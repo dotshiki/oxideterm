@@ -18,9 +18,8 @@ use oxideterm_sftp::BackgroundTransferState;
 use serde_json::{Value, json};
 
 use super::{
-    TabKind, TelnetSessionConfig, TerminalInputInterceptor, TerminalOutputProcessor,
-    TerminalSessionId, WorkspaceApp, WorkspaceOverlayIntent, plugin_entity, plugin_host,
-    plugin_runtime,
+    TelnetSessionConfig, TerminalInputInterceptor, TerminalOutputProcessor, TerminalSessionId,
+    WorkspaceApp, WorkspaceOverlayIntent, plugin_entity, plugin_host, plugin_runtime,
 };
 
 mod host_api_snapshot;
@@ -217,7 +216,13 @@ impl WorkspaceApp {
             host: host.clone(),
             port,
         };
-        match self.create_telnet_terminal_tab(config, Default::default(), window, cx) {
+        match self.create_telnet_terminal_tab(
+            config,
+            oxideterm_connections::SavedUpstreamProxyPolicy::Direct,
+            Default::default(),
+            window,
+            cx,
+        ) {
             Ok(session_id) => {
                 let label = format!("Telnet {host}:{port}");
                 plugin_runtime::PluginResponse::ok(
@@ -1327,17 +1332,20 @@ impl WorkspaceApp {
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(normalized_keybinding) =
-            crate::keybindings::normalize_plugin_keystroke(&event.keystroke)
-        else {
-            return false;
-        };
         let Some(keybinding) = self
             .plugin_entity
             .read(cx)
             .registry()
             .contributions()
-            .runtime_keybinding_for_normalized_key(&normalized_keybinding)
+            .runtime_keybindings
+            .iter()
+            .find(|entry| {
+                crate::keybindings::plugin_binding_matches(
+                    entry,
+                    &event.keystroke,
+                    &self.settings_store.settings().keybindings.overrides,
+                )
+            })
             .cloned()
         else {
             return false;

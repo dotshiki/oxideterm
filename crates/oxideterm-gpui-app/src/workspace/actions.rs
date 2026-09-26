@@ -77,6 +77,51 @@ fn resolve_terminal_broadcast_entries(
 }
 
 #[derive(Default)]
+pub(super) struct TerminalSearchState {
+    pub(super) panes: HashMap<PaneId, SearchBarState>,
+    pub(super) focused: Option<PaneId>,
+}
+
+impl TerminalSearchState {
+    fn open(&mut self, pane_id: PaneId) {
+        self.panes.entry(pane_id).or_default().visible = true;
+        self.focused = Some(pane_id);
+    }
+
+    pub(super) fn blur(&mut self) -> bool {
+        self.focused.take().is_some()
+    }
+
+    fn close(&mut self, pane_id: PaneId) -> bool {
+        if let Some(search) = self.panes.get_mut(&pane_id) {
+            search.visible = false;
+            search.clear_match_state();
+        }
+        self.focused == Some(pane_id) && self.blur()
+    }
+
+    pub(super) fn replace_query(
+        &mut self,
+        pane_id: PaneId,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+    ) -> bool {
+        let Some(search) = self.panes.get_mut(&pane_id).filter(|search| search.visible) else {
+            return false;
+        };
+        oxideterm_editor_core::utf16::replace_utf16(&mut search.query, range, text);
+        true
+    }
+
+    pub(super) fn remove(&mut self, pane_id: PaneId) {
+        self.panes.remove(&pane_id);
+        if self.focused == Some(pane_id) {
+            self.focused = None;
+        }
+    }
+}
+
+#[derive(Default)]
 pub(super) struct SearchBarState {
     pub(super) visible: bool,
     pub(super) query: String,
@@ -104,14 +149,80 @@ fn terminal_tab_capture_keystroke(keystroke: &gpui::Keystroke) -> bool {
     keystroke.key.as_str() == "tab" && !modifiers.platform && !modifiers.control && !modifiers.alt
 }
 
+#[cfg(test)]
+mod terminal_search_tests {
+    use super::*;
+
+    #[test]
+    fn pane_searches_keep_their_queries_and_matches_across_focus_and_close() {
+        let mut searches = TerminalSearchState::default();
+        let first = PaneId(10);
+        let second = PaneId(20);
+        searches.open(first);
+        searches.replace_query(first, None, "错误🦀");
+        searches
+            .panes
+            .get_mut(&first)
+            .unwrap()
+            .sync_from_terminal(TerminalSearchStatus {
+                query: Some("错误🦀".into()),
+                active_match: Some(2),
+                match_count: 4,
+            });
+        searches.blur();
+        assert!(searches.panes[&first].visible);
+        assert_eq!(searches.focused, None);
+        searches.open(second);
+        searches.replace_query(second, None, "warning");
+        searches
+            .panes
+            .get_mut(&second)
+            .unwrap()
+            .sync_from_terminal(TerminalSearchStatus {
+                query: Some("warning".into()),
+                active_match: Some(0),
+                match_count: 1,
+            });
+        searches.open(first);
+        assert_eq!(
+            (
+                &*searches.panes[&first].query,
+                searches.panes[&first].active_match,
+                searches.panes[&first].match_count
+            ),
+            ("错误🦀", Some(2), 4)
+        );
+        searches.replace_query(first, Some(2..4), "日志");
+        assert_eq!(searches.panes[&first].query, "错误日志");
+        assert_eq!(
+            (
+                &*searches.panes[&second].query,
+                searches.panes[&second].active_match,
+                searches.panes[&second].match_count
+            ),
+            ("warning", Some(0), 1)
+        );
+        searches.close(first);
+        assert!(!searches.replace_query(first, None, "late input"));
+        searches.open(first);
+        assert_eq!(searches.panes[&first].query, "错误日志");
+        searches.remove(first);
+        assert_eq!(searches.focused, None);
+        assert_eq!(
+            searches.panes.keys().copied().collect::<Vec<_>>(),
+            vec![second]
+        );
+    }
+}
+
 fn terminal_tab_capture_blocked_by_workspace_ui(
     active_ime_target: bool,
-    quick_commands_open: bool,
+    quick_commands_focused: bool,
 ) -> bool {
     // Text inputs, command palettes, and quick commands own Tab semantics while
     // they are active. The terminal fallback only handles the platform
     // focus-traversal path that would otherwise swallow a real terminal Tab.
-    active_ime_target || quick_commands_open
+    active_ime_target || quick_commands_focused
 }
 
 impl WorkspaceApp {
@@ -190,54 +301,150 @@ impl WorkspaceApp {
             settings.begin_keybinding_reset_confirm_exit(delay, cx)
         })
     }
+    pub(super) fn search_visible(&self, cx: &App) -> bool {
+        self.active_pane_id(cx)
+            .and_then(|id| self.search.panes.get(&id))
+            .is_some_and(|search| search.visible)
+    }
+
+    pub(super) fn focused_search_pane(&self, cx: &App) -> Option<PaneId> {
+        let pane_id = self.search.focused?;
+        if !self
+            .search
+            .panes
+            .get(&pane_id)
+            .is_some_and(|search| search.visible)
+        {
+            return None;
+        }
+        let host = self.tab_host.read(cx);
+        let tab = host
+            .tabs()
+            .iter()
+            .find(|tab| tab.active_pane_id == Some(pane_id))?;
+        if self.active_tab_id(cx) != Some(tab.id) && !host.is_outside_main_window(tab.id) {
+            return None;
+        }
+        let owner = host.detached_window_handle(tab.id).or_else(|| {
+            self.window_registry
+                .handle_for_role(window_registry::WindowRole::Main)
+        });
+        // A remembered search focus in another native window cannot claim this window's keys.
+        if cx
+            .active_window()
+            .is_some_and(|active| owner.is_none_or(|owner| owner.window_id() != active.window_id()))
+        {
+            return None;
+        }
+        Some(pane_id)
+    }
+
+    fn focus_search_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let tab_id = self
+            .tabs(cx)
+            .iter()
+            .find(|tab| {
+                tab.root_pane
+                    .as_ref()
+                    .is_some_and(|root| root.contains_pane(pane_id))
+            })
+            .map(|tab| tab.id);
+        let Some(tab_id) = tab_id else {
+            return;
+        };
+        self.blur_text_inputs(cx);
+        self.tab_host
+            .update(cx, |host, _| host.set_active_pane(Some(tab_id), pane_id));
+        if !self.tab_host.read(cx).is_outside_main_window(tab_id) {
+            self.set_main_window_active_tab(Some(tab_id), cx);
+        }
+        self.search.focused = Some(pane_id);
+    }
+
     pub(super) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search.visible = true;
-        self.close_terminal_quick_commands_popover(cx);
+        let Some(pane_id) = self.active_pane_id(cx) else {
+            return;
+        };
+        self.open_search_for_pane(pane_id, window, cx);
+    }
+
+    pub(super) fn open_search_for_pane(
+        &mut self,
+        pane_id: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.blur_terminal_quick_commands_input(cx);
+        self.focus_search_pane(pane_id, cx);
+        self.search.open(pane_id);
         window.focus(&self.focus_handle, cx);
-        if let Some(pane) = self.active_pane(cx) {
-            let query = (!self.search.query.is_empty()).then(|| self.search.query.clone());
-            let selected_match = query
-                .as_ref()
-                .map(|_| self.search.active_match.unwrap_or(0));
-            let status = pane.update(cx, |pane, cx| {
-                pane.set_search_query(query, selected_match, cx)
-            });
-            self.search.sync_from_terminal(status);
-        } else {
-            self.search.clear_match_state();
+        self.update_search_query_for_pane(pane_id, false, cx);
+        self.select_all_active_text_input(cx);
+        cx.notify();
+    }
+
+    pub(super) fn hide_search(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if self.search.close(pane_id) {
+            self.ime_marked_text = None;
+            self.clear_ime_selection();
+        }
+        if let Some(pane) = self.tab_host.read(cx).panes().get(&pane_id).cloned() {
+            pane.update(cx, |pane, cx| pane.set_search_query(None, None, cx));
         }
         cx.notify();
     }
 
     pub(super) fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search.visible = false;
-        self.search.clear_match_state();
-        self.ime_marked_text = None;
-        if let Some(pane) = self.active_pane(cx) {
-            let _ = pane.update(cx, |pane, cx| pane.set_search_query(None, None, cx));
+        if let Some(id) = self.active_pane_id(cx) {
+            self.hide_search(id, cx);
         }
         self.focus_active_pane(window, cx);
-        cx.notify();
     }
 
-    pub(super) fn update_search_query(&mut self, cx: &mut Context<Self>) {
-        let query = (!self.search.query.is_empty()).then(|| self.search.query.clone());
-        self.search.active_match = query.as_ref().map(|_| 0);
-        if let Some(pane) = self.active_pane(cx) {
-            let status = pane.update(cx, |pane, cx| {
-                pane.set_search_query(query, self.search.active_match, cx)
-            });
-            self.search.sync_from_terminal(status);
-        } else {
-            self.search.clear_match_state();
+    pub(super) fn update_search_query_for_pane(
+        &mut self,
+        pane_id: PaneId,
+        reset_match: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(search) = self.search.panes.get_mut(&pane_id) else {
+            return;
+        };
+        let query = (!search.query.is_empty()).then(|| search.query.clone());
+        if reset_match {
+            search.active_match = query.as_ref().map(|_| 0);
+        }
+        if let Some(pane) = self.tab_host.read(cx).panes().get(&pane_id).cloned() {
+            let status = pane.read(cx).search_status();
+            let status = if !reset_match && status.query == query {
+                status
+            } else {
+                pane.update(cx, |pane, cx| {
+                    pane.set_search_query(query, search.active_match, cx)
+                })
+            };
+            search.sync_from_terminal(status);
         }
         cx.notify();
     }
 
     pub(super) fn search_next(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if let Some(pane) = self.active_pane(cx) {
+        if let Some(id) = self.active_pane_id(cx) {
+            self.search_next_for_pane(id, forward, cx);
+        }
+    }
+
+    pub(super) fn search_next_for_pane(
+        &mut self,
+        pane_id: PaneId,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.tab_host.read(cx).panes().get(&pane_id).cloned() {
             let status = pane.update(cx, |pane, cx| pane.select_next_search_result(forward, cx));
-            self.search.sync_from_terminal(status);
+            if let Some(search) = self.search.panes.get_mut(&pane_id) {
+                search.sync_from_terminal(status);
+            }
             cx.notify();
         }
     }
@@ -264,7 +471,10 @@ impl WorkspaceApp {
         let terminal_active = self.active_tab(cx).is_some_and(|tab| {
             matches!(
                 tab.kind,
-                TabKind::LocalTerminal | TabKind::SshTerminal | TabKind::MoshTerminal
+                TabKind::LocalTerminal
+                    | TabKind::SshTerminal
+                    | TabKind::MoshTerminal
+                    | TabKind::Workspace
             )
         });
         if !terminal_active {
@@ -291,6 +501,8 @@ impl WorkspaceApp {
         let entering = !settings.sidebar_ui.zen_mode;
         settings.sidebar_ui.zen_mode = entering;
         if entering {
+            self.sidebar_motion.settle(0.0);
+            self.context_sidebar_motion.settle(0.0);
             self.sidebar_collapsed = true;
             self.sidebar_motion_generation = self.sidebar_motion_generation.wrapping_add(1);
             self.context_sidebar_motion_generation =
@@ -358,7 +570,10 @@ impl WorkspaceApp {
         let terminal_active = self.active_tab(cx).is_some_and(|tab| {
             matches!(
                 tab.kind,
-                TabKind::LocalTerminal | TabKind::SshTerminal | TabKind::MoshTerminal
+                TabKind::LocalTerminal
+                    | TabKind::SshTerminal
+                    | TabKind::MoshTerminal
+                    | TabKind::Workspace
             )
         });
         if matches!(
@@ -369,7 +584,7 @@ impl WorkspaceApp {
             return false;
         }
 
-        let terminal_panel_open = self.search.visible
+        let terminal_panel_open = self.focused_search_pane(cx).is_some()
             || self.ai_entity.read(cx).terminal_inline_panel().open
             || self.context_sidebar_visible();
         if !crate::keybindings::action_allowed_by_terminal_behavior(
@@ -381,7 +596,7 @@ impl WorkspaceApp {
             return false;
         }
 
-        self.dispatch_keybinding_action(definition.id, window, cx)
+        self.dispatch_keybinding_action(&definition.id, window, cx)
     }
 
     pub(super) fn registered_keybinding_matches(&self, event: &KeyDownEvent) -> bool {
@@ -411,7 +626,7 @@ impl WorkspaceApp {
             "app.newConnection" => self.open_new_connection_form(window, cx),
             "app.settings" => self.open_settings(window, cx),
             "app.toggleSidebar" => self.toggle_sidebar(cx),
-            "app.commandPalette" => self.open_command_palette(cx),
+            "app.commandPalette" => self.open_command_palette(window, cx),
             "app.zenMode" => self.toggle_zen_mode(cx),
             "app.nextTab" => self.next_tab(true, window, cx),
             "app.prevTab" => self.next_tab(false, window, cx),
@@ -487,7 +702,7 @@ impl WorkspaceApp {
         if self.close_terminal_command_overlays(cx) {
             return;
         }
-        if self.search.visible {
+        if self.search_visible(cx) {
             self.close_search(window, cx);
             return;
         }
@@ -514,12 +729,6 @@ impl WorkspaceApp {
             return true;
         }
         if self.dismiss_terminal_broadcast_menu(cx) {
-            cx.notify();
-            return true;
-        }
-
-        if self.terminal.read(cx).quick_commands.is_open() {
-            self.close_terminal_quick_commands_popover(cx);
             cx.notify();
             return true;
         }
@@ -553,33 +762,68 @@ impl WorkspaceApp {
     pub(super) fn handle_terminal_command_overlay_escape(
         &mut self,
         event: &KeyDownEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         if event.keystroke.key.as_str() != "escape" || event.keystroke.modifiers.platform {
             return false;
         }
 
-        self.close_terminal_command_overlays(cx)
+        if self.close_terminal_command_overlays(cx) {
+            return true;
+        }
+        // A dock must not consume Escape from a focused shell or terminal application.
+        if self.focus_handle.is_focused(window) && self.terminal.read(cx).quick_commands.is_open() {
+            self.close_terminal_quick_commands_panel(cx);
+            self.focus_active_pane(window, cx);
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     pub(super) fn toggle_terminal_broadcast(&mut self, cx: &mut Context<Self>) {
-        let (enabled, selected_group_id) = {
-            let terminal = self.terminal.read(cx);
-            (
-                terminal.broadcast_enabled(),
-                terminal.selected_broadcast_group_id(),
-            )
-        };
-        if !enabled && let Some(group_id) = selected_group_id {
-            self.select_terminal_broadcast_group(group_id, cx);
-            self.terminal.update(cx, |terminal, _cx| {
-                terminal.set_broadcast_menu_open(false);
-            });
-        } else {
-            self.terminal
-                .update(cx, |terminal, _cx| terminal.toggle_broadcast());
-        }
+        let active = self.active_pane_id(cx);
+        let member = active.and_then(|pane| self.terminal.read(cx).sync_groups().member(pane));
+        self.terminal.update(cx, |terminal, _| {
+            if let Some(member) = member {
+                if member.isolated {
+                    if let Some(pane) = active {
+                        terminal.sync_groups_mut().toggle_isolated(pane);
+                    }
+                } else {
+                    terminal.sync_groups_mut().toggle_enabled(member.group);
+                }
+            } else {
+                terminal.set_broadcast_menu_open(true);
+            }
+        });
         cx.notify();
+    }
+
+    pub(in crate::workspace) fn toggle_terminal_sync_isolation(
+        &mut self,
+        pane: PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal.update(cx, |terminal, _| {
+            terminal.sync_groups_mut().toggle_isolated(pane)
+        });
+        cx.notify();
+    }
+
+    pub(in crate::workspace) fn terminal_sync_group_name(
+        &self,
+        group: Option<uuid::Uuid>,
+    ) -> String {
+        group
+            .and_then(|id| {
+                self.terminal_broadcast_groups()
+                    .iter()
+                    .find(|group| group.id == id)
+            })
+            .map(|group| group.name.clone())
+            .unwrap_or_else(|| self.i18n.t("terminal.broadcast.temporary_group"))
     }
 
     pub(in crate::workspace) fn dismiss_terminal_broadcast_menu(
@@ -600,9 +844,9 @@ impl WorkspaceApp {
         let should_open = !self.terminal.read(cx).broadcast_menu_open();
         self.dismiss_terminal_broadcast_menu(cx);
         if should_open {
+            self.blur_terminal_quick_commands_input(cx);
             self.dismiss_terminal_recording_menu();
             self.dismiss_terminal_highlight_popover();
-            self.close_terminal_quick_commands_popover(cx);
             self.close_terminal_cwd_picker(cx);
             self.close_terminal_git_branch_picker(cx);
             self.close_terminal_project_panel(cx);
@@ -618,7 +862,18 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.terminal_command_sender_editor_focused(window, cx) {
+        if self.session_sort_menu_open {
+            if event.keystroke.key == "escape" {
+                self.session_sort_menu_open = false;
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.terminal_command_sender_editor_focused(window, cx)
+            || self.quick_command_text_editor_focused(window, cx)
+        {
             // Child editor handlers own the bubble path while focused.
             return;
         }
@@ -630,6 +885,23 @@ impl WorkspaceApp {
             // The capture handler deliberately lets platform text input own text
             // and IME composition keys; the bubble fallback must follow the same
             // rule so inputs do not append or activate once per key path.
+            return;
+        }
+
+        if self.handle_knowledge_input_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.active_ime_target(cx) == Some(ime::WorkspaceImeTarget::ActiveSessionSearch) {
+            if event.keystroke.key == "escape" {
+                self.session_search_query.clear();
+                self.session_search_open = false;
+                self.begin_disclosure_motion("session-search".into(), false, cx);
+                self.clear_ime_selection();
+                cx.notify();
+            }
+            cx.stop_propagation();
             return;
         }
 
@@ -675,7 +947,7 @@ impl WorkspaceApp {
             return;
         }
 
-        if self.handle_settings_confirm_key(event, window, cx) {
+        if self.handle_settings_confirm_key(event, cx) {
             return;
         }
 
@@ -747,6 +1019,13 @@ impl WorkspaceApp {
         }
 
         if self.active_surface == ActiveSurface::Settings && self.open_settings_select.is_some() {
+            if self.open_settings_select == Some(SettingsSelect::AppearanceTheme)
+                && self.handle_appearance_theme_select_key(event, cx)
+            {
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
             if key == "escape" && !modifiers.platform {
                 self.close_settings_select();
                 cx.notify();
@@ -771,7 +1050,7 @@ impl WorkspaceApp {
             quick_commands.is_open() && quick_commands.focused_input().is_some()
         };
         if quick_commands_focused {
-            self.handle_quick_commands_key(event, cx);
+            self.handle_quick_commands_key(event, window, cx);
             return;
         }
 
@@ -787,7 +1066,7 @@ impl WorkspaceApp {
             return;
         }
 
-        if self.handle_terminal_command_overlay_escape(event, cx) {
+        if self.handle_terminal_command_overlay_escape(event, window, cx) {
             return;
         }
 
@@ -813,7 +1092,7 @@ impl WorkspaceApp {
             return;
         }
 
-        if self.sftp_view.read(cx).focused_input().is_some()
+        if self.sftp_view().read(cx).focused_input().is_some()
             || self
                 .active_tab(cx)
                 .is_some_and(|tab| tab.kind == TabKind::Sftp)
@@ -837,7 +1116,7 @@ impl WorkspaceApp {
             &self.settings_store.settings().keybindings.overrides,
         );
 
-        if close_panel_shortcut && self.search.visible {
+        if close_panel_shortcut && self.focused_search_pane(cx).is_some() {
             self.close_search(window, cx);
             return;
         }
@@ -854,14 +1133,12 @@ impl WorkspaceApp {
             return;
         }
 
-        if self.search.visible && !modifiers.platform {
+        if self.focused_search_pane(cx).is_some() && !modifiers.platform {
             match key {
                 "escape" => self.close_search(window, cx),
                 "enter" => self.search_next(!modifiers.shift, cx),
                 "backspace" => {
-                    if self.search.query.pop().is_some() {
-                        self.update_search_query(cx);
-                    }
+                    self.handle_active_text_input_delete_selection(&event.keystroke, cx);
                 }
                 _ => {}
             }
@@ -885,7 +1162,11 @@ impl WorkspaceApp {
 
         if terminal_tab_capture_blocked_by_workspace_ui(
             self.active_ime_target(cx).is_some(),
-            self.terminal.read(cx).quick_commands.is_open(),
+            self.terminal
+                .read(cx)
+                .quick_commands
+                .focused_input()
+                .is_some(),
         ) {
             return false;
         }
@@ -902,7 +1183,10 @@ impl WorkspaceApp {
         let terminal_active = self.active_tab(cx).is_some_and(|tab| {
             matches!(
                 tab.kind,
-                TabKind::LocalTerminal | TabKind::SshTerminal | TabKind::MoshTerminal
+                TabKind::LocalTerminal
+                    | TabKind::SshTerminal
+                    | TabKind::MoshTerminal
+                    | TabKind::Workspace
             )
         });
         if !terminal_active {
@@ -985,7 +1269,6 @@ impl WorkspaceApp {
     pub(super) fn handle_settings_confirm_key(
         &mut self,
         event: &KeyDownEvent,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         if self
@@ -998,7 +1281,7 @@ impl WorkspaceApp {
             }
             // The import dialog owns keyboard input while it is mounted.
             true
-        } else if self.handle_keybinding_reset_confirm_key(event, window, cx) {
+        } else if self.handle_keybinding_reset_confirm_key(event, cx) {
             true
         } else if self.handle_knowledge_delete_confirm_key(event, cx) {
             true
@@ -1014,7 +1297,6 @@ impl WorkspaceApp {
     pub(super) fn handle_keybinding_reset_confirm_key(
         &mut self,
         event: &KeyDownEvent,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self
@@ -1041,7 +1323,7 @@ impl WorkspaceApp {
             }
             Some(settings::KeybindingResetConfirmKeyAction::Confirm) => {
                 if self.begin_keybinding_reset_all_confirm_exit(cx) {
-                    self.reset_all_keybindings(window, cx);
+                    self.reset_all_keybindings(cx);
                 }
                 true
             }
@@ -1142,10 +1424,11 @@ impl WorkspaceApp {
                     self.reset_standard_confirm_focus();
                     cx.notify();
                 } else {
-                    self.knowledge_create_blank_document(cx);
-                    self.ai_entity.update(cx, |entity, cx| {
-                        entity.close_knowledge_document_dialog(Duration::ZERO, cx);
-                    });
+                    if self.knowledge_create_blank_document(cx) {
+                        self.ai_entity.update(cx, |entity, cx| {
+                            entity.close_knowledge_document_dialog(Duration::ZERO, cx);
+                        });
+                    }
                 }
                 true
             }
@@ -1391,49 +1674,44 @@ impl WorkspaceApp {
     pub(super) fn handle_keybinding_recording_key(
         &mut self,
         event: &KeyDownEvent,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let definitions = self.keybinding_definitions(cx);
         let overrides = &self.settings_store.settings().keybindings.overrides;
         let action = self.settings_workspace.update(cx, |settings, cx| {
-            settings.handle_keybinding_recording_key(event, overrides, cx)
+            settings.handle_keybinding_recording_key(event, overrides, &definitions, cx)
         });
         if action == Some(settings::KeybindingRecordingKeyAction::Confirm) {
-            self.confirm_keybinding_recording(window, cx);
+            self.confirm_keybinding_recording(cx);
         }
     }
 
     pub(super) fn activate_keybinding_recording_footer_action(
         &mut self,
         action: settings::KeybindingRecordingFooterAction,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let should_confirm = self.settings_workspace.update(cx, |settings, cx| {
             settings.activate_keybinding_recording_footer(action, cx)
         });
         if should_confirm {
-            self.confirm_keybinding_recording(window, cx);
+            self.confirm_keybinding_recording(cx);
         }
     }
 
-    pub(super) fn confirm_keybinding_recording(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn confirm_keybinding_recording(&mut self, cx: &mut Context<Self>) {
         let Some(commit) = self.settings_workspace.update(cx, |settings, cx| {
             settings.take_keybinding_recording_commit(cx)
         }) else {
             return;
         };
-        let Some(definition) = crate::keybindings::action_definition(&commit.action_id) else {
+        let Some(definition) = self.keybinding_definition(&commit.action_id, cx) else {
             return;
         };
 
         let side = crate::keybindings::KeybindingSide::current();
         let previous = crate::keybindings::effective_combo(
-            definition,
+            &definition,
             &self.settings_store.settings().keybindings.overrides,
             side,
         );
@@ -1445,16 +1723,16 @@ impl WorkspaceApp {
 
         self.edit_settings(
             move |settings| {
-                crate::keybindings::set_override(
+                crate::keybindings::set_definition_override(
                     &mut settings.keybindings.overrides,
-                    &commit.action_id,
+                    &definition,
                     side,
                     commit.combo,
                 );
             },
             cx,
         );
-        self.apply_runtime_key_bindings(runtime_bindings, window, cx);
+        Self::apply_runtime_key_bindings(runtime_bindings, cx);
     }
 
     pub(super) fn cancel_keybinding_recording(&mut self, cx: &mut Context<Self>) {
@@ -1463,18 +1741,13 @@ impl WorkspaceApp {
         });
     }
 
-    pub(super) fn reset_keybinding(
-        &mut self,
-        action_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(definition) = crate::keybindings::action_definition(action_id) else {
+    pub(super) fn reset_keybinding(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        let Some(definition) = self.keybinding_definition(action_id, cx) else {
             return;
         };
         let side = crate::keybindings::KeybindingSide::current();
         let previous = crate::keybindings::effective_combo(
-            definition,
+            &definition,
             &self.settings_store.settings().keybindings.overrides,
             side,
         );
@@ -1495,21 +1768,16 @@ impl WorkspaceApp {
             cx,
         );
         self.cancel_keybinding_recording(cx);
-        self.apply_runtime_key_bindings(runtime_bindings, window, cx);
+        Self::apply_runtime_key_bindings(runtime_bindings, cx);
     }
 
-    pub(super) fn unbind_keybinding(
-        &mut self,
-        action_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(definition) = crate::keybindings::action_definition(action_id) else {
+    pub(super) fn unbind_keybinding(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        let Some(definition) = self.keybinding_definition(action_id, cx) else {
             return;
         };
         let side = crate::keybindings::KeybindingSide::current();
         let previous = crate::keybindings::effective_combo(
-            definition,
+            &definition,
             &self.settings_store.settings().keybindings.overrides,
             side,
         );
@@ -1526,10 +1794,10 @@ impl WorkspaceApp {
             cx,
         );
         self.cancel_keybinding_recording(cx);
-        self.apply_runtime_key_bindings(runtime_bindings, window, cx);
+        Self::apply_runtime_key_bindings(runtime_bindings, cx);
     }
 
-    pub(super) fn reset_all_keybindings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn reset_all_keybindings(&mut self, cx: &mut Context<Self>) {
         let side = crate::keybindings::KeybindingSide::current();
         let runtime_bindings = {
             let overrides = &self.settings_store.settings().keybindings.overrides;
@@ -1538,7 +1806,7 @@ impl WorkspaceApp {
                 .flat_map(|definition| {
                     let previous = crate::keybindings::effective_combo(definition, overrides, side);
                     crate::keybindings::runtime_rebind_key_bindings(
-                        definition.id,
+                        &definition.id,
                         previous.as_ref(),
                         Some(definition.default_combo(side)),
                     )
@@ -1547,7 +1815,7 @@ impl WorkspaceApp {
         };
         self.edit_settings(|settings| settings.keybindings.overrides.clear(), cx);
         self.cancel_keybinding_recording(cx);
-        self.apply_runtime_key_bindings(runtime_bindings, window, cx);
+        Self::apply_runtime_key_bindings(runtime_bindings, cx);
     }
 
     pub(super) fn export_keybindings(&mut self, cx: &mut Context<Self>) {
@@ -1572,7 +1840,7 @@ impl WorkspaceApp {
         });
     }
 
-    pub(super) fn import_keybindings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn import_keybindings(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -1588,33 +1856,19 @@ impl WorkspaceApp {
             }
         };
         let runtime = self.forwarding_runtime.handle().clone();
-        let target_window = window.window_handle();
         self.settings_workspace.update(cx, |settings, cx| {
-            settings.start_keybinding_import(selection, runtime, target_window, cx);
+            settings.start_keybinding_import(selection, runtime, cx);
         });
     }
 
-    fn apply_runtime_key_bindings(
-        &self,
+    pub(in crate::workspace) fn apply_runtime_key_bindings(
         bindings: Vec<gpui::KeyBinding>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) {
-        self.apply_runtime_key_bindings_to_window_handle(bindings, window.window_handle(), cx);
-    }
-
-    pub(in crate::workspace) fn apply_runtime_key_bindings_to_window_handle(
-        &self,
-        bindings: Vec<gpui::KeyBinding>,
-        window_handle: AnyWindowHandle,
-        cx: &mut Context<Self>,
-    ) {
-        if bindings.is_empty() {
-            return;
+        if !bindings.is_empty() {
+            // The keymap belongs to the app; the calling window may already be updating.
+            cx.bind_keys(bindings);
         }
-        let _ = cx.update_window(window_handle, move |_root, _window, app| {
-            app.bind_keys(bindings);
-        });
     }
 
     pub(super) fn handle_terminal_cast_search_key(
@@ -1651,9 +1905,7 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.terminal.read(cx).broadcast_enabled() {
-            self.retain_live_terminal_broadcast_targets(cx);
-        }
+        self.retain_live_terminal_broadcast_targets(cx);
         let parameter_values = command
             .parameters
             .iter()
@@ -1686,6 +1938,7 @@ impl WorkspaceApp {
                     || !prepared.unavailable_targets.is_empty()
             });
         if needs_dialog || prepared.is_err() {
+            self.prepare_terminal_quick_commands_panel(window, cx);
             self.terminal.update(cx, |terminal, _cx| {
                 terminal.quick_commands.request_execution(command.clone())
             });
@@ -1705,9 +1958,7 @@ impl WorkspaceApp {
             return Vec::new();
         };
         let mut pane_ids = vec![active_pane_id];
-        if self.terminal.read(cx).broadcast_enabled() {
-            pane_ids.extend(self.terminal_broadcast_target_panes(active_pane_id, cx));
-        }
+        pane_ids.extend(self.terminal_broadcast_target_panes(active_pane_id, cx));
         pane_ids
             .into_iter()
             .filter_map(|pane_id| {
@@ -1733,7 +1984,9 @@ impl WorkspaceApp {
         let selected_group_name = self
             .terminal
             .read(cx)
-            .selected_broadcast_group_id()
+            .sync_groups()
+            .member(pane_id)
+            .and_then(|member| member.group)
             .and_then(|group_id| {
                 self.settings_store
                     .settings()
@@ -2293,7 +2546,9 @@ impl WorkspaceApp {
         candidates
             .retain(|pane_id| *pane_id != source_pane_id && tab_host.panes().contains_key(pane_id));
 
-        self.terminal.read(cx).filter_broadcast_targets(candidates)
+        self.terminal
+            .read(cx)
+            .filter_broadcast_targets(source_pane_id, candidates)
     }
 
     fn retain_live_terminal_broadcast_targets(&mut self, cx: &mut Context<Self>) {
@@ -2320,11 +2575,7 @@ impl WorkspaceApp {
                 if !tab_host.panes().contains_key(&pane_id) {
                     continue;
                 }
-                let label = if root.pane_count() > 1 {
-                    format!("{} · {}", tab.title, pane_id)
-                } else {
-                    tab.title.clone()
-                };
+                let label = self.terminal_pane_label(pane_id, cx);
                 let saved_connection = root
                     .session_id_for_pane(pane_id)
                     .and_then(|session_id| self.terminal_saved_connection_refs.get(&session_id))
@@ -2509,29 +2760,53 @@ impl WorkspaceApp {
 
     pub(in crate::workspace) fn toggle_terminal_broadcast_group_member(
         &mut self,
-        group_id: uuid::Uuid,
-        target: oxideterm_settings::TerminalBroadcastTargetRef,
+        pane_id: PaneId,
         cx: &mut Context<Self>,
     ) {
-        self.edit_settings(
-            |settings| {
-                let Some(group) = settings
-                    .terminal
-                    .broadcast_groups
-                    .iter_mut()
-                    .find(|group| group.id == group_id)
-                else {
-                    return;
-                };
-                if let Some(index) = group.members.iter().position(|member| member == &target) {
-                    group.members.remove(index);
-                } else {
-                    group.members.push(target);
-                }
-            },
-            cx,
-        );
-        self.select_terminal_broadcast_group(group_id, cx);
+        let group_id = self.terminal.read(cx).selected_broadcast_group_id();
+        if self
+            .terminal
+            .read(cx)
+            .sync_groups()
+            .member(pane_id)
+            .is_some_and(|member| member.group != group_id)
+        {
+            return;
+        }
+        let entry = self
+            .terminal_broadcast_entries(cx)
+            .into_iter()
+            .find(|entry| entry.pane_id == pane_id);
+        self.terminal
+            .update(cx, |terminal, _| terminal.toggle_broadcast_target(pane_id));
+        if let (Some(group_id), Some(target)) =
+            (group_id, entry.and_then(|entry| entry.saved_connection))
+        {
+            let members = self.terminal.read(cx).sync_groups().panes(Some(group_id));
+            let profile_still_used = self.terminal_broadcast_entries(cx).iter().any(|entry| {
+                members.contains(&entry.pane_id) && entry.saved_connection.as_ref() == Some(&target)
+            });
+            self.edit_settings(
+                |settings| {
+                    if let Some(group) = settings
+                        .terminal
+                        .broadcast_groups
+                        .iter_mut()
+                        .find(|group| group.id == group_id)
+                    {
+                        if profile_still_used {
+                            if !group.members.contains(&target) {
+                                group.members.push(target);
+                            }
+                        } else {
+                            group.members.retain(|member| member != &target);
+                        }
+                    }
+                },
+                cx,
+            );
+        }
+        cx.notify();
     }
 
     fn terminal_command_should_handoff_focus(&self, command: &str) -> bool {
@@ -2547,12 +2822,7 @@ impl WorkspaceApp {
             .any(|candidate| candidate == &command_name)
     }
 
-    pub(super) fn switch_locale(
-        &mut self,
-        locale: Locale,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn switch_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
         // Route language changes through the same settings mutation path as the
         // settings UI so native plugin language/settings subscriptions observe
         // menu-triggered locale switches too.
@@ -2560,12 +2830,6 @@ impl WorkspaceApp {
             |settings| settings.general.language = settings_language_from_locale(locale),
             cx,
         );
-
-        let menus = crate::platform::app_menus(&self.i18n);
-        let _ = cx.update_window(window.window_handle(), move |_root, _window, app| {
-            app.set_menus(menus);
-        });
-        cx.notify();
     }
 
     pub(super) fn sync_tab_titles(&mut self, cx: &mut App) {
@@ -2578,15 +2842,21 @@ impl WorkspaceApp {
         });
     }
 
-    pub(super) fn render_search_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_search_bar(&self, pane_id: PaneId, cx: &mut Context<Self>) -> AnyElement {
         const SEARCH_PANEL_BG_ALPHA: u32 = 0xf5; // Tauri bg-theme-bg-elevated translated to native opacity.
         const SEARCH_PANEL_BORDER_ALPHA: u32 = 0xcc; // Tauri border-theme-border.
 
         let theme = self.tokens.ui;
-        let target = WorkspaceImeTarget::Search;
-        let has_query = !self.search.query.is_empty();
+        let Some(search) = self.search.panes.get(&pane_id) else {
+            return div().into_any_element();
+        };
+        let focused = self.focused_search_pane(cx) == Some(pane_id);
+        let target = WorkspaceImeTarget::Search(pane_id);
+        let has_query = !search.query.is_empty();
         let marked_text = self.marked_text_for_target(target, cx);
-        let selected_range = self.ime_selected_range_for_target(target, cx);
+        let selected_range = focused
+            .then(|| self.ime_selected_range_for_target(target, cx))
+            .flatten();
         let input_range = selected_range.filter(|_| has_query && marked_text.is_none());
         let selection_range = input_range.clone().filter(|range| range.start < range.end);
         let caret_offset = input_range
@@ -2596,15 +2866,12 @@ impl WorkspaceApp {
         let shows_selection = selection_range.is_some();
         let shows_positioned_caret = caret_offset.is_some() && !shows_selection;
         let query = if has_query {
-            self.search.query.clone()
+            search.query.clone()
         } else {
             self.i18n.t("search.placeholder")
         };
-        let match_count = self.search.match_count;
-        let active_match = self
-            .search
-            .active_match
-            .filter(|index| *index < match_count);
+        let match_count = search.match_count;
+        let active_match = search.active_match.filter(|index| *index < match_count);
         let navigation_disabled = !has_query || match_count == 0;
         let result_label = if !has_query {
             String::new()
@@ -2615,6 +2882,7 @@ impl WorkspaceApp {
         };
 
         div()
+            .id(("terminal-search", pane_id.0))
             .absolute()
             .top(px(12.0))
             .right(px(12.0))
@@ -2630,6 +2898,7 @@ impl WorkspaceApp {
             .shadow_lg()
             .text_size(px(13.0))
             .text_color(rgb(theme.text))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .h(px(44.0))
@@ -2662,7 +2931,7 @@ impl WorkspaceApp {
                                 } else {
                                     rgb(theme.text_muted)
                                 })
-                                .when(!has_query && marked_text.is_none(), |input| {
+                                .when(focused && !has_query && marked_text.is_none(), |input| {
                                     input
                                         .child(text_caret(&self.tokens, self.input_caret.visible()))
                                 })
@@ -2689,7 +2958,10 @@ impl WorkspaceApp {
                                     )
                                 })
                                 .when(
-                                    has_query && !shows_selection && !shows_positioned_caret,
+                                    focused
+                                        && has_query
+                                        && !shows_selection
+                                        && !shows_positioned_caret,
                                     |input| {
                                         input.child(text_caret(
                                             &self.tokens,
@@ -2697,7 +2969,7 @@ impl WorkspaceApp {
                                         ))
                                     },
                                 ),
-                            |_this, _cx| {},
+                            move |this, cx| this.focus_search_pane(pane_id, cx),
                             cx,
                         ),
                     )
@@ -2737,8 +3009,8 @@ impl WorkspaceApp {
                             ))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.search_next(false, cx);
+                                cx.listener(move |this, _event, _window, cx| {
+                                    this.search_next_for_pane(pane_id, false, cx);
                                     cx.stop_propagation();
                                 }),
                             ),
@@ -2769,8 +3041,8 @@ impl WorkspaceApp {
                             ))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.search_next(true, cx);
+                                cx.listener(move |this, _event, _window, cx| {
+                                    this.search_next_for_pane(pane_id, true, cx);
                                     cx.stop_propagation();
                                 }),
                             ),
@@ -2791,8 +3063,16 @@ impl WorkspaceApp {
                             ))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _event, window, cx| {
-                                    this.close_search(window, cx);
+                                cx.listener(move |this, _event, window, cx| {
+                                    let restore_focus = this.search.focused == Some(pane_id)
+                                        || this.active_pane_id(cx) == Some(pane_id);
+                                    this.hide_search(pane_id, cx);
+                                    if restore_focus
+                                        && let Some(pane) =
+                                            this.tab_host.read(cx).panes().get(&pane_id).cloned()
+                                    {
+                                        pane.update(cx, |pane, cx| pane.focus(window, cx));
+                                    }
                                     cx.stop_propagation();
                                 }),
                             ),
@@ -3005,5 +3285,75 @@ pub(super) fn classify_command_risk(command: &str) -> Option<&'static str> {
         Some(QuickCommandRisk::High) => Some("high"),
         Some(QuickCommandRisk::Medium) => Some("medium"),
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod keybinding_update_tests {
+    use super::*;
+    use gpui::{FocusHandle, KeyBinding, TestAppContext};
+
+    struct ShortcutTarget {
+        focus: FocusHandle,
+        actions: usize,
+        input: Vec<String>,
+    }
+
+    impl Render for ShortcutTarget {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .key_context("Workspace")
+                .track_focus(&self.focus)
+                .on_action(cx.listener(|this, _: &NewTerminal, _, _| this.actions += 1))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, _| {
+                    this.input.push(event.keystroke.unparse());
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn runtime_rebind_releases_old_shortcut_during_window_update(cx: &mut TestAppContext) {
+        use crate::keybindings::{KeybindingSide, action_definition, runtime_rebind_key_bindings};
+
+        cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-t", NewTerminal, Some("Workspace"))]));
+        let previous = action_definition("app.newTerminal")
+            .unwrap()
+            .default_combo(KeybindingSide::Other)
+            .clone();
+        let mut next = previous.clone();
+        next.key = "p".into();
+        let (target, cx) = cx.add_window_view(|window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            ShortcutTarget {
+                focus,
+                actions: 0,
+                input: Vec::new(),
+            }
+        });
+        cx.simulate_keystrokes("ctrl-t");
+        target.read_with(cx, |target, _| assert_eq!(target.actions, 1));
+        for (label, previous, next, expected_input, expected_actions) in [
+            ("rebind", Some(&previous), Some(&next), vec!["ctrl-t"], 1),
+            ("unbind", Some(&next), None, vec!["ctrl-t", "ctrl-p"], 0),
+            ("restore", None, Some(&previous), vec!["ctrl-p"], 1),
+        ] {
+            target.update(cx, |target, _| {
+                target.actions = 0;
+                target.input.clear();
+            });
+            // Settings callbacks already hold the window when updating the keymap.
+            cx.update(|_window, cx| {
+                WorkspaceApp::apply_runtime_key_bindings(
+                    runtime_rebind_key_bindings("app.newTerminal", previous, next),
+                    cx,
+                );
+            });
+            cx.simulate_keystrokes("ctrl-t ctrl-p");
+            target.read_with(cx, |target, _| {
+                assert_eq!(target.input, expected_input, "{label}");
+                assert_eq!(target.actions, expected_actions, "{label}");
+            });
+        }
     }
 }

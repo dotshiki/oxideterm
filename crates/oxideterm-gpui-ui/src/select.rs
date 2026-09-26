@@ -49,6 +49,7 @@ fn readonly_value_trigger_spec() -> SelectTriggerChromeSpec {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum SelectAnchorId {
+    ActiveSessionSort,
     SettingsLanguage,
     SettingsUpdateChannel,
     SettingsAppearanceTheme,
@@ -67,6 +68,8 @@ pub enum SelectAnchorId {
     SettingsCustomThemeDuplicate,
     SettingsUpdateProxyMode,
     SettingsUpdateProxyProtocol,
+    SettingsIdeFontFamily,
+    SettingsIdeCjkFontFamily,
     SettingsTerminalFontFamily,
     SettingsTerminalCjkFontFamily,
     SettingsTerminalFontSizeSlider,
@@ -94,8 +97,6 @@ pub enum SelectAnchorId {
     SettingsNetworkProxyProtocol,
     SettingsNetworkProxyAuth,
     SettingsAiProviderTemplate,
-    SettingsAiContextMaxChars,
-    SettingsAiContextVisibleLines,
     SettingsAiEmbeddingProvider,
     SettingsKnowledgeCollectionScope,
     SettingsKnowledgeDocumentFormat,
@@ -191,6 +192,8 @@ impl SelectAnchorId {
                 | Self::SettingsAppearanceBackgroundFit
                 | Self::SettingsCustomThemeDuplicate
                 | Self::SettingsTerminalFontFamily
+                | Self::SettingsIdeFontFamily
+                | Self::SettingsIdeCjkFontFamily
                 | Self::SettingsTerminalCjkFontFamily
                 | Self::SettingsTerminalEncoding
                 | Self::SettingsTerminalBackspaceSequence
@@ -215,8 +218,6 @@ impl SelectAnchorId {
                 | Self::SettingsNetworkProxyProtocol
                 | Self::SettingsNetworkProxyAuth
                 | Self::SettingsAiProviderTemplate
-                | Self::SettingsAiContextMaxChars
-                | Self::SettingsAiContextVisibleLines
                 | Self::SettingsAiEmbeddingProvider
                 | Self::SettingsKnowledgeCollectionScope
                 | Self::SettingsKnowledgeDocumentFormat
@@ -618,7 +619,7 @@ pub fn select_panel_popup_with_max_height(
     width: f32,
     max_height: f32,
 ) -> Stateful<Div> {
-    select_popup_with_max_height(tokens, width, max_height).bg(rgb(tokens.ui.bg_panel))
+    select_popup_with_max_height(tokens, width, max_height)
 }
 
 pub fn select_overlay_popup(tokens: &ThemeTokens, width: f32) -> Stateful<Div> {

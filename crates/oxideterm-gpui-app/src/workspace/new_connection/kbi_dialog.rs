@@ -14,9 +14,9 @@ use crate::workspace::new_connection::entity::{
     KeyboardInteractiveKeyAction, KeyboardInteractiveSubmitResult,
 };
 use oxideterm_gpui_ui::{
-    TextInputView,
+    MaterialRole, TextInputView,
     button::{ButtonOptions, ButtonRadius, ButtonSize, ButtonVariant, ToolbarButtonOptions},
-    form_field,
+    form_field, material_surface,
     modal::{dismissible_dialog_backdrop, rounded_shell_child_radius},
     text_input, text_input_anchor_probe,
 };
@@ -212,7 +212,11 @@ impl WorkspaceApp {
                 .unwrap_or_default();
             prompt_list = prompt_list.child(form_field(
                 &self.tokens,
-                prompt.prompt.clone(),
+                if prompt.prompt == "ssh.form.password" {
+                    self.i18n.t("ssh.form.password")
+                } else {
+                    prompt.prompt.clone()
+                },
                 text_input_anchor_probe(
                     target.anchor_id(),
                     text_input(
@@ -269,13 +273,12 @@ impl WorkspaceApp {
             .child(oxideterm_gpui_ui::motion::form_transition(
                 &self.tokens,
                 "keyboard-interactive-dialog-transition",
-                div()
+                material_surface(&self.tokens, div(), MaterialRole::Dialog)
                     .w(px(self.tokens.metrics.modal_width))
                     .rounded(px(self.tokens.radii.md))
                     .overflow_hidden()
                     .border_1()
                     .border_color(rgb(theme.border))
-                    .bg(rgb(theme.bg_elevated))
                     .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                         cx.stop_propagation();
                     })

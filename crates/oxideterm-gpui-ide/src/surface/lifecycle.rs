@@ -168,7 +168,7 @@ impl IdeSurface {
                     || buffer.format != buffer.saved_format
             })
             .filter_map(|buffer| match &buffer.location {
-                IdeLocation::Remote { path, .. } => Some((path.clone(), buffer.text.clone())),
+                IdeLocation::Remote { path, .. } => Some((path.clone(), buffer.text.to_string())),
                 IdeLocation::Local { .. } => None,
             })
             .collect::<BTreeMap<_, _>>();
@@ -528,7 +528,7 @@ mod lifecycle_tests {
                 .expect("build IDE hidden visibility test runtime"),
         );
         let surface = cx.new({
-            let fs = fs.clone();
+            let fs = fs;
             let backend_runtime = backend_runtime.clone();
             move |cx| {
                 IdeSurface::new(
@@ -696,7 +696,7 @@ mod lifecycle_tests {
             }
         });
         let second_surface = cx.new({
-            let fs = fs.clone();
+            let fs = fs;
             let backend_runtime = backend_runtime.clone();
             let second_node_id = second_node.0.clone();
             move |cx| {

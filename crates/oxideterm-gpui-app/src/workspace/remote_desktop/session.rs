@@ -15,6 +15,7 @@ impl RemoteDesktopSessionEntity {
             session.shutdown_worker();
             drop(session.ssh_tunnel.take());
             drop(session.password.take());
+            session.credential_prompt_task.take();
         })
         .detach();
     }
@@ -107,7 +108,7 @@ impl RemoteDesktopSessionEntity {
         self.automatic_reconnect_task = Some(reconnect_task);
     }
 
-    fn shutdown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn shutdown(&mut self, mut window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.cancel_automatic_reconnect();
         if let Some(worker_wake) = self.worker_wake.take() {
             worker_wake.stop();
@@ -116,10 +117,16 @@ impl RemoteDesktopSessionEntity {
         self.public_mcp_clipboard = None;
         drop(self.ssh_tunnel.take());
         drop(self.password.take());
+        self.credential_prompt_task.take();
         let images = self.state.take_all_images();
         let textures = self.state.take_all_textures();
-        self.drop_images(images, window, cx);
-        Self::drop_textures(textures, window);
+        for image in images {
+            cx.drop_image(image, window.as_deref_mut());
+        }
+        // A destroyed window has already released its texture atlas.
+        if let Some(window) = window {
+            Self::drop_textures(textures, window);
+        }
     }
 
     fn poll_deliveries(
@@ -216,6 +223,18 @@ impl RemoteDesktopSessionEntity {
                             changed = true;
                         }
                         RemoteDesktopHelperEvent::ConnectionFailure { message, category } => {
+                            if category == Some(RemoteDesktopErrorCategory::Authentication)
+                                && self
+                                    .password
+                                    .as_ref()
+                                    .is_none_or(|password| password.is_empty())
+                                && self.credential_prompt_generation != Some(generation)
+                            {
+                                self.credential_prompt_generation = Some(generation);
+                                intents.push(RemoteDesktopDeliveryIntent::CredentialsRequired {
+                                    generation,
+                                });
+                            }
                             if remote_desktop_network_failure_allows_automatic_reconnect(
                                 self.has_connected,
                                 category,
@@ -517,7 +536,7 @@ impl RemoteDesktopSessionEntity {
         let monitor_layout = remote_desktop_monitor_layout(&profile, cx);
         let worker = self.spawn_worker(
             generation,
-            profile.clone(),
+            profile,
             provider,
             password_available,
             frame_slot.clone(),
@@ -785,7 +804,8 @@ impl RemoteDesktopSessionEntity {
             let generation = match event {
                 RemoteDesktopSessionEvent::DeliveryReady { generation }
                 | RemoteDesktopSessionEvent::FrameApplyReady { generation } => generation,
-                RemoteDesktopSessionEvent::ClipboardTransferFailed
+                RemoteDesktopSessionEvent::CredentialsRequired { .. }
+                | RemoteDesktopSessionEvent::ClipboardTransferFailed
                 | RemoteDesktopSessionEvent::VncFileTransferCompleted
                 | RemoteDesktopSessionEvent::VncFileTransferFailed(_) => return,
             };
@@ -813,6 +833,13 @@ impl RemoteDesktopSessionEntity {
                             }
                             for intent in outcome.intents {
                                 match intent {
+                                    RemoteDesktopDeliveryIntent::CredentialsRequired {
+                                        generation,
+                                    } => {
+                                        cx.emit(RemoteDesktopSessionEvent::CredentialsRequired {
+                                            generation,
+                                        });
+                                    }
                                     RemoteDesktopDeliveryIntent::ClipboardTransferFailed => {
                                         cx.emit(RemoteDesktopSessionEvent::ClipboardTransferFailed);
                                     }
@@ -839,7 +866,8 @@ impl RemoteDesktopSessionEntity {
                                 cx.notify();
                             }
                         }
-                        RemoteDesktopSessionEvent::ClipboardTransferFailed
+                        RemoteDesktopSessionEvent::CredentialsRequired { .. }
+                        | RemoteDesktopSessionEvent::ClipboardTransferFailed
                         | RemoteDesktopSessionEvent::VncFileTransferCompleted
                         | RemoteDesktopSessionEvent::VncFileTransferFailed(_) => {}
                     }
@@ -893,6 +921,80 @@ impl RemoteDesktopSessionEntity {
 }
 
 impl WorkspaceApp {
+    fn prompt_remote_desktop_credentials(
+        &mut self,
+        session: &Entity<RemoteDesktopSessionEntity>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let current = session.read(cx);
+        if current.worker_generation != generation {
+            return;
+        }
+        let window_handle = current.window_handle;
+        let needs_username = current.profile.protocol == RemoteDesktopProtocol::Rdp
+            && current
+                .profile
+                .username
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty());
+        let mut prompts = Vec::new();
+        if needs_username {
+            prompts.push(oxideterm_ssh::KeyboardInteractivePrompt {
+                prompt: self.i18n.t("ssh.form.username"),
+                echo: true,
+            });
+        }
+        prompts.push(oxideterm_ssh::KeyboardInteractivePrompt {
+            prompt: self.i18n.t("ssh.form.password"),
+            echo: false,
+        });
+        let request = oxideterm_ssh::KeyboardInteractivePromptRequest {
+            flow_id: uuid::Uuid::new_v4().to_string(),
+            name: format!(
+                "{}@{}",
+                current.profile.username.as_deref().unwrap_or_default(),
+                current.profile.endpoint.format_authority()
+            ),
+            instructions: String::new(),
+            prompts,
+            chained: false,
+        };
+        let weak_session = session.downgrade();
+        let task = cx.spawn(async move |workspace, cx| {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.open_keyboard_interactive_challenge(request, sender, window, cx)
+                });
+            });
+            let Ok(Ok(mut responses)) = receiver.await else {
+                return;
+            };
+            if responses.len() != if needs_username { 2 } else { 1 } {
+                return;
+            }
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = weak_session.update(cx, |session, cx| {
+                    // A closed or replaced transport cannot consume a stale prompt response.
+                    if session.worker_generation != generation {
+                        return;
+                    }
+                    if needs_username {
+                        session.profile.username = Some(std::mem::take(&mut responses[0]));
+                    }
+                    let index = usize::from(needs_username);
+                    session.password = Some(RemoteDesktopSecret::from(Zeroizing::new(
+                        std::mem::take(&mut responses[index]),
+                    )));
+                    session.restart_worker_preserving_frame(window, cx);
+                    cx.notify();
+                });
+            });
+        });
+        session.update(cx, |session, _| session.credential_prompt_task = Some(task));
+    }
+
     pub(in crate::workspace) fn handle_remote_desktop_session_event(
         &mut self,
         tab_id: TabId,
@@ -902,6 +1004,10 @@ impl WorkspaceApp {
     ) {
         debug_assert_eq!(session_entity.read(cx).tab_id, tab_id);
         match event {
+            RemoteDesktopSessionEvent::CredentialsRequired { generation } => {
+                self.prompt_remote_desktop_credentials(session_entity, *generation, cx);
+                return;
+            }
             RemoteDesktopSessionEvent::ClipboardTransferFailed => {
                 self.push_command_palette_toast(
                     self.i18n.t("remote_desktop.clipboard_file_failed"),
@@ -1020,7 +1126,7 @@ impl WorkspaceApp {
     pub(in crate::workspace) fn close_remote_desktop_tab(
         &mut self,
         tab_id: TabId,
-        window: &mut Window,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         self.release_public_mcp_desktop_for_closed_tab(tab_id);
@@ -1055,6 +1161,7 @@ impl WorkspaceApp {
 
     pub(in crate::workspace) fn focus_remote_desktop_keyboard(
         &mut self,
+        tab_id: TabId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1073,9 +1180,7 @@ impl WorkspaceApp {
         self.clear_ai_sidebar_keyboard_focus(cx);
         changed |= ai_focus_changed;
 
-        if let Some(tab_id) = self.active_remote_desktop_tab_id(cx) {
-            self.sync_remote_desktop_lock_keys(tab_id, window.capslock(), cx);
-        }
+        self.sync_remote_desktop_lock_keys(tab_id, window.capslock(), cx);
         window.focus(&self.focus_handle, cx);
         if changed {
             cx.notify();
@@ -1410,7 +1515,7 @@ impl WorkspaceApp {
             .when_some(
                 vnc_capability_presentation,
                 |footer, (capability_label, capability_tooltip)| {
-                    let tooltip_for_move = capability_tooltip.clone();
+                    let tooltip_for_move = capability_tooltip;
                     footer.child(
                         remote_desktop_capability_chip(&self.tokens, capability_label)
                             .id("remote-desktop-vnc-capabilities")
@@ -1775,6 +1880,93 @@ mod tests {
     }
 
     #[gpui::test]
+    fn missing_remote_desktop_password_requests_credentials_once_per_attempt(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| RemoteDesktopSessionTestRoot);
+        for (protocol, category, supplied, expected) in [
+            (
+                RemoteDesktopProtocol::Vnc,
+                RemoteDesktopErrorCategory::Authentication,
+                false,
+                true,
+            ),
+            (
+                RemoteDesktopProtocol::Rdp,
+                RemoteDesktopErrorCategory::Authentication,
+                false,
+                true,
+            ),
+            (
+                RemoteDesktopProtocol::Vnc,
+                RemoteDesktopErrorCategory::Network,
+                false,
+                false,
+            ),
+            (
+                RemoteDesktopProtocol::Vnc,
+                RemoteDesktopErrorCategory::LegacySecurity,
+                false,
+                false,
+            ),
+            (
+                RemoteDesktopProtocol::Vnc,
+                RemoteDesktopErrorCategory::Authentication,
+                true,
+                false,
+            ),
+        ] {
+            let provider = builtin_preview_provider_registry()
+                .unwrap()
+                .get_for_protocol(protocol)
+                .cloned()
+                .unwrap();
+            let session = cx.new(|_| {
+                let mut session = RemoteDesktopSessionEntity::new(
+                    TabId(45),
+                    preview_remote_desktop_profile(protocol),
+                    provider,
+                    supplied.then(|| RemoteDesktopSecret::from("test-password")),
+                    std::env::temp_dir().join("unused-auth-test-certs.json"),
+                    RemoteDesktopFrameDeliverySlot::new(),
+                    window.into(),
+                );
+                session.worker_generation = 1;
+                session
+            });
+            window
+                .update(cx, |_, window, cx| {
+                    session.update(cx, |session, cx| {
+                        for first in [true, false] {
+                            session
+                                .delivery_tx
+                                .send(RemoteDesktopWorkerDelivery::Event {
+                                    tab_id: TabId(45),
+                                    generation: 1,
+                                    event: RemoteDesktopHelperEvent::ConnectionFailure {
+                                        message: "authentication test".into(),
+                                        category: Some(category),
+                                    },
+                                })
+                                .unwrap();
+                            let outcome = session.poll_deliveries(window, cx);
+                            assert_eq!(
+                                outcome.intents.iter().any(|intent| matches!(
+                                    intent,
+                                    RemoteDesktopDeliveryIntent::CredentialsRequired {
+                                        generation: 1
+                                    }
+                                )),
+                                expected && first
+                            );
+                        }
+                    })
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
     fn initial_layout_probe_starts_rdp_and_vnc_before_first_delivery(cx: &mut TestAppContext) {
         let (_, cx) = cx.add_window_view(|_window, _cx| RemoteDesktopSessionTestRoot);
         let tokens = ThemeTokens::from_builtin(theme_by_id("default"));
@@ -2091,7 +2283,7 @@ mod tests {
 
         window
             .update(cx, |_root, window, cx| {
-                session.update(cx, |session, cx| session.shutdown(window, cx));
+                session.update(cx, |session, cx| session.shutdown(Some(window), cx));
             })
             .unwrap();
 
@@ -2204,7 +2396,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn repeated_shutdown_closes_only_once(cx: &mut TestAppContext) {
+    fn shutdown_after_window_close_releases_worker_and_secrets_once(cx: &mut TestAppContext) {
         let window = cx.add_window(|_window, _cx| RemoteDesktopSessionTestRoot);
         let protocol = RemoteDesktopProtocol::Rdp;
         let profile = preview_remote_desktop_profile(protocol);
@@ -2234,14 +2426,14 @@ mod tests {
             session
         });
 
-        // Repeated close paths must not duplicate helper shutdown or retain
-        // session-owned credentials.
         window
-            .update(cx, |_root, window, cx| {
-                session.update(cx, |session, cx| session.shutdown(window, cx));
-                session.update(cx, |session, cx| session.shutdown(window, cx));
-            })
+            .update(cx, |_, window, _| window.remove_window())
             .unwrap();
+        cx.run_until_parked();
+        // The native window is gone; repeated cleanup still releases the worker
+        // and credentials exactly once without accessing its stale handle.
+        session.update(cx, |session, cx| session.shutdown(None, cx));
+        session.update(cx, |session, cx| session.shutdown(None, cx));
 
         assert!(observed_wake.is_stopped());
         assert!(matches!(

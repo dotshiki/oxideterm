@@ -162,7 +162,7 @@ fn migrate_ai_providers(settings: &mut Value, warnings: &mut Vec<String>) {
             "type": "deepseek",
             "name": "DeepSeek",
             "baseUrl": "https://api.deepseek.com",
-            "models": ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
+            "models": ["deepseek-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
             "enabled": true,
             "createdAt": created_at,
         }),
@@ -477,9 +477,7 @@ fn ai_reasoning_profile_value(value: &str) -> &'static str {
 }
 
 fn ai_reasoning_settings_value(value: &str) -> &'static str {
-    match ai_reasoning_profile_value(value) {
-        other => other,
-    }
+    ai_reasoning_profile_value(value)
 }
 
 fn clamp_i64(

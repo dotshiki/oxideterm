@@ -111,8 +111,6 @@ const AI_KEYS: &[&str] = &[
     "activeModel",
     "activeBackend",
     "activeAcpAgentId",
-    "contextMaxChars",
-    "contextVisibleLines",
     "thinkingStyle",
     "reasoningEffort",
     "reasoningProviderOverrides",
@@ -122,7 +120,6 @@ const AI_KEYS: &[&str] = &[
     "userContextWindows",
     "customSystemPrompt",
     "memory",
-    "modelMaxResponseTokens",
     "toolUse",
     "contextSources",
     "mcpServers",
@@ -394,6 +391,47 @@ fn ensure_object_path<'a>(value: &'a mut Value, path: &[&str]) -> &'a mut Map<St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn note_split_preferences_persist_locally_and_never_enter_snapshots() {
+        use crate::{KnowledgeEditorMode, SettingsStore};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut store = SettingsStore::load_from_path(&path).unwrap();
+        store.settings_mut().window_ui.knowledge_editor.mode = KnowledgeEditorMode::Split;
+        store.settings_mut().window_ui.knowledge_editor.source_ratio = 0.65;
+        store.save().unwrap();
+        let reloaded = SettingsStore::load_from_path(path).unwrap();
+        assert_eq!(
+            reloaded.settings().window_ui.knowledge_editor.mode,
+            KnowledgeEditorMode::Split
+        );
+        assert_eq!(
+            reloaded.settings().window_ui.knowledge_editor.source_ratio,
+            0.65
+        );
+        let sections = super::ALL_OXIDE_SETTINGS_SECTIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let exported =
+            super::export_oxide_settings_snapshot_json(reloaded.settings(), Some(&sections), false)
+                .unwrap();
+        let mut snapshot: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert!(snapshot["settings"].get("windowUI").is_none());
+        snapshot["settings"]["windowUI"] =
+            serde_json::json!({"knowledgeEditor":{"mode":"source", "sourceRatio":0.25}});
+        let imported = super::merge_oxide_settings_snapshot(
+            reloaded.settings(),
+            &snapshot.to_string(),
+            Some(&sections),
+        )
+        .unwrap();
+        assert_eq!(
+            imported.window_ui.knowledge_editor.mode,
+            KnowledgeEditorMode::Split
+        );
+        assert_eq!(imported.window_ui.knowledge_editor.source_ratio, 0.65);
+    }
     use super::*;
     use crate::{Language, PersistedSettings};
 
@@ -429,9 +467,45 @@ mod tests {
     }
 
     #[test]
+    fn retired_ai_size_controls_are_ignored_without_losing_sources_or_model_windows() {
+        let mut source = PersistedSettings::default().to_value();
+        source["ai"]["contextMaxChars"] = json!(8000);
+        source["ai"]["contextVisibleLines"] = json!(50);
+        source["ai"]["modelMaxResponseTokens"] = json!({"provider":{"model":256}});
+        source["ai"]["contextSources"] = json!({"ide":false,"sftp":true});
+        source["ai"]["userContextWindows"] = json!({"provider":{"model":128000}});
+        let loaded: PersistedSettings = serde_json::from_value(source).unwrap();
+        let exported = export_oxide_settings_snapshot_json(
+            &loaded,
+            Some(&HashSet::from(["ai".into()])),
+            false,
+        )
+        .unwrap();
+        let restored =
+            merge_oxide_settings_snapshot(&PersistedSettings::default(), &exported, None).unwrap();
+        let ai = &restored.to_value()["ai"];
+        for retired in [
+            "contextMaxChars",
+            "contextVisibleLines",
+            "modelMaxResponseTokens",
+        ] {
+            assert_eq!(ai.get(retired), None);
+        }
+        assert_eq!(ai["contextSources"], json!({"ide":false,"sftp":true}));
+        assert_eq!(
+            ai["userContextWindows"],
+            json!({"provider":{"model":128000}})
+        );
+    }
+
+    #[test]
     fn export_selected_extended_sections() {
         let mut settings = PersistedSettings::default();
         settings.ai.enabled = true;
+        settings.ai.providers = vec![
+            json!({"id":"responses-provider","type":"openai_compatible","apiProtocol":"responses","baseUrl":"https://example.test/v1","models":["model"]}),
+            json!({"id":"grok-provider","type":"xai","apiProtocol":"responses","baseUrl":"https://api.x.ai/v1","models":["grok-4.6"]}),
+        ];
         settings.settings_navigation.groups = vec![vec!["terminal".to_string()]];
         settings.local_terminal.default_cwd = Some("/tmp".to_string());
         settings
@@ -446,6 +520,19 @@ mod tests {
         let exported =
             export_oxide_settings_snapshot_json(&settings, Some(&selected), false).expect("export");
         let parsed: Value = serde_json::from_str(&exported).expect("json");
+        let restored = merge_oxide_settings_snapshot(
+            &PersistedSettings::default(),
+            &exported,
+            Some(&selected),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.ai.providers,
+            vec![
+                json!({"id":"responses-provider","type":"openai_compatible","apiProtocol":"responses","baseUrl":"https://example.test/v1","models":["model"]}),
+                json!({"id":"grok-provider","type":"xai","apiProtocol":"responses","baseUrl":"https://api.x.ai/v1","models":["grok-4.6"]})
+            ]
+        );
         let section_ids = parsed["sectionIds"]
             .as_array()
             .expect("section ids")

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 AnalyseDeCircuit
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{cell::RefCell, cmp::Ordering};
+use std::{cell::RefCell, cmp::Ordering, sync::Arc};
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -22,7 +22,7 @@ struct HistoryEntry {
 #[derive(Clone, Debug)]
 pub struct TextBuffer {
     storage: PieceTableTextBuffer,
-    text_cache: RefCell<Option<String>>,
+    text_cache: RefCell<Option<Arc<str>>>,
     line_starts: Vec<usize>,
     version: u64,
     content_revision: u64,
@@ -30,16 +30,88 @@ pub struct TextBuffer {
     next_content_revision: u64,
     undo_stack: Vec<HistoryEntry>,
     redo_stack: Vec<HistoryEntry>,
+    changes: Option<Vec<BufferChange>>,
+}
+
+/// Coordinate changes only; readers do not need another copy of edited text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BufferChange {
+    pub before_version: u64,
+    pub after_version: u64,
+    pub replacements: Vec<(std::ops::Range<usize>, usize)>,
+}
+
+impl BufferChange {
+    pub fn map_position(&self, position: f64) -> f64 {
+        let mut shift = 0.0;
+        for (range, length) in &self.replacements {
+            if position < range.start as f64 {
+                break;
+            }
+            if position <= range.end as f64 {
+                return range.start as f64 + shift + *length as f64;
+            }
+            shift += *length as f64 - range.len() as f64;
+        }
+        (position + shift).max(0.0)
+    }
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+    #[test]
+    fn anchors_follow_insert_undo_and_redo_without_retaining_text() {
+        let mut buffer = TextBuffer::new("甲乙\nend");
+        buffer.track_changes(true);
+        buffer
+            .apply_transaction(EditTransaction::single(TextEdit::insert(
+                BufferOffset(0),
+                "x\n",
+            )))
+            .unwrap();
+        buffer.undo().unwrap();
+        buffer.redo().unwrap();
+        let changes = buffer.take_changes();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| (c.before_version, c.after_version, c.replacements.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (0, 1, vec![(0..0, 2)]),
+                (1, 2, vec![(0..2, 0)]),
+                (2, 3, vec![(0..0, 2)])
+            ]
+        );
+        assert_eq!(changes[0].map_position(6.0), 8.0);
+        assert_eq!(changes[1].map_position(8.0), 6.0);
+        assert_eq!(changes[2].map_position(6.0), 8.0);
+        assert_eq!(buffer.text(), "x\n甲乙\nend");
+    }
 }
 
 impl TextBuffer {
-    pub fn new(text: impl Into<String>) -> Self {
+    /// The subscribing editor must drain changes after observing a new version.
+    pub fn track_changes(&mut self, enabled: bool) {
+        self.changes = enabled.then(Vec::new);
+    }
+
+    pub fn take_changes(&mut self) -> Vec<BufferChange> {
+        self.changes
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    pub fn new(text: impl Into<Arc<str>>) -> Self {
         let text = text.into();
         let line_starts = compute_line_starts(&text);
-        let storage = PieceTableTextBuffer::new(text.clone());
+        let storage = PieceTableTextBuffer::new(text);
+        let text_cache = RefCell::new(Some(storage.original.clone()));
         Self {
             storage,
-            text_cache: RefCell::new(Some(text)),
+            text_cache,
             line_starts,
             version: 0,
             content_revision: 0,
@@ -47,6 +119,7 @@ impl TextBuffer {
             next_content_revision: 1,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            changes: None,
         }
     }
 
@@ -54,9 +127,18 @@ impl TextBuffer {
         self.with_text(str::to_string)
     }
 
+    pub fn text_snapshot(&self) -> Arc<str> {
+        self.with_text(|_| ());
+        self.text_cache
+            .borrow()
+            .as_ref()
+            .expect("text cache was materialized")
+            .clone()
+    }
+
     pub fn with_text<R>(&self, f: impl FnOnce(&str) -> R) -> R {
         if self.text_cache.borrow().is_none() {
-            *self.text_cache.borrow_mut() = Some(self.storage.to_text());
+            *self.text_cache.borrow_mut() = Some(self.storage.to_text().into());
         }
         let cache = self.text_cache.borrow();
         f(cache
@@ -102,9 +184,19 @@ impl TextBuffer {
     pub fn with_line_text<R>(&self, line: usize, f: impl FnOnce(&str) -> R) -> Option<R> {
         let start = *self.line_starts.get(line)?;
         let end = self.line_end_offset(line)?.0;
-        // Rendering hot paths need a borrowed line view. Materialize the shared
-        // text cache once and slice it instead of allocating a fresh line string.
-        self.with_text(|text| text.get(start..end).map(f))
+        if start == 0 && end == self.storage.len() {
+            // A single-line document is already the requested row; cache it for repeated paints.
+            return Some(self.with_text(f));
+        }
+        // A visible-row read must not rebuild the entire document after an edit.
+        // Reuse a warm contiguous cache, otherwise materialize only this line.
+        let cache = self.text_cache.borrow();
+        if let Some(text) = cache.as_ref() {
+            text.get(start..end).map(f)
+        } else {
+            drop(cache);
+            Some(f(&self.storage.slice_to_string(start..end)))
+        }
     }
 
     pub fn line_char_counts(&self) -> Vec<usize> {
@@ -276,6 +368,16 @@ impl TextBuffer {
 
     fn apply_edits_internal(&mut self, edits: Vec<TextEdit>) -> Result<Vec<TextEdit>, EditorError> {
         let edits = normalize_edits_for_storage(edits, &self.storage)?;
+        if let Some(changes) = &mut self.changes {
+            changes.push(BufferChange {
+                before_version: self.version,
+                after_version: self.version.saturating_add(1),
+                replacements: edits
+                    .iter()
+                    .map(|edit| (edit.range.as_range(), edit.replacement.len()))
+                    .collect(),
+            });
+        }
         let mut inverse = Vec::with_capacity(edits.len());
         let mut delta: isize = 0;
 
@@ -290,7 +392,7 @@ impl TextBuffer {
             delta += edit.replacement.len() as isize - edit.range.len() as isize;
         }
 
-        let next_line_starts = update_line_starts_after_edits(&self.line_starts, &edits);
+        update_line_starts_after_edits(&mut self.line_starts, &edits);
 
         for edit in edits.iter().rev() {
             self.storage
@@ -300,7 +402,7 @@ impl TextBuffer {
         // API boundary. Keep that as an explicit on-demand cache instead of
         // forcing every edit through full-document materialization.
         *self.text_cache.borrow_mut() = None;
-        self.line_starts = next_line_starts;
+        self.storage.reclaim_unused_text();
         self.version = self.version.saturating_add(1);
         Ok(inverse)
     }
@@ -398,6 +500,184 @@ mod tests {
     use crate::{Cursor, piece_table::PieceSource};
 
     #[test]
+    fn unused_add_text_is_reclaimed_without_losing_history_or_snapshots() {
+        let mut buffer = TextBuffer::new("base");
+        let middle = "你".repeat(1024);
+        let inserted = format!("left{middle}right");
+        buffer
+            .replace_selection(Selection::caret(BufferOffset(4)), &inserted)
+            .unwrap();
+        let snapshot = buffer.clone();
+        buffer
+            .replace_selection(
+                Selection::new(BufferOffset(8), BufferOffset(8 + middle.len())),
+                "",
+            )
+            .unwrap();
+        assert_eq!(buffer.text(), "baseleftright");
+        assert_eq!(buffer.storage.add, "leftright");
+        buffer
+            .replace_selection(Selection::caret(BufferOffset(8)), "!")
+            .unwrap();
+        assert_eq!(buffer.text(), "baseleft!right");
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text(), "baseleftright");
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text(), format!("baseleft{middle}right"));
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text(), "base");
+        assert_eq!(buffer.storage.add.capacity(), 0);
+        assert_eq!(snapshot.text(), format!("baseleft{middle}right"));
+        buffer.redo().unwrap();
+        buffer.redo().unwrap();
+        buffer.redo().unwrap();
+        assert_eq!(buffer.text(), "baseleft!right");
+    }
+
+    #[test]
+    #[ignore = "manual repeated-paste storage retention benchmark"]
+    fn repeated_paste_memory() {
+        let mut buffer = TextBuffer::new("original");
+        let pasted = "x".repeat(256 * 1024);
+        for _ in 0..64 {
+            buffer
+                .replace_selection(Selection::caret(BufferOffset(8)), pasted.clone())
+                .unwrap();
+            buffer.undo().unwrap();
+        }
+        assert_eq!(buffer.text(), "original");
+        eprintln!(
+            "EDITOR_RETENTION text_bytes={} added_bytes={} added_capacity={} undo_entries={} redo_entries={}",
+            buffer.len(),
+            buffer.storage.add.len(),
+            buffer.storage.add.capacity(),
+            buffer.undo_stack.len(),
+            buffer.redo_stack.len()
+        );
+        buffer.redo().unwrap();
+        assert_eq!(buffer.text(), format!("original{pasted}"));
+    }
+
+    #[test]
+    #[ignore = "manual original storage retention benchmark"]
+    fn deleted_original_memory() {
+        let source = format!("left{}right", "中".repeat(4 * 1024 * 1024));
+        let mut buffer = TextBuffer::new(source);
+        let before = buffer.storage.original.len();
+        buffer
+            .replace_selection(
+                Selection::new(BufferOffset(4), BufferOffset(before - 5)),
+                "",
+            )
+            .unwrap();
+        assert_eq!(buffer.text(), "leftright");
+        let retained = buffer.storage.original.len();
+        buffer.undo().unwrap();
+        assert_eq!(buffer.len(), before);
+        assert!(buffer.with_text(|text| text[4..before - 5].chars().all(|ch| ch == '中')));
+        buffer.redo().unwrap();
+        assert_eq!(buffer.text(), "leftright");
+        eprintln!("ORIGINAL_MEMORY before={before} retained={retained}");
+    }
+
+    #[test]
+    fn deleted_original_ranges_release_storage_without_losing_undo_or_snapshots() {
+        let source: Arc<str> = format!("left{}right", "中".repeat(1024)).into();
+        let mut buffer = TextBuffer::new(source.clone());
+        assert!(Arc::ptr_eq(&source, &buffer.text_snapshot()));
+        let end = source.len() - 5;
+        buffer
+            .replace_selection(Selection::new(BufferOffset(4), BufferOffset(end)), "")
+            .unwrap();
+        assert_eq!(buffer.text(), "leftright");
+        assert!(Arc::ptr_eq(&source, &buffer.storage.original));
+        let snapshot = buffer.text_snapshot();
+        drop(source);
+        buffer
+            .replace_selection(Selection::caret(BufferOffset(4)), "!")
+            .unwrap();
+        assert_eq!(buffer.storage.original.as_ref(), "leftright");
+        assert_eq!(buffer.text(), "left!right");
+        assert_eq!(snapshot.as_ref(), "leftright");
+        buffer.undo().unwrap();
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text(), format!("left{}right", "中".repeat(1024)));
+        buffer.redo().unwrap();
+        buffer.redo().unwrap();
+        assert_eq!(buffer.text(), "left!right");
+        buffer
+            .replace_selection(
+                Selection::new(BufferOffset(0), BufferOffset(buffer.len())),
+                "new",
+            )
+            .unwrap();
+        assert_eq!(buffer.storage.original.len(), 0);
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text(), "left!right");
+    }
+
+    #[test]
+    #[ignore = "manual million-line editing benchmark"]
+    fn million_line_edit_performance() {
+        for (name, offset, end, replacement) in [
+            ("prefix", 0, 0, "z"),
+            ("tail", 3999996, 3999996, "z"),
+            ("same_width", 2000000, 2000001, "z"),
+        ] {
+            for run in 0..6 {
+                let mut buffer = TextBuffer::new("row\n".repeat(1_000_000));
+                let started = std::time::Instant::now();
+                buffer
+                    .replace_selection(
+                        Selection::new(BufferOffset(offset), BufferOffset(end)),
+                        replacement,
+                    )
+                    .unwrap();
+                let edit_ms = started.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(buffer.line_count(), 1_000_001);
+                assert_eq!(
+                    buffer
+                        .slice(TextRange::new(
+                            BufferOffset(offset),
+                            BufferOffset(offset + 1)
+                        ))
+                        .unwrap(),
+                    "z"
+                );
+                eprintln!("LINE_EDIT workload={name} run={run} edit_ms={edit_ms:.3}");
+            }
+        }
+    }
+
+    #[test]
+    fn immutable_text_is_shared_while_edits_and_undo_stay_independent() {
+        let mut buffer = TextBuffer::new("alpha\nbeta");
+        let original = buffer.storage.original.as_ptr();
+        assert_eq!(buffer.with_text(|text| text.as_ptr()), original);
+        let initial_snapshot = buffer.clone();
+        assert_eq!(initial_snapshot.storage.original.as_ptr(), original);
+        buffer
+            .apply_transaction(EditTransaction::single(TextEdit::new(
+                TextRange::new(BufferOffset(6), BufferOffset(10)),
+                "gamma",
+            )))
+            .unwrap();
+        assert_eq!(buffer.text(), "alpha\ngamma");
+        let edited_snapshot = buffer.clone();
+        assert_eq!(
+            buffer.with_text(|text| text.as_ptr()),
+            edited_snapshot.with_text(|text| text.as_ptr())
+        );
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text(), "alpha\nbeta");
+        assert!(!buffer.is_dirty());
+        buffer.redo().unwrap();
+        assert_eq!(buffer.text(), "alpha\ngamma");
+        assert_eq!(initial_snapshot.text(), "alpha\nbeta");
+        assert_eq!(edited_snapshot.text(), "alpha\ngamma");
+    }
+
+    #[test]
     fn maps_unicode_offsets_to_line_columns() {
         let buffer = TextBuffer::new("aé\n你b\nlast");
 
@@ -418,12 +698,35 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_line_text_matches_owned_line_text() {
-        let buffer = TextBuffer::new("alpha\n你b\nlast");
-
+    fn visible_line_reads_follow_edits_without_materializing_the_document() {
+        let mut buffer = TextBuffer::new("alpha\n你b\nlast");
         assert_eq!(
             buffer.with_line_text(1, str::to_string),
-            buffer.line_text(1)
+            Some("你b".to_string())
+        );
+        buffer
+            .apply_transaction(EditTransaction::single(TextEdit::new(
+                TextRange::new(BufferOffset(6), BufferOffset(9)),
+                "世",
+            )))
+            .unwrap();
+        assert_eq!(
+            buffer.with_line_text(1, str::to_string),
+            Some("世b".to_string())
+        );
+        assert!(
+            buffer.text_cache.borrow().is_none(),
+            "reading one row rebuilt the full document"
+        );
+        buffer.undo().unwrap();
+        assert_eq!(
+            buffer.with_line_text(1, str::to_string),
+            Some("你b".to_string())
+        );
+        buffer.redo().unwrap();
+        assert_eq!(
+            buffer.with_line_text(1, str::to_string),
+            Some("世b".to_string())
         );
         assert_eq!(buffer.with_line_text(99, str::len), None);
     }
@@ -516,7 +819,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(buffer.text(), "hi world!");
-        assert_eq!(buffer.storage.original, "hello world");
+        assert_eq!(buffer.storage.original.as_ref(), "hello world");
         assert!(buffer.storage.add.contains("hi"));
         assert!(buffer.storage.add.contains('!'));
         assert!(
@@ -540,7 +843,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(buffer.text(), "alpha\nBETA\nextra\ngamma");
-        assert_eq!(buffer.storage.original, "alpha\nbeta\ngamma");
+        assert_eq!(buffer.storage.original.as_ref(), "alpha\nbeta\ngamma");
         assert_eq!(buffer.line_count(), 4);
         assert_eq!(buffer.line_text(2), Some("extra".to_string()));
     }

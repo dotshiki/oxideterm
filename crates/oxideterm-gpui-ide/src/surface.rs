@@ -47,7 +47,8 @@ use oxideterm_ssh::ReconnectIdeSnapshot;
 use oxideterm_theme::ThemeTokens;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{file_icons, labels::IdeLabels};
+use crate::labels::IdeLabels;
+use oxideterm_gpui_ui::file_icons;
 
 // Tauri IdeWorkspace.tsx uses a 280px default with 200px/500px resize bounds.
 const IDE_TREE_DEFAULT_WIDTH: f32 = 280.0;
@@ -203,6 +204,8 @@ impl IdeSurfaceMount {
 #[derive(Clone, Debug, PartialEq)]
 pub struct IdeRuntimeSettings {
     pub auto_save: bool,
+    pub editor_font_family: String,
+    pub editor_font_weight: f32,
     pub editor_font_fallback: Option<String>,
     pub editor_font_size: f32,
     pub editor_line_height: f32,
@@ -215,6 +218,11 @@ impl Default for IdeRuntimeSettings {
     fn default() -> Self {
         Self {
             auto_save: false,
+            editor_font_family: oxideterm_theme::default_tokens()
+                .metrics
+                .markdown_code_font_family
+                .into(),
+            editor_font_weight: 400.0,
             editor_font_fallback: None,
             editor_font_size: 14.0,
             editor_line_height: 1.2,

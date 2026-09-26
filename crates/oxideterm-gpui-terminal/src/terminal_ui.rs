@@ -115,6 +115,7 @@ pub struct TerminalUiPreferences {
     pub render_policy: EffectiveRenderPolicy,
     pub background: Option<TerminalBackgroundPreferences>,
     pub transparent_background: bool,
+    pub processing_failed_message: String,
     pub paste_labels: TerminalPasteLabels,
     pub kitty_file_transmission_labels: TerminalKittyFileTransmissionLabels,
     pub autosuggest_labels: TerminalAutosuggestLabels,
@@ -123,6 +124,8 @@ pub struct TerminalUiPreferences {
     pub trzsz_labels: TerminalTrzszLabels,
     pub serial_control_labels: TerminalSerialControlLabels,
     pub tmux_labels: TerminalTmuxLabels,
+    pub control_bar_expand_label: String,
+    pub control_bar_collapse_label: String,
     pub session_log_options: Option<TerminalSessionLogOptions>,
     pub session_log_automatic: bool,
     pub session_log_labels: TerminalSessionLogLabels,
@@ -235,6 +238,8 @@ impl Default for TerminalUiPreferences {
             render_policy: EffectiveRenderPolicy::quality(),
             background: None,
             transparent_background: false,
+            processing_failed_message:
+                "Terminal processing stopped. Reconnect this session to continue.".into(),
             paste_labels: TerminalPasteLabels::default(),
             kitty_file_transmission_labels: TerminalKittyFileTransmissionLabels::default(),
             autosuggest_labels: TerminalAutosuggestLabels::default(),
@@ -243,6 +248,8 @@ impl Default for TerminalUiPreferences {
             trzsz_labels: TerminalTrzszLabels::default(),
             serial_control_labels: TerminalSerialControlLabels::default(),
             tmux_labels: TerminalTmuxLabels::default(),
+            control_bar_expand_label: "Show controls".into(),
+            control_bar_collapse_label: "Hide controls".into(),
             session_log_options: None,
             session_log_automatic: false,
             session_log_labels: TerminalSessionLogLabels::default(),
@@ -372,12 +379,18 @@ pub struct TerminalNotice {
 #[derive(Clone, Debug)]
 pub struct TerminalAutosuggestLabels {
     pub history_source: String,
+    pub matches: String,
+    pub navigation_hint: String,
+    pub dismiss_hint: String,
 }
 
 impl Default for TerminalAutosuggestLabels {
     fn default() -> Self {
         Self {
             history_source: "history".to_string(),
+            matches: "{{count}} matches".into(),
+            navigation_hint: "{{select}} select · {{run}} run · Click fill".into(),
+            dismiss_hint: "{{dismiss}} close · {{remove}} remove".into(),
         }
     }
 }
@@ -773,7 +786,7 @@ pub struct TerminalBackgroundPreferences {
     pub fit: TerminalBackgroundFit,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum TerminalBackgroundFit {
     Cover,
     Contain,

@@ -44,6 +44,21 @@ pub(crate) fn prepare_local_shell_launch(
     mut env: HashMap<String, String>,
     default_args: Vec<String>,
 ) -> LocalShellLaunch {
+    let default_args = if shell.id.starts_with("wsl") {
+        let mut args = default_args;
+        if let Some(cwd) = config.cwd.as_ref() {
+            if let Some(index) = args.iter().position(|arg| arg == "--cd") {
+                if index + 1 < args.len() {
+                    args.remove(index + 1);
+                }
+                args.remove(index);
+            }
+            args.extend(["--cd".to_owned(), cwd.to_string_lossy().into_owned()]);
+        }
+        args
+    } else {
+        default_args
+    };
     // Editor adapters are passive files. Exposing their paths for every PTY
     // lets a user toggle Free Type Mode without restarting the shell, while
     // still requiring an explicit opt-in from the editor configuration.
@@ -309,17 +324,15 @@ fn zsh_source_user_file(name: &str, integration_directory: &Path, final_user_fil
 }
 
 fn posix_prompt_hook() -> String {
-    format!(
-        r#"__oxideterm_pct_path() {{
+    r#"__oxideterm_pct_path() {
     command printf '%s' "$1" | command od -An -tx1 -v | command tr -d ' \n' | command sed 's/../%&/g; s|%2f|/|g'
-}}
-__oxideterm_emit_cwd() {{
+}
+__oxideterm_emit_cwd() {
     __oxideterm_cwd=$(pwd -P 2>/dev/null || pwd 2>/dev/null) || return
     command printf '\033]7;file://%s\007' "$(__oxideterm_pct_path "$__oxideterm_cwd")"
-}}
-PROMPT_COMMAND="__oxideterm_emit_cwd${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}"
-__oxideterm_emit_cwd"#
-    )
+}
+PROMPT_COMMAND="__oxideterm_emit_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+__oxideterm_emit_cwd"#.to_string()
 }
 
 fn zsh_prompt_hook(import_history: bool) -> String {
@@ -439,6 +452,24 @@ mod tests {
         };
         let shell = ShellInfo::new(shell_id, shell_id, shell_id);
         (config, shell)
+    }
+
+    #[test]
+    fn wsl_project_directory_replaces_default_without_shell_interpolation() {
+        let (mut config, mut shell) = config_for("wsl-ubuntu");
+        config.cwd = Some("/home/user/project with spaces;echo ignored".into());
+        shell.args = vec!["-d".into(), "Ubuntu".into(), "--cd".into(), "~".into()];
+        let launch =
+            prepare_local_shell_launch(&config, &shell, HashMap::new(), shell.args.clone());
+        assert_eq!(
+            launch.args,
+            [
+                "-d",
+                "Ubuntu",
+                "--cd",
+                "/home/user/project with spaces;echo ignored"
+            ]
+        );
     }
 
     #[test]

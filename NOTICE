@@ -41,6 +41,15 @@ Copyright (c) 2020, Lucide Contributors.
 Licensed under the ISC License.
 Used for the native workspace sidebar and toolbar SVG icons.
 
+Material Icon Theme
+Copyright (c) 2025 Material Extensions.
+Licensed under the MIT License.
+Version 5.38.1 SVG assets and file/folder associations are used across native
+file lists. Full license text is in
+licenses/third-party/MATERIAL-ICON-THEME-LICENSE-MIT and is shipped with binaries.
+Source hashes and SVG sizing adjustments are recorded in
+crates/oxideterm-gpui-ui/resources/material-icons/SOURCE.md.
+
 GPUI / GPUI-CE
 Copyright 2022-2025 Zed Industries, Inc.
 Additional GPUI-CE contributions are included under the same license.
@@ -80,3 +89,12 @@ src-tauri/vendor/russh-0.59.0. That vendored copy is based on Eugeny's
 russh fork (https://github.com/Eugeny/russh), which in turn derives from
 Pierre-Étienne Meunier's Thrussh/Russh lineage. Original source copyright
 and license headers are preserved in the vendored files.
+
+Linux distribution icons
+Debian, Gentoo, NixOS, and Rocky Linux artwork is bundled under its respective
+Creative Commons license. Linux Mint artwork is used under the project-specific
+logo permission in its official FAQ. Ubuntu and Arch Linux artwork is displayed
+to identify matching systems, subject to their respective brand policies.
+See DISTRO-ICONS-NOTICE.md for sources, changes, file hashes, and trademark
+guidance. The complete CC BY 4.0, CC BY-SA 2.5, CC BY-SA 3.0, and CC BY-SA 4.0
+license texts accompany release packages.

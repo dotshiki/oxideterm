@@ -238,6 +238,13 @@ const VNC_COMPRESSION_PREFERENCES: &[(RemoteDesktopVncPreference, &str)] = &[
 fn new_connection_transport_index(transport: NewConnectionTransport) -> usize {
     match transport {
         NewConnectionTransport::Ssh => 0,
+        NewConnectionTransport::Ftp => {
+            if cfg!(target_os = "windows") {
+                9
+            } else {
+                8
+            }
+        }
         NewConnectionTransport::Mosh => 1,
         NewConnectionTransport::Telnet => 2,
         NewConnectionTransport::Serial => 3,
@@ -263,7 +270,10 @@ fn new_connection_transport_index(transport: NewConnectionTransport) -> usize {
 
 fn new_connection_transport_visual_offset(transport: NewConnectionTransport) -> f32 {
     let row_stride = NEW_CONNECTION_TRANSPORT_ROW_HEIGHT + NEW_CONNECTION_TRANSPORT_ROW_GAP;
-    let advanced_offset = if transport == NewConnectionTransport::StandaloneSftp {
+    let advanced_offset = if matches!(
+        transport,
+        NewConnectionTransport::StandaloneSftp | NewConnectionTransport::Ftp
+    ) {
         NEW_CONNECTION_ADVANCED_GROUP_OFFSET
     } else {
         0.0
@@ -317,6 +327,23 @@ fn connection_secret_field_value(
             .map(|jump_form| jump_form.passphrase.as_str()),
         _ => None,
     }
+}
+
+fn toggle_primary_sftp_empty_password(form: &mut NewConnectionForm) {
+    form.empty_password = !form.empty_password;
+    form.field_focused = false;
+    form.saved_password_keychain_id = None;
+    form.password_from_store = false;
+    form.password_loaded = true;
+    form.password.zeroize();
+}
+
+fn toggle_secondary_sftp_empty_password(form: &mut NewConnectionForm) {
+    let endpoint = &mut form.standalone_sftp_secondary;
+    endpoint.empty_password = !endpoint.empty_password;
+    endpoint.password_keychain_id = None;
+    endpoint.password.zeroize();
+    form.field_focused = false;
 }
 
 fn toggle_primary_sftp_password_persistence(form: &mut NewConnectionForm) {
@@ -895,6 +922,35 @@ impl WorkspaceApp {
         let caret_visible = self.input_caret.visible();
         let (input, secret_visible) = {
             let form = self.connection_form_state(cx).form.as_ref()?;
+            let use_empty = match field {
+                NewConnectionField::Password => {
+                    form.empty_password && form.auth_tab == SshAuthTab::Password
+                }
+                NewConnectionField::StandaloneSftpSecondaryPassword => {
+                    form.standalone_sftp_secondary.empty_password
+                }
+                NewConnectionField::JumpPassword => form
+                    .jump_server_form
+                    .as_ref()
+                    .is_some_and(|jump| jump.empty_password),
+                _ => false,
+            };
+            if use_empty {
+                let input = text_input(
+                    &self.tokens,
+                    TextInputView {
+                        value: "",
+                        placeholder,
+                        focused: false,
+                        caret_visible: false,
+                        secret: true,
+                        selected_all: false,
+                        selected_range: None,
+                        marked_text: None,
+                    },
+                );
+                return Some((div().opacity(0.5).child(input).into_any_element(), None));
+            }
             let value = connection_secret_field_value(form, field)?;
             let secret_visible = connection_secret_field_visible(form, field);
             let focused = form.field_focused && form.focused_field == field;
@@ -1065,6 +1121,8 @@ impl WorkspaceApp {
                             // Native credential access may prompt or block; never run it on the UI thread.
                             store
                                 .get_saved_auth_password(&SavedAuth::Password {
+                                    empty_password: false,
+
                                     keychain_id: Some(keychain_id),
                                     plaintext_password: None,
                                 })
@@ -1511,7 +1569,7 @@ impl WorkspaceApp {
         groups
     }
 
-    pub(super) fn connection_form_group_is_ungrouped(&self, group: &str) -> bool {
+    pub(in crate::workspace) fn connection_form_group_is_ungrouped(&self, group: &str) -> bool {
         let group = group.trim();
         group.is_empty()
             || group == "Ungrouped"
@@ -1813,6 +1871,7 @@ impl WorkspaceApp {
         agent_available: Option<bool>,
         saved_credential_present: bool,
         save_password: bool,
+        empty_password: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let context = if secondary {
@@ -1912,6 +1971,16 @@ impl WorkspaceApp {
             .child(self.render_auth_selector(active_tab, context, false, cx))
             .when(active_tab == SshAuthTab::Password, |content| {
                 content
+                    .child(self.render_connection_checkbox(
+                        self.i18n.t("ssh.form.use_empty_password"),
+                        empty_password,
+                        if secondary {
+                            toggle_secondary_sftp_empty_password
+                        } else {
+                            toggle_primary_sftp_empty_password
+                        },
+                        cx,
+                    ))
                     .child(self.render_connection_secret_field(
                         self.i18n.t("ssh.form.password"),
                         String::new(),
@@ -2408,6 +2477,7 @@ impl WorkspaceApp {
         color_value: &str,
         background_color_value: &str,
         expanded: bool,
+        supports_auto_icon: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = self.tokens.ui;
@@ -2415,12 +2485,28 @@ impl WorkspaceApp {
         let preview_background = parse_rgb24_hex(background_color_value)
             .map(rgb)
             .unwrap_or_else(|| rgba((preview_color << 8) | 0x22));
-        let active_icon = session_icon_from_id(Some(icon_value)).unwrap_or(LucideIcon::Server);
+        let active_icon =
+            session_icon_from_id(Some(icon_value)).unwrap_or(LucideIcon::Server.into());
         let mut grid = div().flex().flex_wrap().gap(px(self.tokens.spacing.two));
 
-        for choice in SESSION_ICON_CHOICES {
-            let selected = icon_value.trim() == choice.id;
-            let icon_id = choice.id.to_string();
+        let choices = crate::assets::DISTRO_ICONS
+            .iter()
+            .map(|icon| {
+                (
+                    icon.id,
+                    icon.name,
+                    crate::workspace::session_icons::SessionIcon::Distro(icon),
+                )
+            })
+            .chain(
+                SESSION_ICON_CHOICES
+                    .iter()
+                    .map(|choice| (choice.id, choice.id, choice.icon.into())),
+            );
+        for (id, name, icon) in choices {
+            let selected = icon_value.trim() == id;
+            let icon_id = id.to_string();
+            let tokens = self.tokens;
             grid = grid.child(
                 div()
                     .size(px(38.0))
@@ -2440,8 +2526,26 @@ impl WorkspaceApp {
                         rgb(theme.bg)
                     })
                     .cursor_pointer()
-                    .child(Self::render_lucide_icon(
-                        choice.icon,
+                    .id(gpui::SharedString::from(format!(
+                        "session-icon-choice-{id}"
+                    )))
+                    .when(
+                        matches!(
+                            icon,
+                            crate::workspace::session_icons::SessionIcon::Distro(_)
+                        ),
+                        |button| {
+                            button.aria_label(name).tooltip(move |_, cx| {
+                                oxideterm_gpui_ui::tooltip::tooltip_view(
+                                    tokens,
+                                    name.to_owned(),
+                                    None,
+                                    cx,
+                                )
+                            })
+                        },
+                    )
+                    .child(icon.render(
                         18.0,
                         if selected {
                             rgb(theme.accent)
@@ -2455,6 +2559,9 @@ impl WorkspaceApp {
                             this.update_connection_form_state(cx, |state| {
                                 if let Some(form) = state.form.as_mut() {
                                     form.icon = icon_id.clone();
+                                    if supports_auto_icon {
+                                        form.icon_picker_expanded = false;
+                                    }
                                     clear_connection_selection(form);
                                 }
                             });
@@ -2487,21 +2594,23 @@ impl WorkspaceApp {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(Self::render_lucide_icon(
-                                    active_icon,
-                                    18.0,
-                                    rgb(preview_color),
-                                )),
+                                .child(active_icon.render(18.0, rgb(preview_color))),
                         )
                         .child(
                             button(
                                 &self.tokens,
-                                if expanded {
+                                if supports_auto_icon {
+                                    self.i18n.t("sessionManager.edit_properties.custom_icon")
+                                } else if expanded {
                                     self.i18n.t("sessionManager.edit_properties.hide_icons")
                                 } else {
                                     self.i18n.t("sessionManager.edit_properties.choose_icon")
                                 },
-                                ButtonTone::Secondary,
+                                if supports_auto_icon && !icon_value.trim().is_empty() {
+                                    ButtonTone::Primary
+                                } else {
+                                    ButtonTone::Secondary
+                                },
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -2516,19 +2625,30 @@ impl WorkspaceApp {
                                 }),
                             ),
                         )
-                        .when(!icon_value.trim().is_empty(), |row| {
+                        .when(supports_auto_icon || !icon_value.trim().is_empty(), |row| {
                             row.child(
                                 button(
                                     &self.tokens,
-                                    self.i18n.t("sessionManager.edit_properties.default_icon"),
-                                    ButtonTone::Secondary,
+                                    self.i18n.t(if supports_auto_icon {
+                                        "sessionManager.edit_properties.auto_icon"
+                                    } else {
+                                        "sessionManager.edit_properties.default_icon"
+                                    }),
+                                    if supports_auto_icon && icon_value.trim().is_empty() {
+                                        ButtonTone::Primary
+                                    } else {
+                                        ButtonTone::Secondary
+                                    },
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _event, _window, cx| {
+                                    cx.listener(move |this, _event, _window, cx| {
                                         this.update_connection_form_state(cx, |state| {
                                             if let Some(form) = state.form.as_mut() {
                                                 form.icon.clear();
+                                                if supports_auto_icon {
+                                                    form.icon_picker_expanded = false;
+                                                }
                                                 clear_connection_selection(form);
                                             }
                                         });
@@ -2537,6 +2657,28 @@ impl WorkspaceApp {
                                 ),
                             )
                         }),
+                )
+                .when(
+                    supports_auto_icon && icon_value.trim().is_empty(),
+                    |content| {
+                        content.child(self.render_connection_hint(
+                            self.i18n.t("sessionManager.edit_properties.auto_icon_hint"),
+                        ))
+                    },
+                )
+                .when(
+                    matches!(
+                        active_icon,
+                        crate::workspace::session_icons::SessionIcon::Distro(_)
+                    ),
+                    |content| {
+                        content.child(
+                            self.render_connection_hint(
+                                self.i18n
+                                    .t("sessionManager.edit_properties.brand_icon_hint"),
+                            ),
+                        )
+                    },
                 )
                 .when(expanded, |content| {
                     content.child(
@@ -2617,7 +2759,7 @@ impl WorkspaceApp {
                 false,
             ));
         }
-        // Local terminals are one-shot launch targets, so keep them after saved transports.
+        // Local profiles share the same saved-session entry point as remote transports.
         choices.push((
             NewConnectionTransport::LocalTerminal,
             self.i18n
@@ -2634,6 +2776,13 @@ impl WorkspaceApp {
             LucideIcon::FolderSync,
             true,
         ));
+        choices.push((
+            NewConnectionTransport::Ftp,
+            self.i18n.t("modals.new_connection.transport_ftp"),
+            NewConnectionField::Name,
+            LucideIcon::FolderSync,
+            true,
+        ));
         let mut sidebar = div()
             .w(px(NEW_CONNECTION_TYPE_SIDEBAR_WIDTH))
             .h_full()
@@ -2645,8 +2794,10 @@ impl WorkspaceApp {
             .border_color(rgba((theme.border << 8) | 0x80))
             .pr(px(self.tokens.spacing.three));
 
+        let mut advanced_group_started = false;
         for (transport, label, focus_field, icon, advanced) in choices {
-            if advanced {
+            if advanced && !advanced_group_started {
+                advanced_group_started = true;
                 sidebar = sidebar.child(div().flex_1()).child(
                     div()
                         .id("new-connection-advanced-group")
@@ -2687,9 +2838,9 @@ impl WorkspaceApp {
                             }),
                         ),
                 );
-                if !advanced_connections_expanded {
-                    continue;
-                }
+            }
+            if advanced && !advanced_connections_expanded {
+                continue;
             }
             let active = active_transport == transport;
             let transport_index = new_connection_transport_index(transport);
@@ -2791,6 +2942,8 @@ impl WorkspaceApp {
                             if previous_transport != transport
                                 && previous_transport != NewConnectionTransport::StandaloneSftp
                                 && transport != NewConnectionTransport::StandaloneSftp
+                                && previous_transport != NewConnectionTransport::Ftp
+                                && transport != NewConnectionTransport::Ftp
                             {
                                 // The advanced group is pinned below a flexible spacer, so its
                                 // absolute row offset cannot use the fixed-list slide animation.
@@ -2801,7 +2954,7 @@ impl WorkspaceApp {
                             }
                             apply_transport_default_port(form, previous_transport, transport);
                             apply_transport_default_username(form, previous_transport, transport);
-                            if transport == NewConnectionTransport::Rdp && previous_transport != transport {
+                            if matches!(transport, NewConnectionTransport::Rdp | NewConnectionTransport::Telnet) && previous_transport != transport {
                                 form.upstream_proxy_policy = NewConnectionUpstreamProxyPolicy::Direct;
                                 form.upstream_proxy_protocol = SavedUpstreamProxyProtocol::Socks5;
                             }
@@ -2838,19 +2991,28 @@ impl WorkspaceApp {
     }
 
     pub(super) fn render_local_terminal_form_branch(&self, cx: &mut Context<Self>) -> AnyElement {
-        let selected_shell_id = self
+        let form = self
             .connection_form_state(cx)
             .form
             .as_ref()
-            .and_then(|form| form.local_shell_id.as_deref());
-        let resolved_shell = self.resolved_local_shell(selected_shell_id);
+            .expect("local form");
+        let name = form.name.clone();
+        let cwd = form.local_cwd.clone();
+        let group = form.group.clone();
+        let selected_shell_id = form.local_shell_id.as_deref();
+        let resolved_shell = match selected_shell_id {
+            Some(id) => self
+                .effective_local_shells_for_settings(self.settings_store.settings())
+                .into_iter()
+                .find(|shell| shell.id == id),
+            None => self.resolved_local_shell(None),
+        };
         let default_shell_id = self
             .settings_store
             .settings()
             .local_terminal
             .default_shell_id
             .as_deref();
-        let shells = self.effective_local_shells_for_settings(self.settings_store.settings());
         let selected_label = resolved_shell
             .as_ref()
             .map(|shell| {
@@ -2864,7 +3026,16 @@ impl WorkspaceApp {
                     shell.label.clone()
                 }
             })
-            .unwrap_or_else(|| self.i18n.t("settings_view.local_terminal.select_shell"));
+            .unwrap_or_else(|| {
+                selected_shell_id
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.i18n.t("local_session.inherit_shell"))
+            });
+        let selected_label = if selected_shell_id.is_none() {
+            self.i18n.t("local_session.inherit_shell")
+        } else {
+            selected_label
+        };
         let selected_path = resolved_shell.as_ref().map(|shell| {
             format!(
                 "{}: {}",
@@ -2883,7 +3054,7 @@ impl WorkspaceApp {
                     NewConnectionSelect::LocalShell,
                     selected_label,
                     resolved_shell.is_none(),
-                    shells.is_empty(),
+                    false,
                     cx,
                 ),
             ))
@@ -2892,9 +3063,33 @@ impl WorkspaceApp {
             })
             .into_any_element();
 
-        // Match the shared connection form hierarchy while keeping the one-shot
-        // local terminal choice compact and backed by application settings.
-        self.render_connection_form_section(ConnectionFormSection::LocalShell, shell_field, cx)
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.metrics.modal_section_gap))
+            .child(self.render_connection_field(
+                self.i18n.t("ssh.form.name"),
+                &name,
+                self.i18n.t("ssh.form.name_placeholder"),
+                NewConnectionField::Name,
+                false,
+                cx,
+            ))
+            .child(shell_field)
+            .child(self.render_connection_field(
+                self.i18n.t("local_session.directory"),
+                &cwd,
+                self.i18n.t("local_session.inherit_directory"),
+                NewConnectionField::LocalCwd,
+                false,
+                cx,
+            ))
+            .child(self.render_connection_group_select(self.i18n.t("ssh.form.group"), &group, cx));
+        self.render_connection_form_section(
+            ConnectionFormSection::LocalShell,
+            content.into_any_element(),
+            cx,
+        )
     }
 
     pub(super) fn render_wsl_graphics_form_branch(&self, _cx: &mut Context<Self>) -> AnyElement {
@@ -3125,7 +3320,6 @@ impl WorkspaceApp {
                 cx,
             ))
             .child(self.render_connection_group_select(self.i18n.t("ssh.form.group"), &group, cx))
-            .child(self.render_connection_notes_fields(&notes, cx))
             .child(
                 div()
                     .flex()
@@ -3159,6 +3353,7 @@ impl WorkspaceApp {
                     ),
                 )
             })
+            .child(self.render_connection_notes_fields(&notes, cx))
             .into_any_element();
         let username_placeholder =
             if protocol == oxideterm_remote_desktop::RemoteDesktopProtocol::Rdp {
@@ -3586,7 +3781,6 @@ impl WorkspaceApp {
                     cx,
                 ),
             )
-            .child(self.render_connection_notes_fields(&notes, cx))
             .child(
                 div()
                     .flex()
@@ -3617,12 +3811,14 @@ impl WorkspaceApp {
                     self.tokens.ui.error,
                 ))
             })
+            .child(self.render_connection_notes_fields(&notes, cx))
             .into_any_element();
         div()
             .flex()
             .flex_col()
             .gap(px(self.tokens.metrics.modal_section_gap))
             .child(self.render_connection_form_section(ConnectionFormSection::Basic, basic, cx))
+            .child(self.render_upstream_proxy_policy_section(false, cx))
             .child(self.render_connection_form_section(
                 ConnectionFormSection::Terminal,
                 self.render_connection_terminal_options(cx),

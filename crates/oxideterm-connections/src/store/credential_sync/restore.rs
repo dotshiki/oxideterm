@@ -30,10 +30,14 @@ pub fn is_profile_credential(secret: &EncryptedPortableSecret) -> bool {
 }
 
 fn set_auth_reference(auth: &mut SavedAuth, reference: Option<String>) -> Result<()> {
+    if auth.uses_empty_password() {
+        return Ok(());
+    }
     match auth {
         SavedAuth::Password {
             keychain_id,
             plaintext_password,
+            ..
         } => {
             *keychain_id = reference;
             *plaintext_password = None;
@@ -187,6 +191,33 @@ fn update_reference(
                     set_policy_reference(&mut profile.upstream_proxy, reference)?
                 }
                 _ => bail!("Invalid remote desktop credential slot"),
+            }
+        }
+        CredentialOwner::Telnet(id) => {
+            let profile = data
+                .telnet_profiles
+                .iter_mut()
+                .find(|p| &p.id == id)
+                .context("Telnet profile is unavailable")?;
+            match target.slot {
+                CredentialSlot::UpstreamProxy => {
+                    set_policy_reference(&mut profile.upstream_proxy, reference)?
+                }
+                _ => bail!("Invalid Telnet credential slot"),
+            }
+        }
+        CredentialOwner::Ftp(id) => {
+            let profile = data
+                .ftp_profiles
+                .iter_mut()
+                .find(|p| &p.id == id)
+                .context("FTP profile is unavailable")?;
+            match target.slot {
+                CredentialSlot::Primary => profile.password_keychain_id = reference,
+                CredentialSlot::UpstreamProxy => {
+                    set_policy_reference(&mut profile.upstream_proxy, reference)?
+                }
+                _ => bail!("Invalid FTP credential slot"),
             }
         }
         CredentialOwner::GlobalProxy => {

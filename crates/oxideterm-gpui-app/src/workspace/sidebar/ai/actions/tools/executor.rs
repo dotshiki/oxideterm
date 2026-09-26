@@ -246,12 +246,11 @@ impl AiModelBackendServices {
                 )
                 .with_verified(!truncated)
             }
-            Err(error) => snapshot.fail(
-                "MCP resource read failed.",
-                "mcp_resource_read_failed",
-                error.to_string(),
-                "read",
-            ),
+            Err(error) => {
+                let mut result = snapshot.fail("MCP resource read failed.", "mcp_resource_read_failed", error.to_string(), "read");
+                result.data = serde_json::json!({"recovery":error.recovery()});
+                result
+            },
         }
     }
 
@@ -1692,6 +1691,16 @@ impl AiOrchestratorRuntimeSnapshot {
         envelope.insert("ok".to_string(), serde_json::json!(result.ok));
         envelope.insert("summary".to_string(), serde_json::json!(safe_summary));
         envelope.insert("output".to_string(), serde_json::json!(output));
+        // Keep compact interaction facts available when model formatting drops
+        // the full UI-only data payload (including the terminal screen).
+        for key in ["inputWaitReason", "tuiState"] {
+            if let Some(value) = safe_data.get(key).and_then(serde_json::Value::as_str) {
+                envelope.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        if let Some(observation) = safe_data.get("terminalObservation") {
+            envelope.insert("terminalObservation".to_string(), observation.clone());
+        }
         // Tauri omits `data` when an action did not provide it. Preserve that
         // shape so models do not learn data=null as a meaningful result.
         if !safe_data.is_null() && !data_is_internal_waiting_hint {
@@ -2102,7 +2111,11 @@ async fn execute_ai_tool_uncoordinated(
     post_user_approval: bool,
     dangerous_command_approved: bool,
     leases: Vec<oxideterm_ai::agent::AgentToolLease>,
+    dispatch: Option<oxideterm_ai::agent::AgentDispatch>,
 ) -> AiExecutedToolResult {
+    if dispatch.as_ref().is_some_and(|guard| guard.check().is_err()) {
+        return rejected_ai_tool_result(tool_call_id, tool_name, "agent_direction_changed", "Task direction changed before dispatch.");
+    }
     if ai_rejects_legacy_live_target_argument(&tool_name, &args) {
         return rejected_ai_tool_result(
             tool_call_id,
@@ -2119,6 +2132,7 @@ async fn execute_ai_tool_uncoordinated(
             conversation_id,
             assistant_id,
             AiStreamDeliveryEvent::ToolExecutionRequested {
+                dispatch,
                 leases,
                 tool_session_id: tool_session_id.clone(),
                 tool_call_id: tool_call_id.clone(),

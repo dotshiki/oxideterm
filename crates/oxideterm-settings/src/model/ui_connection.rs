@@ -134,9 +134,23 @@ fn default_show_app_lock_icon() -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSortOrder {
+    #[default]
+    Default,
+    NameAscending,
+    NameDescending,
+    ConnectedFirst,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SidebarUiState {
+    #[serde(default)]
+    pub session_sort_order: SessionSortOrder,
+    #[serde(default)]
+    pub session_manual_order: Vec<String>,
     pub collapsed: bool,
     pub active_section: String,
     pub width: i64,
@@ -154,6 +168,8 @@ impl Default for SidebarUiState {
         Self {
             collapsed: false,
             active_section: "sessions".to_string(),
+            session_sort_order: SessionSortOrder::Default,
+            session_manual_order: Vec::new(),
             width: 300,
             ai_sidebar_collapsed: true,
             ai_sidebar_width: AI_SIDEBAR_DEFAULT_WIDTH,

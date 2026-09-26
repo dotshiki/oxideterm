@@ -67,8 +67,8 @@ pub fn ai_prompt_token_breakdown(
         if message.role == AiChatRole::Assistant
             && let Some(provider_state_tokens) = provider_state_tokens
         {
-            // Gemini replays signed parts instead of rebuilding the visible
-            // assistant message, so counting both would double the same turn.
+            // Native replay replaces the visible projection; counting both
+            // would double the same assistant turn.
             breakdown.tool_results = breakdown.tool_results.saturating_add(provider_state_tokens);
             continue;
         }
@@ -178,6 +178,9 @@ fn ai_provider_parts_estimated_tokens(
     message: &AiChatMessage,
     provider_type: &str,
 ) -> Option<usize> {
+    if matches!(provider_type, "openai" | "openai_compatible") {
+        return crate::responses_state::responses_history_tokens(message);
+    }
     (provider_type == "gemini")
         .then(|| super::turn::ai_provider_parts(message, provider_type))
         .flatten()
@@ -228,12 +231,11 @@ pub fn normalize_ai_stream_history_for_provider(history: &mut Vec<AiChatMessage>
                 }
             }
             AiChatRole::Assistant => {
-                if message.content.trim().is_empty() {
+                if message.content.trim().is_empty() && !crate::has_responses_history(&message) {
                     continue;
                 }
-                // Tauri replays prior turns as plain assistant text. Tool protocol
-                // messages are only emitted inside the live tool loop, where every
-                // assistant tool_call is immediately followed by its matching tool result.
+                // Runtime tool fields cannot survive across turns. Responses keeps
+                // completed wire rounds separately in the scoped turn metadata.
                 message.tool_calls.clear();
                 message.tool_call_id = None;
                 message.thinking_content = None;
@@ -365,14 +367,7 @@ pub fn should_retain_stopped_ai_message(message: &AiChatMessage) -> bool {
 }
 
 pub fn cancel_rejected_tool_call(call: &serde_json::Value) -> Option<(String, String, String)> {
-    let status = call
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if matches!(status, "completed" | "error" | "rejected") {
-        return None;
-    }
-    if call.get("result").is_some_and(|result| !result.is_null()) {
+    if !crate::persistence::ai_tool_call_is_unfinished(call) {
         return None;
     }
     let id = call.get("id").and_then(serde_json::Value::as_str)?;
@@ -402,7 +397,7 @@ pub fn ai_estimated_tokens(text: &str) -> usize {
 }
 
 pub fn ai_response_reserve(context_window: usize) -> usize {
-    (((context_window as f64) * 0.15).floor() as usize).min(4096)
+    ((context_window as f64) * 0.15).floor() as usize
 }
 
 pub const AI_HISTORY_BUDGET_RATIO: f32 = 0.7;
@@ -604,28 +599,27 @@ fn trim_ai_stream_history_with_estimator(
         .saturating_sub(response_reserve)
         .saturating_sub(system_tokens)
         .saturating_sub(fixed_prompt_overhead);
-    if budget == 0 {
-        // Preserve the latest request even when fixed prompt overhead consumes
-        // the entire history budget.
-        let keep_index = regular_indices[total_regular - 1];
-        *history = history
-            .drain(..)
-            .enumerate()
-            .filter_map(|(index, message)| {
-                (message.role == AiChatRole::System || index == keep_index).then_some(message)
-            })
-            .collect();
-        return total_regular.saturating_sub(1);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for index in regular_indices {
+        if history[index].role == AiChatRole::Tool && !groups.is_empty() {
+            groups.last_mut().unwrap().push(index);
+        } else {
+            groups.push(vec![index]);
+        }
     }
     let mut kept_indices = std::collections::HashSet::<usize>::new();
     let mut used = 0usize;
-    for index in regular_indices.iter().rev().copied() {
-        let tokens = estimate_message(&history[index]);
+    for group in groups.iter().rev() {
+        let tokens = group
+            .iter()
+            .map(|index| estimate_message(&history[*index]))
+            .sum::<usize>();
         if used.saturating_add(tokens) > budget && !kept_indices.is_empty() {
             break;
         }
+        // Keep the latest request/complete tool round even if it alone exceeds the budget.
         used = used.saturating_add(tokens);
-        kept_indices.insert(index);
+        kept_indices.extend(group.iter().copied());
     }
     let kept_regular = kept_indices.len();
     if kept_regular >= total_regular {
@@ -684,9 +678,9 @@ pub fn ai_orchestrator_system_prompt(tool_use_enabled: bool) -> String {
             "- Do not pass command text such as `pwd`, `docker ps`, `ls -la`, or `sudo ...` to `select_target`; first select the execution target, then call `run_command`.",
             "- Saved SSH connections are not live shells. To run a command there, call `connect_target`, then rediscover the current terminal handle before calling `run_command` so the command is visible to the user.",
             "- If `run_command` returns `execution.visibleInTerminal: true`, the command was sent through a visible terminal session. If it returns `false`, it was a backend capture and you must not say it appeared in the terminal.",
-            "- Treat `execution.state: \"sent\"` as dispatch only. Do not summarize command results until tool output, `exitCode`, or `execution.state: \"completed\"` / `\"output_captured\"` proves what happened.",
+            "- Treat `execution.state: \"sent\"` as dispatch only and `\"output_captured\"` as observed output, not completion. Report only what the output proves; use a completed command record or exit status to establish completion, and check the result before claiming success.",
             "- Use `send_terminal_input` only after `observe_terminal` confirms the current interactive state. It may send literal text or one declared control/navigation key; use `run_command` for shell commands.",
-            "- Use `wait_terminal_output` for prompts, literal output, TUI transitions, or tracked command completion instead of guessing from elapsed time.",
+            "- Use `wait_terminal_output` for prompts, literal output, TUI transitions, or tracked command completion. Observation calls yield within 30 seconds; an expired observation does not mean the command failed or was interrupted. Inspect terminalObservation: completionConfirmed establishes a tracked exit, shell_ready means the prompt returned with unknown exit status, and canRunCommand indicates whether another command may be submitted. Quiet output alone does not free terminal input. Continue observing or do independent work when completion is unknown; do not repeat the original command or ask the user to confirm merely because an observation yielded.",
             "- Saved serial, Telnet, RDP, and VNC profiles must be opened through `open_transport_profile`; then rediscover the live terminal or remote-desktop owner before operating it.",
             "- Use `manage_telnet_session` for Telnet IAC controls such as IP, AO, AYT, and BRK. Do not emulate those protocol commands with literal terminal bytes.",
             "- Credential tools expose metadata and deletion only. Never ask another tool to reveal, synthesize, or persist a password, private key, passphrase, or token.",
@@ -706,11 +700,22 @@ pub fn ai_orchestrator_system_prompt(tool_use_enabled: bool) -> String {
         "- Do not claim something was connected, executed, read, modified, or verified until current context or a successful tool result proves it.",
         "- Current UI tab is only a ranking hint. It is not a capability boundary.",
         "",
+        "### Intent / Authorization",
+        "- When the user asks you to perform work and tools are available, execute the necessary steps, inspect their results, and continue until the requested outcome is achieved or a concrete blocker requires user input. Do not stop at suggested commands. Requests for explanation, review, or a plan alone do not authorize changes.",
+        "- Authorization already given in the conversation continues to apply to the same task and targets unless the user changes or revokes it. Do not ask again merely because the next authorized step uses privileges or affects a service. Ask before expanding the target or scope, or taking a materially different destructive or credential-sensitive action.",
+        "- User authorization and runtime tool approval are separate requirements. Follow the current runtime policy: submit an authorized tool action to its normal approval flow instead of adding a duplicate conversational confirmation. If approval is denied or an action is disabled, do not bypass it through another tool or command. An allowed tool does not by itself authorize work the user did not request.",
+        "- Detected intent hints are advisory. The user's actual instructions, including requests to inspect without changing anything, take precedence.",
+        "",
         "### Terminal Safety",
         "- Never echo, display, or log secrets. Redact tokens, passwords, private keys, API keys, cookies, and credentials from command output.",
-        "- Dangerous commands must not be casual suggestions. Explain the risk and require explicit user confirmation before destructive, privileged, credential-sensitive, or service-impacting operations.",
+        "- Make consequential changes deliberate and scoped. Explain a concrete risk when seeking missing authorization; do not repeatedly warn about an action the user has already authorized.",
         "- Do not guess passwords, passphrases, sudo prompts, host key answers, or interactive confirmation input.",
-        "- If a result has `waitingForInput`, stop and tell the user what input is needed. Do not repeat the command.",
+        "- Only `waitingForInput: true` signals a possible input wait; false or an absent field is not a request to stop. `inputWaitReason: \"credential_prompt\"` comes from terminal state, while `\"possible_credential_prompt\"` is a text heuristic and needs fresh observation. Never invent or expose credentials; let the user supply them through the application's credential UI or terminal. Do not repeat the command to escape a prompt.",
+        "- For an observed ordinary menu or non-sensitive interactive step already covered by the user's request, continue using the supported input tools and observe the result. `tuiState: \"alternate_screen\"` identifies a TUI, not a credential request; `\"shell\"` does not prove readiness or command completion. If the prompt, required value, or authorization is unclear, obtain the missing information before answering it. Do not guess host-key trust decisions.",
+        "",
+        "### Execution Environment",
+        "- Local OS describes the machine running OxideTerm, not a remote execution target. Bind each command and path to the selected target's verified OS, shell, and working directory. If remote facts are unknown, inspect that target's metadata or use a suitable read-only probe before choosing platform-specific commands. Never assume remote Linux, macOS, Windows, or a particular shell from the local environment.",
+        "- Active-tab and inferred-directory context are hints, not instructions to switch targets. Keep working on the user's selected target until the task or user requires a change.",
         "",
         "### Tool Use Rules",
         &tool_use_policy,
@@ -782,27 +787,12 @@ pub const AI_CONTEXT_WARNING_PERCENT: f32 = 70.0;
 pub const AI_CONTEXT_DANGER_PERCENT: f32 = 85.0;
 pub const AI_COMPACTION_DEFAULT_CONTEXT_WINDOW: usize = crate::DEFAULT_CONTEXT_WINDOW as usize;
 pub const AI_USER_MEMORY_MAX_CHARS: usize = 16_000;
-pub const DEFAULT_AI_SYSTEM_PROMPT: &str = r#"You are OxideSens, a terminal-aware assistant inside OxideTerm.
-
-## Identity / Scope
-- Help with shell commands, scripts, terminal output, files, connections, and OxideTerm workflows.
-- Be concise, direct, and honest about what you can verify.
-- Do not claim that you connected, executed, changed, read, or verified anything unless the available context or a successful tool result proves it.
-
-## Terminal Safety
-- Treat terminal actions as real operations on the user's machine or remote hosts.
-- Do not present dangerous commands as casual suggestions. For destructive, privileged, credential-sensitive, or service-impacting commands, explain the risk first and require explicit user confirmation.
-- Never echo, display, or log secrets. If command output contains tokens, passwords, private keys, API keys, cookies, or credentials, redact them in your response.
-- Do not guess passwords, passphrases, sudo prompts, host key answers, or interactive confirmation input.
-
-## Output Handling
-- If output is incomplete, sampled, or truncated, say that your conclusion is limited to the visible output.
-- If a command or tool fails, read the error, explain the likely cause, and adapt the next step. Do not repeat the same failing command unchanged.
-- When commands may invoke pagers, prefer non-pager forms such as `git --no-pager ...`, `GIT_PAGER=cat`, `journalctl --no-pager`, `man ... | col -b | head`, or command-specific no-pager flags.
+pub const DEFAULT_AI_SYSTEM_PROMPT: &str = r#"Help with shell commands, scripts, terminal output, files, connections, and OxideTerm workflows.
 
 ## Response Style
-- Prefer actionable answers over long theory.
-- When tools or file access are available, do not ask the user to manually copy text into files just to complete a task; use the available mechanisms or answer directly.
+- Be concise, direct, and honest about what you can verify.
+- Lead with the result or the next necessary action. Match the user's language and level of detail.
+- Explain findings, changes, and concrete blockers without narrating every tool call.
 - Format commands and paths clearly in markdown."#;
 pub const AI_SUGGESTIONS_INSTRUCTION: &str = r#"
 

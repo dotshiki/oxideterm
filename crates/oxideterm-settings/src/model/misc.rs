@@ -104,6 +104,11 @@ pub enum FileTransferProtocolPreference {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdeSettings {
+    pub font_family: Option<FontFamily>,
+    #[serde(default)]
+    pub custom_font_family: String,
+    pub cjk_font_family: Option<String>,
+    pub font_weight: Option<i64>,
     pub auto_save: bool,
     pub font_size: Option<i64>,
     pub line_height: Option<f64>,
@@ -116,6 +121,10 @@ pub struct IdeSettings {
 impl Default for IdeSettings {
     fn default() -> Self {
         Self {
+            font_family: None,
+            custom_font_family: String::new(),
+            cjk_font_family: None,
+            font_weight: None,
             auto_save: false,
             font_size: None,
             line_height: None,
@@ -175,19 +184,15 @@ pub enum SettingsUpstreamProxyProtocol {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SettingsUpstreamProxyAuth {
+    #[default]
     None,
     Password {
         username: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         keychain_id: Option<String>,
     },
-}
-
-impl Default for SettingsUpstreamProxyAuth {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -386,6 +391,8 @@ fn default_host_tool_enabled() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct WindowUiState {
     #[serde(default)]
+    pub knowledge_editor: KnowledgeEditorUiState,
+    #[serde(default)]
     pub normal_bounds: Option<WindowGeometry>,
     #[serde(default)]
     pub maximized: bool,
@@ -393,6 +400,31 @@ pub struct WindowUiState {
     pub fullscreen: bool,
     #[serde(flatten)]
     pub extra: ExtraFields,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KnowledgeEditorMode {
+    #[default]
+    Source,
+    Preview,
+    Split,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KnowledgeEditorUiState {
+    pub mode: KnowledgeEditorMode,
+    pub source_ratio: f32,
+}
+
+impl Default for KnowledgeEditorUiState {
+    fn default() -> Self {
+        Self {
+            mode: KnowledgeEditorMode::Source,
+            source_ratio: 0.5,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -545,10 +577,7 @@ mod misc_tests {
         let restored: PersistedSettings =
             serde_json::from_value(serialized.clone()).expect("settings should deserialize");
 
-        assert_eq!(
-            serialized["settingsNavigation"]["groups"][0][0],
-            "terminal"
-        );
+        assert_eq!(serialized["settingsNavigation"]["groups"][0][0], "terminal");
         assert_eq!(restored.settings_navigation, settings.settings_navigation);
     }
 
@@ -666,6 +695,10 @@ mod misc_tests {
         let serialized = settings.to_value();
 
         assert_eq!(serialized["network"]["applicationProxyMode"], "direct");
-        assert!(serialized["network"].get("applicationProxyEnabled").is_none());
+        assert!(
+            serialized["network"]
+                .get("applicationProxyEnabled")
+                .is_none()
+        );
     }
 }

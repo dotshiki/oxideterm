@@ -576,7 +576,27 @@ impl ConnectionStore {
                 profile.updated_at = now;
             }
         }
+        for profile in &mut self.data.local_terminal_profiles {
+            if profile
+                .group
+                .as_deref()
+                .is_some_and(|group| group_path_is_within(group, &name))
+            {
+                profile.group = None;
+                profile.updated_at = now;
+            }
+        }
         for profile in &mut self.data.telnet_profiles {
+            if profile
+                .group
+                .as_deref()
+                .is_some_and(|group| group_path_is_within(group, &name))
+            {
+                profile.group = None;
+                profile.updated_at = now;
+            }
+        }
+        for profile in &mut self.data.ftp_profiles {
             if profile
                 .group
                 .as_deref()
@@ -667,7 +687,29 @@ impl ConnectionStore {
                 updated += 1;
             }
         }
+        for profile in &mut self.data.local_terminal_profiles {
+            if let Some(renamed) = profile
+                .group
+                .as_deref()
+                .and_then(|group| rename_group_path(group, &old_name, &new_name))
+            {
+                profile.group = Some(renamed);
+                profile.updated_at = now;
+                updated += 1;
+            }
+        }
         for profile in &mut self.data.telnet_profiles {
+            if let Some(renamed) = profile
+                .group
+                .as_deref()
+                .and_then(|group| rename_group_path(group, &old_name, &new_name))
+            {
+                profile.group = Some(renamed);
+                profile.updated_at = now;
+                updated += 1;
+            }
+        }
+        for profile in &mut self.data.ftp_profiles {
             if let Some(renamed) = profile
                 .group
                 .as_deref()
@@ -719,7 +761,7 @@ impl ConnectionStore {
     }
 
     pub fn move_to_group(&mut self, ids: &[String], group: Option<&str>) -> Result<usize> {
-        self.move_session_assets_to_group(ids, &[], &[], &[], &[], &[], group)
+        self.move_session_assets_to_group(ids, &[], &[], &[], &[], &[], &[], &[], group)
     }
 
     /// Moves all saved Session Manager asset types in one metadata save.
@@ -727,20 +769,24 @@ impl ConnectionStore {
         &mut self,
         connection_ids: &[String],
         serial_profile_ids: &[String],
+        local_terminal_profile_ids: &[String],
         telnet_profile_ids: &[String],
         mosh_profile_ids: &[String],
         standalone_sftp_profile_ids: &[String],
         remote_desktop_ids: &[String],
+        ftp_profile_ids: &[String],
         group: Option<&str>,
     ) -> Result<usize> {
         let group = normalize_optional_group_name(group)?;
         let connection_id_set = connection_ids.iter().collect::<HashSet<_>>();
+        let local_terminal_profile_id_set = local_terminal_profile_ids.iter().collect::<HashSet<_>>();
         let serial_profile_id_set = serial_profile_ids.iter().collect::<HashSet<_>>();
         let telnet_profile_id_set = telnet_profile_ids.iter().collect::<HashSet<_>>();
         let mosh_profile_id_set = mosh_profile_ids.iter().collect::<HashSet<_>>();
         let standalone_sftp_profile_id_set =
             standalone_sftp_profile_ids.iter().collect::<HashSet<_>>();
         let remote_desktop_id_set = remote_desktop_ids.iter().collect::<HashSet<_>>();
+        let ftp_profile_id_set = ftp_profile_ids.iter().collect::<HashSet<_>>();
         let now = Utc::now();
         let mut updated = 0;
         for conn in &mut self.data.connections {
@@ -752,6 +798,13 @@ impl ConnectionStore {
         }
         for profile in &mut self.data.serial_profiles {
             if serial_profile_id_set.contains(&profile.id) {
+                profile.group = group.clone();
+                profile.updated_at = now;
+                updated += 1;
+            }
+        }
+        for profile in &mut self.data.local_terminal_profiles {
+            if local_terminal_profile_id_set.contains(&profile.id) {
                 profile.group = group.clone();
                 profile.updated_at = now;
                 updated += 1;
@@ -773,6 +826,13 @@ impl ConnectionStore {
         }
         for profile in &mut self.data.standalone_sftp_profiles {
             if standalone_sftp_profile_id_set.contains(&profile.id) {
+                profile.group = group.clone();
+                profile.updated_at = now;
+                updated += 1;
+            }
+        }
+        for profile in &mut self.data.ftp_profiles {
+            if ftp_profile_id_set.contains(&profile.id) {
                 profile.group = group.clone();
                 profile.updated_at = now;
                 updated += 1;
@@ -1002,6 +1062,8 @@ impl ConnectionStore {
         let group = normalize_optional_group_name(request.group.as_deref())?;
         let now = Utc::now();
         let id = request.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let previous_credentials =
+            self.stored_credential_targets(&CredentialOwner::Telnet(id.clone()));
         let mut profile = self
             .data
             .telnet_profiles
@@ -1014,7 +1076,7 @@ impl ConnectionStore {
                 profile.id = id.clone();
                 profile
             });
-
+        let old_proxy_ids = collect_keychain_ids_for_upstream_proxy(&profile.upstream_proxy);
         profile.name = request.name.trim().to_string();
         profile.group = group;
         profile.notes = normalize_optional_text(request.notes);
@@ -1023,6 +1085,13 @@ impl ConnectionStore {
         profile.icon_background_color = normalize_optional_text(request.icon_background_color);
         profile.host = request.host.trim().to_string();
         profile.port = request.port;
+        profile.upstream_proxy = self.materialize_upstream_proxy_policy(
+            request
+                .upstream_proxy
+                .unwrap_or_else(|| profile.upstream_proxy.clone()),
+            Some(&profile.upstream_proxy),
+        )?;
+        let next_proxy_ids = collect_keychain_ids_for_upstream_proxy(&profile.upstream_proxy);
         profile.terminal = request.terminal;
         profile.connect_on_open = request.connect_on_open.unwrap_or(false);
         if !self
@@ -1046,17 +1115,34 @@ impl ConnectionStore {
         } else {
             self.data.telnet_profiles.push(profile.clone());
         }
+        self.record_cleared_credentials(previous_credentials);
         self.normalize();
         self.save()?;
+        for id in old_proxy_ids
+            .into_iter()
+            .filter(|id| !next_proxy_ids.contains(id))
+        {
+            self.delete_or_queue_connection_keychain_entry(id)?;
+        }
         Ok(profile)
     }
 
     pub fn delete_telnet_profile(&mut self, id: &str) -> Result<bool> {
+        let proxy_ids = self
+            .data
+            .telnet_profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| collect_keychain_ids_for_upstream_proxy(&p.upstream_proxy))
+            .unwrap_or_default();
         let before = self.data.telnet_profiles.len();
         self.data.telnet_profiles.retain(|profile| profile.id != id);
         let deleted = self.data.telnet_profiles.len() != before;
         if deleted {
             self.save()?;
+            for reference in proxy_ids {
+                self.delete_or_queue_connection_keychain_entry(reference)?;
+            }
         }
         Ok(deleted)
     }
@@ -2211,6 +2297,9 @@ impl ConnectionStore {
 
     pub fn get_saved_auth_password(&self, auth: &SavedAuth) -> Result<SecretString> {
         let auth = auth.conventional_fallback();
+        if auth.uses_empty_password() {
+            return Ok(SecretString::default());
+        }
         match auth {
             SavedAuth::Password {
                 keychain_id: Some(keychain_id),
@@ -2314,10 +2403,15 @@ impl ConnectionStore {
     }
 
     pub fn copy_saved_auth_for_new_owner(&self, auth: &SavedAuth) -> Result<SavedAuth> {
+        if auth.uses_empty_password() {
+            return Ok(auth.clone());
+        }
         // The destination receives a temporary zeroizing secret and creates its own keychain
         // entry during upsert; sharing the source keychain id would couple deletion lifetimes.
         match auth {
             SavedAuth::Password { .. } => Ok(SavedAuth::Password {
+                empty_password: false,
+
                 keychain_id: None,
                 plaintext_password: Some(self.get_saved_auth_password(auth)?),
             }),
@@ -2640,10 +2734,27 @@ impl ConnectionStore {
         auth: SavedAuth,
         existing_auth: Option<&SavedAuth>,
     ) -> Result<(SavedAuth, Option<SecretString>)> {
+        if matches!(
+            &auth,
+            SavedAuth::Password {
+                empty_password: true,
+                ..
+            }
+        ) {
+            return Ok((
+                SavedAuth::Password {
+                    empty_password: true,
+                    keychain_id: None,
+                    plaintext_password: None,
+                },
+                Some(SecretString::default()),
+            ));
+        }
         match auth {
             SavedAuth::Password {
                 keychain_id,
                 plaintext_password,
+                ..
             } => {
                 if let Some(password) = plaintext_password {
                     let keychain_id = existing_password_keychain_id(existing_auth)
@@ -2652,6 +2763,8 @@ impl ConnectionStore {
                     self.keychain.store(&keychain_id, &password)?;
                     Ok((
                         SavedAuth::Password {
+                            empty_password: false,
+
                             keychain_id: Some(keychain_id),
                             plaintext_password: None,
                         },
@@ -2660,6 +2773,8 @@ impl ConnectionStore {
                 } else {
                     Ok((
                         SavedAuth::Password {
+                            empty_password: false,
+
                             keychain_id,
                             plaintext_password: None,
                         },
@@ -3274,6 +3389,9 @@ impl ConnectionStore {
     }
 
     fn clone_auth_secret(&self, auth: &SavedAuth) -> Result<SavedAuth> {
+        if auth.uses_empty_password() {
+            return Ok(auth.clone());
+        }
         match auth {
             SavedAuth::Password {
                 keychain_id: Some(keychain_id),
@@ -3283,6 +3401,8 @@ impl ConnectionStore {
                 let next_keychain_id = new_password_keychain_id();
                 self.keychain.store(&next_keychain_id, &password)?;
                 Ok(SavedAuth::Password {
+                    empty_password: false,
+
                     keychain_id: Some(next_keychain_id),
                     plaintext_password: None,
                 })
@@ -3292,6 +3412,8 @@ impl ConnectionStore {
             } => Ok(SavedAuth::Password {
                 keychain_id: None,
                 plaintext_password: None,
+
+                empty_password: false,
             }),
             SavedAuth::Key {
                 key_path,
@@ -3360,13 +3482,14 @@ impl ConnectionStore {
     fn normalize(&mut self) {
         self.data.connection_tombstones =
             active_connection_tombstones(&self.data.connection_tombstones);
+        self.data.ftp_tombstones = active_connection_tombstones(&self.data.ftp_tombstones);
+        self.data.local_terminal_tombstones = active_connection_tombstones(&self.data.local_terminal_tombstones);
         self.data
             .recent
             .retain(|recent_id| self.data.connections.iter().any(|conn| &conn.id == recent_id));
         self.data.recent.dedup();
         self.data
-            .groups
-            .sort_by(|left, right| left.to_lowercase().cmp(&right.to_lowercase()));
+            .groups.sort_by_key(|left| left.to_lowercase());
         self.data.groups.dedup();
         let implicit_groups = self
             .data
@@ -3384,6 +3507,7 @@ impl ConnectionStore {
             .serial_profiles
             .iter()
             .filter_map(|profile| profile.group.clone())
+            .chain(self.data.ftp_profiles.iter().filter_map(|profile|profile.group.clone()))
             .chain(
                 self.data
                     .telnet_profiles
@@ -3408,6 +3532,7 @@ impl ConnectionStore {
                     .iter()
                     .filter_map(|profile| profile.group.clone()),
             )
+            .chain(self.data.local_terminal_profiles.iter().filter_map(|profile| profile.group.clone()))
             .collect::<Vec<_>>();
         for group in implicit_local_groups {
             if !self.data.groups.contains(&group) {
@@ -3424,6 +3549,7 @@ impl ConnectionStore {
         self.data
             .connections
             .sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        self.data.local_terminal_profiles.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         self.data
             .serial_profiles
             .sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
@@ -3439,6 +3565,7 @@ impl ConnectionStore {
         self.data
             .standalone_sftp_profiles
             .sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        self.data.ftp_profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
     }
 
     fn add_connection(&mut self, connection: SavedConnection) {

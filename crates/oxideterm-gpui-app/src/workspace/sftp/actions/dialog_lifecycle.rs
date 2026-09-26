@@ -8,7 +8,7 @@ impl WorkspaceApp {
         cx: &App,
     ) where
         F: FnOnce(
-                SftpSession,
+                ftp::MutationSession,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
             > + Send
@@ -25,7 +25,7 @@ impl WorkspaceApp {
         cx: &App,
     ) where
         F: FnOnce(
-                SftpSession,
+                ftp::MutationSession,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
             > + Send
@@ -41,14 +41,11 @@ impl WorkspaceApp {
         let Some(backend) = self.sftp_remote_backend(&remote_id) else {
             return;
         };
-        let tx = self.sftp_view.read(cx).worker_sender();
+        let tx = self.sftp_view().read(cx).worker_sender();
         let runtime = self.forwarding_runtime.clone();
         runtime.spawn(async move {
             let result = async {
-                let sftp = backend
-                    .acquire_transfer_sftp()
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let sftp = backend.mutation_session().await?;
                 operation(sftp).await
             }
             .await;
@@ -86,7 +83,7 @@ impl WorkspaceApp {
             oxideterm_gpui_ui::motion::MotionDuration::Control,
         );
         if self
-            .sftp_view
+            .sftp_view()
             .update(cx, |sftp, cx| sftp.begin_dialog_exit(delay, cx))
         {
             self.ime_marked_text = None;
@@ -94,12 +91,12 @@ impl WorkspaceApp {
     }
 
     pub(in crate::workspace::sftp) fn stop_sftp_preview_media(&mut self, cx: &mut Context<Self>) {
-        self.sftp_view
+        self.sftp_view()
             .update(cx, |sftp, _cx| sftp.stop_preview_media());
     }
 
     pub(in crate::workspace::sftp) fn toggle_sftp_preview_audio(&mut self, cx: &mut Context<Self>) {
-        self.sftp_view
+        self.sftp_view()
             .update(cx, |sftp, cx| sftp.toggle_preview_audio(cx));
     }
 
@@ -108,18 +105,18 @@ impl WorkspaceApp {
         position: std::time::Duration,
         cx: &mut Context<Self>,
     ) {
-        self.sftp_view
+        self.sftp_view()
             .update(cx, |sftp, cx| sftp.seek_preview_audio(position, cx));
     }
 
     pub(in crate::workspace::sftp) fn accept_sftp_dialog(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.sftp_view.read(cx).dialog() else {
+        let Some(dialog) = self.sftp_view().read(cx).dialog() else {
             return;
         };
         match dialog {
             SftpDialog::Rename { pane, old_name } => {
                 let new_name = self
-                    .sftp_view
+                    .sftp_view()
                     .read(cx)
                     .input_value(SftpInput::DialogValue)
                     .trim()
@@ -129,7 +126,7 @@ impl WorkspaceApp {
                     && !new_name.is_empty()
                 {
                     let old_path = {
-                        let sftp = self.sftp_view.read(cx);
+                        let sftp = self.sftp_view().read(cx);
                         sftp.local_files
                             .iter()
                             .find(|file| file.name == old_name)
@@ -149,11 +146,7 @@ impl WorkspaceApp {
                     self.spawn_sftp_pane_remote_mutation(
                         pane,
                         move |sftp| {
-                            Box::pin(async move {
-                                sftp.rename(&old_path, &new_path)
-                                    .await
-                                    .map_err(|error| error.to_string())
-                            })
+                            Box::pin(async move { sftp.rename(&old_path, &new_path).await })
                         },
                         Some(toast),
                         cx,
@@ -164,13 +157,13 @@ impl WorkspaceApp {
                 if !new_name.is_empty() {
                     match pane {
                         SftpPane::Local => {
-                            let local_path = self.sftp_view.read(cx).local_path.clone();
+                            let local_path = self.sftp_view().read(cx).local_path.clone();
                             let old_path = join_local_path(&local_path, &old_name);
                             let new_path = join_local_path(&local_path, &new_name);
                             match std::fs::rename(old_path, new_path) {
                                 Ok(()) => {
                                     if let Ok(files) = list_local_files(&local_path) {
-                                        self.sftp_view.update(cx, |sftp, cx| {
+                                        self.sftp_view().update(cx, |sftp, cx| {
                                             sftp.local_files = files;
                                             cx.notify();
                                         });
@@ -198,7 +191,7 @@ impl WorkspaceApp {
                         }
                         SftpPane::Remote => {
                             let old_path = {
-                                let sftp = self.sftp_view.read(cx);
+                                let sftp = self.sftp_view().read(cx);
                                 sftp.remote_files
                                     .iter()
                                     .find(|file| file.name == old_name)
@@ -217,11 +210,7 @@ impl WorkspaceApp {
                             };
                             self.spawn_remote_sftp_mutation(
                                 move |sftp| {
-                                    Box::pin(async move {
-                                        sftp.rename(&old_path, &new_path)
-                                            .await
-                                            .map_err(|error| error.to_string())
-                                    })
+                                    Box::pin(async move { sftp.rename(&old_path, &new_path).await })
                                 },
                                 Some(toast),
                                 cx,
@@ -232,7 +221,7 @@ impl WorkspaceApp {
             }
             SftpDialog::NewFolder { pane } => {
                 let name = self
-                    .sftp_view
+                    .sftp_view()
                     .read(cx)
                     .input_value(SftpInput::DialogValue)
                     .trim()
@@ -241,7 +230,7 @@ impl WorkspaceApp {
                     && self.sftp_pair_primary_remote_id(cx).is_some()
                     && !name.is_empty()
                 {
-                    let path = join_sftp_path(&self.sftp_view.read(cx).local_path, &name);
+                    let path = join_sftp_path(&self.sftp_view().read(cx).local_path, &name);
                     let toast = SftpMutationToast {
                         success_title: self.i18n.t("sftp.toast.folder_created"),
                         success_description: Some(name),
@@ -249,11 +238,7 @@ impl WorkspaceApp {
                     };
                     self.spawn_sftp_pane_remote_mutation(
                         pane,
-                        move |sftp| {
-                            Box::pin(async move {
-                                sftp.mkdir(&path).await.map_err(|error| error.to_string())
-                            })
-                        },
+                        move |sftp| Box::pin(async move { sftp.mkdir(&path).await }),
                         Some(toast),
                         cx,
                     );
@@ -263,12 +248,12 @@ impl WorkspaceApp {
                 if !name.is_empty() {
                     match pane {
                         SftpPane::Local => {
-                            let local_path = self.sftp_view.read(cx).local_path.clone();
+                            let local_path = self.sftp_view().read(cx).local_path.clone();
                             let path = join_local_path(&local_path, &name);
                             match std::fs::create_dir_all(path) {
                                 Ok(()) => {
                                     if let Ok(files) = list_local_files(&local_path) {
-                                        self.sftp_view.update(cx, |sftp, cx| {
+                                        self.sftp_view().update(cx, |sftp, cx| {
                                             sftp.local_files = files;
                                             cx.notify();
                                         });
@@ -291,7 +276,7 @@ impl WorkspaceApp {
                             }
                         }
                         SftpPane::Remote => {
-                            let remote_path = self.sftp_view.read(cx).remote_path.clone();
+                            let remote_path = self.sftp_view().read(cx).remote_path.clone();
                             let path = join_sftp_path(&remote_path, &name);
                             let toast = SftpMutationToast {
                                 success_title: self.i18n.t("sftp.toast.folder_created"),
@@ -299,11 +284,7 @@ impl WorkspaceApp {
                                 error_title: self.i18n.t("sftp.toast.create_folder_failed"),
                             };
                             self.spawn_remote_sftp_mutation(
-                                move |sftp| {
-                                    Box::pin(async move {
-                                        sftp.mkdir(&path).await.map_err(|error| error.to_string())
-                                    })
-                                },
+                                move |sftp| Box::pin(async move { sftp.mkdir(&path).await }),
                                 Some(toast),
                                 cx,
                             );
@@ -313,7 +294,7 @@ impl WorkspaceApp {
             }
             SftpDialog::Delete { pane, files } => {
                 if pane == SftpPane::Local && self.sftp_pair_primary_remote_id(cx).is_some() {
-                    let local_files = self.sftp_view.read(cx).local_files.clone();
+                    let local_files = self.sftp_view().read(cx).local_files.clone();
                     let targets = files
                         .iter()
                         .filter_map(|name| {
@@ -337,9 +318,7 @@ impl WorkspaceApp {
                         move |sftp| {
                             Box::pin(async move {
                                 for path in targets {
-                                    sftp.delete_recursive(&path)
-                                        .await
-                                        .map_err(|error| error.to_string())?;
+                                    sftp.delete_recursive(&path).await?;
                                 }
                                 Ok(())
                             })
@@ -352,7 +331,7 @@ impl WorkspaceApp {
                 }
                 match pane {
                     SftpPane::Local => {
-                        let local_path = self.sftp_view.read(cx).local_path.clone();
+                        let local_path = self.sftp_view().read(cx).local_path.clone();
                         let count = files.len();
                         let mut result = Ok(());
                         for name in files {
@@ -371,7 +350,7 @@ impl WorkspaceApp {
                         match result {
                             Ok(()) => {
                                 if let Ok(files) = list_local_files(&local_path) {
-                                    self.sftp_view.update(cx, |sftp, cx| {
+                                    self.sftp_view().update(cx, |sftp, cx| {
                                         sftp.local_files = files;
                                         cx.notify();
                                     });
@@ -397,7 +376,7 @@ impl WorkspaceApp {
                         }
                     }
                     SftpPane::Remote => {
-                        let remote_files = self.sftp_view.read(cx).remote_files.clone();
+                        let remote_files = self.sftp_view().read(cx).remote_files.clone();
                         let targets = files
                             .into_iter()
                             .filter_map(|name| {
@@ -415,27 +394,21 @@ impl WorkspaceApp {
                             self.close_sftp_dialog(cx);
                             return;
                         };
-                        let tx = self.sftp_view.read(cx).worker_sender();
+                        let tx = self.sftp_view().read(cx).worker_sender();
                         let runtime = self.forwarding_runtime.clone();
                         let success_title = self.i18n.t("sftp.toast.deleted");
                         let success_template = self.i18n.t("sftp.toast.deleted_count");
                         let error_title = self.i18n.t("sftp.toast.delete_failed");
                         runtime.spawn(async move {
                             let result = async {
-                                let sftp = backend
-                                    .acquire_transfer_sftp()
-                                    .await
-                                    .map_err(|error| error.to_string())?;
+                                let sftp = backend.mutation_session().await?;
                                 let mut deleted = 0_u64;
                                 for path in targets {
                                     // Tauri nodeSftpDeleteRecursive returns the
                                     // recursive item count; keep the success
                                     // toast tied to the same backend count.
-                                    deleted = deleted.saturating_add(
-                                        sftp.delete_recursive(&path)
-                                            .await
-                                            .map_err(|error| error.to_string())?,
-                                    );
+                                    deleted =
+                                        deleted.saturating_add(sftp.delete_recursive(&path).await?);
                                 }
                                 Ok(deleted)
                             }

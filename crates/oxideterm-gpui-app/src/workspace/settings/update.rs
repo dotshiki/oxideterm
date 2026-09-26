@@ -774,7 +774,6 @@ impl WorkspaceApp {
                         }
                         KeybindingFileOperationResult::Imported {
                             overrides: next_overrides,
-                            target_window,
                         } => {
                             let side = crate::keybindings::KeybindingSide::current();
                             let runtime_bindings = {
@@ -794,7 +793,7 @@ impl WorkspaceApp {
                                             side,
                                         );
                                         crate::keybindings::runtime_rebind_key_bindings(
-                                            definition.id,
+                                            &definition.id,
                                             previous.as_ref(),
                                             next.as_ref(),
                                         )
@@ -807,11 +806,7 @@ impl WorkspaceApp {
                                 },
                                 cx,
                             );
-                            self.apply_runtime_key_bindings_to_window_handle(
-                                runtime_bindings,
-                                target_window,
-                                cx,
-                            );
+                            Self::apply_runtime_key_bindings(runtime_bindings, cx);
                             self.push_ai_settings_toast(
                                 self.i18n.t("settings_view.keybindings.import_success"),
                                 TerminalNoticeVariant::Success,
@@ -945,9 +940,11 @@ impl WorkspaceApp {
         // Tauri's updater exits after platform installers that need the current
         // process out of the way. Delay one frame so the final toast/state can
         // render before GPUI begins app shutdown.
-        cx.spawn(async move |_weak, cx| {
+        cx.spawn(async move |weak, cx| {
             Timer::after(std::time::Duration::from_millis(750)).await;
-            cx.update(|cx| cx.quit());
+            let _ = weak.update(cx, |workspace, cx| {
+                workspace.request_application_quit(cx);
+            });
         })
         .detach();
     }

@@ -60,6 +60,7 @@ mod vendor_files;
 mod view;
 mod worker;
 
+pub(in crate::workspace) use interaction::remote_desktop_keyboard_capture;
 pub(in crate::workspace) use public_mcp::RemoteDesktopPublicClipboardSnapshot;
 
 use certificate::*;
@@ -169,6 +170,7 @@ pub(super) enum RemoteDesktopWorkerDelivery {
 }
 
 pub(super) enum RemoteDesktopDeliveryIntent {
+    CredentialsRequired { generation: u64 },
     ClipboardTransferFailed,
     VncFileTransferCompleted,
     VncFileTransferFailed(RemoteDesktopFileTransferFailureKind),
@@ -536,6 +538,8 @@ pub(in crate::workspace) struct RemoteDesktopSessionEntity {
     profile: RemoteDesktopConnectionProfile,
     provider: RemoteDesktopProviderManifest,
     password: Option<RemoteDesktopSecret>,
+    credential_prompt_task: Option<gpui::Task<()>>,
+    credential_prompt_generation: Option<u64>,
     certificate_store_path: PathBuf,
     certificate_challenge: Option<RemoteDesktopCertificateChallengeState>,
     session_trusted_certificate_fingerprint: Option<String>,
@@ -608,6 +612,8 @@ impl RemoteDesktopSessionEntity {
             // The tab retains one zeroizing credential owner so a reconnect
             // can answer a fresh certificate-gated authentication request.
             password,
+            credential_prompt_task: None,
+            credential_prompt_generation: None,
             certificate_store_path,
             certificate_challenge: None,
             session_trusted_certificate_fingerprint: None,
@@ -695,6 +701,7 @@ impl RemoteDesktopSessionEntity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::workspace) enum RemoteDesktopSessionEvent {
+    CredentialsRequired { generation: u64 },
     DeliveryReady { generation: u64 },
     FrameApplyReady { generation: u64 },
     ClipboardTransferFailed,
@@ -1098,21 +1105,64 @@ mod tests {
         let mut modifiers = gpui::Modifiers::default();
         modifiers.control = true;
 
-        assert!(remote_desktop_paste_shortcut(&gpui::Keystroke {
-            modifiers,
-            key: "KeyV".to_string(),
-            key_char: Some("v".to_string()),
-        }));
-        assert!(remote_desktop_paste_shortcut(&gpui::Keystroke {
-            modifiers,
-            key: "keyv".to_string(),
-            key_char: Some("v".to_string()),
-        }));
-        assert!(remote_desktop_copy_shortcut(&gpui::Keystroke {
-            modifiers,
-            key: "KeyC".to_string(),
-            key_char: Some("c".to_string()),
-        }));
+        assert!(remote_desktop_paste_shortcut(
+            &gpui::Keystroke {
+                modifiers,
+                key: "KeyV".to_string(),
+                key_char: Some("v".to_string()),
+            },
+            &serde_json::Map::new()
+        ));
+        assert!(remote_desktop_paste_shortcut(
+            &gpui::Keystroke {
+                modifiers,
+                key: "keyv".to_string(),
+                key_char: Some("v".to_string()),
+            },
+            &serde_json::Map::new()
+        ));
+        assert!(remote_desktop_copy_shortcut(
+            &gpui::Keystroke {
+                modifiers,
+                key: "KeyC".to_string(),
+                key_char: Some("c".to_string()),
+            },
+            &serde_json::Map::new()
+        ));
+    }
+
+    #[test]
+    fn remote_desktop_clipboard_keybindings_rebind_and_unbind() {
+        use crate::keybindings::{
+            KeyCombo, KeybindingSide, action_definition, set_definition_override,
+            set_unbound_override,
+        };
+        let mut overrides = serde_json::Map::new();
+        let custom = gpui::Keystroke::parse("ctrl-alt-k").unwrap();
+        let combo = KeyCombo {
+            key: "k".into(),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            meta: false,
+        };
+        set_definition_override(
+            &mut overrides,
+            action_definition("remoteDesktop.paste").unwrap(),
+            KeybindingSide::current(),
+            combo,
+        );
+        assert!(remote_desktop_paste_shortcut(&custom, &overrides));
+        assert!(!remote_desktop_paste_shortcut(
+            &gpui::Keystroke::parse("ctrl-v").unwrap(),
+            &overrides
+        ));
+        set_unbound_override(
+            &mut overrides,
+            "remoteDesktop.paste",
+            KeybindingSide::current(),
+        );
+        assert!(!remote_desktop_paste_shortcut(&custom, &overrides));
     }
 
     #[test]

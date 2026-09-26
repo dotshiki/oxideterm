@@ -2,9 +2,12 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use gpui::{
     Anchor, AnchoredPositionMode, AnyElement, App, ClipboardItem, Context, ExternalPaths,
-    FocusHandle, Focusable, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, Render, RenderImage, SharedString, StyledImage, Window, anchored, deferred, div,
-    point, prelude::*, px, rgb, rgba,
+    FocusHandle, Focusable, FontWeight, IntoColor, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, Render, RenderImage, SharedString, StyledImage, Window, anchored,
+    deferred, div, point, prelude::*, px, rgb, rgba,
+};
+use oxideterm_gpui_ui::button::{
+    ButtonRadius, ContextChipOptions, IconButtonOptions, context_chip, icon_button,
 };
 use oxideterm_gpui_ui::confirm::{ConfirmDialogVariant, ConfirmDialogView, confirm_dialog};
 use oxideterm_gpui_ui::context_menu::{
@@ -13,17 +16,17 @@ use oxideterm_gpui_ui::context_menu::{
     context_menu_item_with_shortcut, context_menu_separator,
     context_menu_separator_height_estimate, context_menu_sub_content, context_menu_sub_trigger,
 };
-use oxideterm_gpui_ui::menu::{MenuItemKind, menu_content, menu_item, menu_label};
+use oxideterm_gpui_ui::menu::menu_content;
 use oxideterm_gpui_ui::modal::{TAURI_POPOVER_LAYER_PRIORITY, overlay_content_boundary};
 use oxideterm_gpui_ui::progress::progress;
 use oxideterm_gpui_ui::scroll::ScrollableElement;
+use oxideterm_gpui_ui::separator::{SeparatorOrientation, separator};
 use oxideterm_terminal::{
     DetectedModemProtocol, ModemTransferDirection, SerialControlLine, SerialDisplayMode,
     SerialFlowControl, SerialLineEnding, SerialParity, SerialSendMode, SerialSessionConfig,
     TermMode, TerminalCommandMark, TerminalCursorShape, TerminalLifecycle, TerminalSessionKind,
     TerminalSnapshot, TmuxAction, TmuxUiState,
 };
-use unicode_width::UnicodeWidthStr;
 
 use super::{
     BACKGROUND_IMAGE_COMPLETION_POLL_INTERVAL, ImageRenderCache, ModemProgressState,
@@ -31,6 +34,7 @@ use super::{
     TerminalContextMenu, TerminalPane, TerminalPaneEvent, TmuxPromptKind, TmuxPromptState,
     command_mark_ui_available,
 };
+use crate::background_cache::background_display_target;
 use crate::terminal_ui::*;
 use crate::terminal_view::*;
 
@@ -48,12 +52,111 @@ const TERMINAL_MODEM_SUBMENU_ACTION_COUNT: f32 = 6.0;
 const TERMINAL_CONTEXT_MENU_ACTIONS_BEFORE_MODEM: f32 = 9.0;
 const TERMINAL_CONTEXT_MENU_SEPARATORS_BEFORE_MODEM: f32 = 2.0;
 const TERMINAL_CONTEXT_MENU_MARGIN: f32 = 8.0;
-const SERIAL_CONTROL_BAR_HEIGHT: f32 = 34.0;
-const TMUX_CONTROL_BAR_HEIGHT: f32 = 34.0;
+const TERMINAL_CONTROL_ROW_HEIGHT: f32 = 34.0;
 const SERIAL_CONTROL_BUTTON_RADIUS: f32 = 999.0;
 // Keep diagnostic chrome away from the prompt and command text at the left edge.
 const TERMINAL_PERFORMANCE_OVERLAY_INSET: f32 = 8.0;
-const TERMINAL_AUTOSUGGEST_MAX_WIDTH: f32 = 520.0;
+const TERMINAL_AUTOSUGGEST_MAX_WIDTH: f32 = 440.0;
+
+fn terminal_autosuggest_hints(labels: &TerminalAutosuggestLabels, macos: bool) -> (String, String) {
+    let (select, run, remove) = if macos {
+        ("⌥↑/↓", "Return", "⇧⌦")
+    } else {
+        ("Alt+↑/↓", "Enter", "Shift+Delete")
+    };
+    (
+        labels
+            .navigation_hint
+            .replace("{{select}}", select)
+            .replace("{{run}}", run),
+        labels
+            .dismiss_hint
+            .replace("{{dismiss}}", "Esc")
+            .replace("{{remove}}", remove),
+    )
+}
+
+fn terminal_autosuggest_bounds(
+    anchor: super::TerminalCursorAnchor,
+    terminal_top: f32,
+    desired_height: f32,
+) -> Option<gpui::Bounds<gpui::Pixels>> {
+    let margin = 8.0;
+    let gap = 4.0;
+    let width = (anchor.container_width - margin * 2.0).min(TERMINAL_AUTOSUGGEST_MAX_WIDTH);
+    let below = (anchor.container_height - anchor.y - anchor.line_height - gap - margin).max(0.0);
+    let above = (anchor.y - gap - margin).max(0.0);
+    let use_below = below >= desired_height || below >= above;
+    let height = desired_height.min(if use_below { below } else { above });
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let left = anchor.x.clamp(
+        margin,
+        (anchor.container_width - width - margin).max(margin),
+    );
+    let top = terminal_top
+        + if use_below {
+            anchor.y + anchor.line_height + gap
+        } else {
+            anchor.y - gap - height
+        };
+    Some(gpui::Bounds::new(
+        point(px(left), px(top)),
+        gpui::size(px(width), px(height)),
+    ))
+}
+
+fn terminal_autosuggest_highlight_ranges(
+    command: &str,
+    query: &str,
+) -> Vec<std::ops::Range<usize>> {
+    // GPUI highlights use UTF-8 byte offsets. Preserve the original character's
+    // range when Unicode lowercasing expands it into multiple code points.
+    let mut normalized = zeroize::Zeroizing::new(String::new());
+    let mut source_ranges = Vec::new();
+    for (start, ch) in command.char_indices() {
+        for lower in ch.to_lowercase() {
+            normalized.push(lower);
+            source_ranges.push(start..start + ch.len_utf8());
+        }
+    }
+    let query = zeroize::Zeroizing::new(query.to_lowercase());
+    let matched: Vec<_> = if let Some(start) = normalized.find(query.as_str()) {
+        let first = normalized[..start].chars().count();
+        source_ranges
+            .iter()
+            .skip(first)
+            .take(query.chars().count())
+            .cloned()
+            .collect()
+    } else {
+        let mut remaining = query.chars().peekable();
+        normalized
+            .chars()
+            .zip(&source_ranges)
+            .filter_map(|(ch, range)| {
+                if remaining.peek() == Some(&ch) {
+                    remaining.next();
+                    Some(range.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in matched {
+        if let Some(last) = ranges.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            ranges.push(range);
+        }
+    }
+    ranges
+}
 
 fn quote_posix_shell_word(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
@@ -245,10 +348,8 @@ impl Render for TerminalPane {
                 })
                 .flatten()
         });
-        let terminal_top = if tmux_state.is_some() {
-            TMUX_CONTROL_BAR_HEIGHT
-        } else if self.is_serial_transport() {
-            SERIAL_CONTROL_BAR_HEIGHT
+        let terminal_top = if tmux_state.is_some() || self.is_serial_transport() {
+            self.terminal_control_bar_height()
         } else {
             0.0
         };
@@ -294,13 +395,22 @@ impl Render for TerminalPane {
 
         let background = self.preferences.background.clone().filter(|_background| {
             // Keep terminal repaint frames off the filesystem hot path; image
-            // fallback and the blurred-image loader handle missing files.
+            // fallback and the background loader handle missing files.
             self.preferences.render_policy.allow_background_images
         });
+        let background_display = self
+            .bounds
+            .map(|bounds| background_display_target(bounds.size, window.scale_factor()))
+            .unwrap_or_else(|| {
+                // The viewport bounds are only known after the first layout pass,
+                // so fall back to the window content area.
+                background_display_target(window.bounds().size, window.scale_factor())
+            });
         let background_layer = background.as_ref().map(|background| {
             terminal_background_layer(
                 background.clone(),
-                self.background_image_cache.render_blurred_image(background),
+                self.background_image_cache
+                    .render_background_image(background, background_display),
             )
         });
         self.ensure_background_image_completion_poll(cx);
@@ -562,78 +672,212 @@ impl TerminalPane {
             return div().into_any_element();
         };
         let tokens = &self.theme.tokens;
-        let popup_margin = tokens.spacing.two;
-        let popup_gap = tokens.spacing.one;
-        let row_height = tokens.metrics.ui_button_sm_height;
-        let popup_padding = tokens.metrics.ui_menu_padding;
-        let header_height = tokens.metrics.ui_text_sm + tokens.metrics.ui_menu_item_padding_y * 2.0;
-        let widest_command_cells = candidates
+        let labels = &self.preferences.autosuggest_labels;
+        let (navigation_hint, dismiss_hint) =
+            terminal_autosuggest_hints(labels, cfg!(target_os = "macos"));
+        let query = zeroize::Zeroizing::new(self.input_tracker.state().value);
+        let row_height = tokens.metrics.ui_text_sm + tokens.metrics.ui_menu_item_padding_y * 2.0;
+        let header_height = 28.0;
+        let footer_height = 44.0;
+        let has_long_command = candidates
             .iter()
-            .map(|candidate| UnicodeWidthStr::width(candidate.command.as_str()))
-            .max()
-            .unwrap_or_default();
-        let available_width = (anchor.container_width - popup_margin * 2.0).max(0.0);
-        let desired_width = widest_command_cells as f32 * anchor.char_width
-            + tokens.metrics.ui_menu_item_padding_x * 2.0
-            + popup_padding * 2.0;
-        let popup_width = desired_width
-            .max(tokens.metrics.ui_menu_min_width.min(available_width))
-            .min(TERMINAL_AUTOSUGGEST_MAX_WIDTH.min(available_width));
-        let query_width = UnicodeWidthStr::width(self.input_tracker.state().value.as_str()) as f32
-            * anchor.char_width;
-        let preferred_left = anchor.x - query_width;
-        let max_left = (anchor.container_width - popup_width - popup_margin).max(popup_margin);
-        let popup_left = preferred_left.max(popup_margin).min(max_left);
-        let popup_height =
-            header_height + row_height * candidates.len() as f32 + popup_padding * 2.0;
-        let cursor_top = terminal_top + anchor.y;
-        let container_height = terminal_top + anchor.container_height;
-        let max_top = (container_height - popup_height - popup_margin).max(popup_margin);
-        let popup_top = if cursor_top - popup_height - popup_gap >= popup_margin {
-            cursor_top - popup_height - popup_gap
-        } else {
-            (cursor_top + anchor.line_height + popup_gap).min(max_top)
+            .any(|candidate| candidate.command.chars().count() > 48);
+        let desired_height = header_height
+            + footer_height
+            + row_height * candidates.len() as f32
+            + if has_long_command { 64.0 } else { 0.0 };
+        let Some(bounds) =
+            terminal_autosuggest_bounds(anchor, terminal_top, desired_height.min(360.0))
+        else {
+            return div().into_any_element();
         };
-        let selected_index = self
+        let height = f32::from(bounds.size.height);
+        if height < header_height + footer_height + row_height {
+            return div().into_any_element();
+        }
+        // Reserve detail space for this result set, so changing selection never moves the rows.
+        let preview_height =
+            if has_long_command && height >= header_height + footer_height + row_height + 64.0 {
+                64.0
+            } else {
+                0.0
+            };
+        let selected = self
             .autosuggest_selected_index
             .filter(|index| *index < candidates.len());
-        let mut list = menu_content(tokens)
-            .w(px(popup_width))
-            .min_w(px(0.0))
-            .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
-            .child(menu_label(
-                tokens,
-                self.preferences.autosuggest_labels.history_source.clone(),
-                false,
-            ));
-        for (index, candidate) in candidates.into_iter().enumerate() {
-            let command = candidate.command;
-            let command_for_click = command.clone();
-            list = list.child(
-                menu_item(tokens, command, MenuItemKind::Plain, false, false)
+        let preview =
+            (preview_height > 0.0).then(|| candidates[selected.unwrap_or(0)].command.clone());
+        let mut rows = div()
+            .id("terminal-autosuggest-list")
+            .w_full()
+            .h(px(height
+                - header_height
+                - footer_height
+                - preview_height
+                - 2.0))
+            .flex_none()
+            .overflow_y_scroll()
+            .track_scroll(&self.autosuggest_scroll);
+        for (index, candidate) in candidates.iter().enumerate() {
+            let active = selected == Some(index);
+            let fill_command = zeroize::Zeroizing::new(candidate.command.clone());
+            let remove_command = zeroize::Zeroizing::new(candidate.command.clone());
+            let highlights = terminal_autosuggest_highlight_ranges(&candidate.command, &query)
+                .into_iter()
+                .map(|range| {
+                    (
+                        range,
+                        gpui::HighlightStyle {
+                            color: Some(rgb(tokens.ui.accent).into_color()),
+                            ..Default::default()
+                        },
+                    )
+                });
+            rows = rows.child(
+                div()
                     .id(("terminal-autosuggest-row", index))
+                    .group("terminal-autosuggest-row")
+                    .w_full()
                     .h(px(row_height))
-                    .min_w_0()
-                    .truncate()
-                    .when(selected_index == Some(index), |row| {
-                        row.bg(rgb(tokens.ui.bg_active))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .border_l_2()
+                    .border_color(if active {
+                        rgb(tokens.ui.accent)
+                    } else {
+                        rgba(0x00000000)
                     })
+                    .bg(if active {
+                        rgb(tokens.ui.bg_active)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .text_size(px(tokens.metrics.ui_text_sm))
+                    .line_height(px(20.0))
+                    .cursor_pointer()
                     .hover(|row| row.bg(rgb(tokens.ui.bg_hover)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _event, _window, cx| {
-                            this.fill_terminal_autosuggest_command(&command_for_click, false, cx);
+                        cx.listener(move |this, _, _, cx| {
+                            this.fill_terminal_autosuggest_command(&fill_command, false, cx);
                             cx.stop_propagation();
                         }),
+                    )
+                    .child(
+                        gpui::svg()
+                            .path("lucide/history.svg")
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(rgb(tokens.ui.text_muted)),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().truncate().child(
+                            gpui::StyledText::new(candidate.command.clone())
+                                .with_highlights(highlights),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id(("terminal-autosuggest-remove", index))
+                            .size(px(20.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(tokens.radii.sm))
+                            .when(!active, |button| {
+                                button
+                                    .invisible()
+                                    .group_hover("terminal-autosuggest-row", |style| {
+                                        style.visible()
+                                    })
+                            })
+                            .hover(|button| button.bg(rgb(tokens.ui.bg_hover)))
+                            .child(
+                                gpui::svg()
+                                    .path("lucide/trash-2.svg")
+                                    .size(px(13.0))
+                                    .text_color(rgb(tokens.ui.text_muted)),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.remove_terminal_autosuggest_command(&remove_command, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
                     ),
             );
         }
-
+        let menu = menu_content(tokens)
+            .p_0()
+            .w(bounds.size.width)
+            .min_w_0()
+            .h(bounds.size.height)
+            .flex()
+            .flex_col()
+            .line_height(px(18.0))
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .h(px(header_height))
+                    .flex_none()
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(tokens.ui.border))
+                    .text_size(px(tokens.metrics.ui_text_xs))
+                    .text_color(rgb(tokens.ui.text_muted))
+                    .child(labels.history_source.clone())
+                    .child(
+                        labels
+                            .matches
+                            .replace("{{count}}", &candidates.len().to_string()),
+                    ),
+            )
+            .child(rows)
+            .when_some(preview, |menu, command| {
+                menu.child(
+                    div()
+                        .id(("terminal-autosuggest-preview", selected.unwrap_or(0)))
+                        .h(px(preview_height))
+                        .flex_none()
+                        .w_full()
+                        .overflow_y_scroll()
+                        .border_t_1()
+                        .border_color(rgb(tokens.ui.border))
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .text_size(px(tokens.metrics.ui_text_xs))
+                        .whitespace_normal()
+                        .child(div().w_full().child(command)),
+                )
+            })
+            .child(
+                div()
+                    .h(px(footer_height))
+                    .flex_none()
+                    .w_full()
+                    .overflow_hidden()
+                    .border_t_1()
+                    .border_color(rgb(tokens.ui.border))
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .text_size(px(10.0))
+                    .line_height(px(16.0))
+                    .text_color(rgb(tokens.ui.text_muted))
+                    .child(div().truncate().child(navigation_hint))
+                    .child(div().truncate().child(dismiss_hint)),
+            );
         div()
             .absolute()
-            .left(px(popup_left))
-            .top(px(popup_top))
-            .child(overlay_content_boundary(list))
+            .left(bounds.origin.x)
+            .top(bounds.origin.y)
+            .child(overlay_content_boundary(menu))
             .into_any_element()
     }
 
@@ -697,16 +941,17 @@ impl TerminalPane {
 
     fn render_tmux_control_bar(&self, state: &TmuxUiState, cx: &mut Context<Self>) -> AnyElement {
         let labels = &self.preferences.tmux_labels;
+        let mut information = Vec::<AnyElement>::new();
         let mut controls = Vec::<AnyElement>::new();
-        controls.push(self.render_serial_status_chip(if state.ready {
+        information.push(self.render_terminal_toolbar_status(if state.ready {
             labels.tmux.clone()
         } else {
             format!("{} · {}", labels.tmux, labels.initializing)
         }));
         for session in &state.sessions {
             let session_id = session.id;
-            controls.push(
-                self.render_serial_control_button(
+            information.push(
+                self.render_terminal_toolbar_action(
                     format!("${session_id} {}", session.name),
                     state.ready,
                     session.active,
@@ -726,7 +971,7 @@ impl TerminalPane {
             let session_id = session.id;
             let session_name = session.name.clone();
             controls.push(
-                self.render_serial_control_button(
+                self.render_terminal_toolbar_action(
                     labels.rename_session.clone(),
                     state.ready,
                     false,
@@ -748,8 +993,8 @@ impl TerminalPane {
         }
         for tmux_window in &state.windows {
             let window_id = tmux_window.id;
-            controls.push(
-                self.render_serial_control_button(
+            information.push(
+                self.render_terminal_toolbar_action(
                     format!(
                         "{}:{}{}",
                         tmux_window.index, tmux_window.name, tmux_window.flags
@@ -772,7 +1017,7 @@ impl TerminalPane {
             let window_id = tmux_window.id;
             let window_name = tmux_window.name.clone();
             controls.push(
-                self.render_serial_control_button(labels.rename_window.clone(), state.ready, false)
+                self.render_terminal_toolbar_action(labels.rename_window.clone(), state.ready, false)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
@@ -789,7 +1034,7 @@ impl TerminalPane {
             );
         }
         controls.push(
-            self.render_serial_control_button(labels.command.clone(), state.ready, false)
+            self.render_terminal_toolbar_action(labels.command.clone(), state.ready, false)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _event: &MouseDownEvent, window, cx| {
@@ -859,7 +1104,7 @@ impl TerminalPane {
         ];
         if state.pane_in_mode {
             controls.push(
-                self.render_serial_control_button(labels.cancel_mode.clone(), state.ready, true)
+                self.render_terminal_toolbar_action(labels.cancel_mode.clone(), state.ready, true)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _event: &MouseDownEvent, window, cx| {
@@ -873,7 +1118,7 @@ impl TerminalPane {
         }
         for (label, action, enabled) in actions {
             controls.push(
-                self.render_serial_control_button(label, state.ready && enabled, false)
+                self.render_terminal_toolbar_action(label, state.ready && enabled, false)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
@@ -888,35 +1133,18 @@ impl TerminalPane {
             );
         }
         if let Some(error) = &state.error {
-            controls.push(self.render_serial_status_chip(if error.is_empty() {
+            information.push(self.render_terminal_toolbar_status(if error.is_empty() {
                 labels.command_failed.clone()
             } else {
                 format!("{} · {error}", labels.command_failed)
             }));
         }
 
-        let control_row = div()
-            .size_full()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(8.0))
-            .children(controls);
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(TMUX_CONTROL_BAR_HEIGHT))
-            .border_b_1()
-            .border_color(rgba(serial_color_alpha(self.theme.foreground, 0x33)))
-            .bg(rgba(serial_color_alpha(self.theme.background, 0xf0)))
-            .on_mouse_down(MouseButton::Left, |_event, _window, cx: &mut App| {
-                cx.stop_propagation();
-            })
-            .child(div().size_full().overflow_x_scrollbar().child(control_row))
-            .into_any_element()
+        self.render_terminal_control_bar(
+            self.render_terminal_toolbar_row(information),
+            self.render_terminal_toolbar_row(controls),
+            cx,
+        )
     }
 
     fn render_tmux_prompt_overlay(
@@ -1038,7 +1266,7 @@ impl TerminalPane {
     ) -> AnyElement {
         div()
             .absolute()
-            .top(px(TMUX_CONTROL_BAR_HEIGHT + 8.0))
+            .top(px(self.terminal_control_bar_height() + 8.0))
             .right(px(8.0))
             .max_w(px(520.0))
             .rounded(px(6.0))
@@ -1128,14 +1356,12 @@ impl TerminalPane {
             }
         );
 
-        // The scroll wrapper transfers its own styles to the viewport, so the
-        // control row must remain a separately styled child to stay horizontal.
-        let control_row = div()
+        let information_row = div()
             .size_full()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(self.theme.tokens.spacing.one))
             .px(px(10.0))
             .child(
                 div()
@@ -1154,9 +1380,17 @@ impl TerminalPane {
                         lifecycle
                     )),
             )
-            .child(self.render_serial_status_chip(port_state))
+            .child(self.render_terminal_toolbar_separator())
+            .child(self.render_terminal_toolbar_status(port_state));
+        let control_row = div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(self.theme.tokens.spacing.one))
+            .px(px(10.0))
             .child(
-                self.render_serial_control_button(
+                self.render_terminal_toolbar_action(
                     send_mode_label,
                     true,
                     matches!(status.runtime_options.send_mode, SerialSendMode::Hex),
@@ -1170,8 +1404,9 @@ impl TerminalPane {
                     }),
                 ),
             )
+            .child(self.render_terminal_toolbar_separator())
             .child(
-                self.render_serial_control_button(
+                self.render_terminal_toolbar_action(
                     display_mode_label,
                     true,
                     !matches!(status.runtime_options.display_mode, SerialDisplayMode::Text),
@@ -1185,8 +1420,9 @@ impl TerminalPane {
                     }),
                 ),
             )
+            .child(self.render_terminal_toolbar_separator())
             .child(
-                self.render_serial_control_button(
+                self.render_terminal_toolbar_action(
                     line_ending_label,
                     true,
                     !matches!(status.runtime_options.line_ending, SerialLineEnding::None),
@@ -1200,8 +1436,9 @@ impl TerminalPane {
                     }),
                 ),
             )
+            .child(self.render_terminal_toolbar_separator())
             .child(
-                self.render_serial_control_button(
+                self.render_terminal_toolbar_action(
                     output_line_ending_label,
                     true,
                     !matches!(
@@ -1218,8 +1455,9 @@ impl TerminalPane {
                     }),
                 ),
             )
+            .child(self.render_terminal_toolbar_separator())
             .child(
-                self.render_serial_control_button(
+                self.render_terminal_toolbar_action(
                     local_echo_label,
                     true,
                     status.runtime_options.local_echo,
@@ -1233,8 +1471,9 @@ impl TerminalPane {
                     }),
                 ),
             )
+            .child(self.render_terminal_toolbar_separator())
             .child(
-                self.render_serial_control_button(labels.refresh.clone(), true, false)
+                self.render_terminal_toolbar_action(labels.refresh.clone(), true, false)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _event: &MouseDownEvent, window, cx| {
@@ -1244,8 +1483,9 @@ impl TerminalPane {
                         }),
                     ),
             )
+            .child(self.render_terminal_toolbar_separator())
             .child(
-                self.render_serial_control_button(labels.send_break.clone(), running, false)
+                self.render_terminal_toolbar_action(labels.send_break.clone(), running, false)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _event: &MouseDownEvent, window, cx| {
@@ -1255,8 +1495,9 @@ impl TerminalPane {
                         }),
                     ),
             )
+            .child(self.render_terminal_toolbar_separator())
             .child(
-                self.render_serial_control_button(
+                self.render_terminal_toolbar_action(
                     dtr_label,
                     running,
                     status.control_state.data_terminal_ready,
@@ -1277,8 +1518,9 @@ impl TerminalPane {
                     }),
                 ),
             )
+            .child(self.render_terminal_toolbar_separator())
             .child(
-                self.render_serial_control_button(
+                self.render_terminal_toolbar_action(
                     rts_label,
                     running,
                     status.control_state.request_to_send,
@@ -1300,34 +1542,150 @@ impl TerminalPane {
                 ),
             );
 
+        self.render_terminal_control_bar(information_row, control_row, cx)
+    }
+
+    fn terminal_control_bar_height(&self) -> f32 {
+        TERMINAL_CONTROL_ROW_HEIGHT * if self.control_bar_expanded { 2.0 } else { 1.0 }
+    }
+
+    fn render_terminal_control_bar(
+        &self,
+        information: gpui::Div,
+        controls: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tokens = self.theme.tokens;
+        let label = if self.control_bar_expanded {
+            self.preferences.control_bar_collapse_label.clone()
+        } else {
+            self.preferences.control_bar_expand_label.clone()
+        };
+        let toggle = icon_button(
+            &tokens,
+            gpui::svg()
+                .path(if self.control_bar_expanded {
+                    "lucide/chevron-down.svg"
+                } else {
+                    "lucide/chevron-right.svg"
+                })
+                .size(px(14.0))
+                .text_color(rgb(tokens.ui.text_muted))
+                .into_any_element(),
+            IconButtonOptions::opaque_toolbar(22.0, ButtonRadius::Sm),
+        )
+        .id("terminal-toolbar-toggle")
+        .flex_none()
+        .ml(px(tokens.spacing.two))
+        .role(gpui::Role::Button)
+        .aria_label(label.clone())
+        .aria_expanded(self.control_bar_expanded)
+        .tooltip(move |_, cx| {
+            oxideterm_gpui_ui::tooltip::tooltip_view(tokens, label.clone(), None, cx)
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+                this.control_bar_expanded = !this.control_bar_expanded;
+                cx.notify();
+            }),
+        );
         div()
             .absolute()
             .top_0()
             .left_0()
             .right_0()
-            .h(px(SERIAL_CONTROL_BAR_HEIGHT))
+            .h(px(self.terminal_control_bar_height()))
+            .flex()
+            .flex_col()
             .border_b_1()
             .border_color(rgba(serial_color_alpha(self.theme.foreground, 0x33)))
             .bg(rgba(serial_color_alpha(self.theme.background, 0xf0)))
             .on_mouse_down(MouseButton::Left, |_event, _window, cx: &mut App| {
                 cx.stop_propagation();
             })
-            .child(div().size_full().overflow_x_scrollbar().child(control_row))
+            .child(
+                div()
+                    .id("terminal-toolbar-information")
+                    .w_full()
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .child(toggle)
+                    .child(
+                        div().min_w(px(0.0)).h_full().flex_1().child(
+                            div().size_full().overflow_x_scrollbar().child(information),
+                        ),
+                    ),
+            )
+            .when(self.control_bar_expanded, |bar| {
+                // The controls own a separate scroll scope and release their height when hidden.
+                bar.child(
+                    div()
+                        .id("terminal-toolbar-controls")
+                        .w_full()
+                        .min_h(px(0.0))
+                        .flex_1()
+                        .child(div().size_full().overflow_x_scrollbar().child(controls)),
+                )
+            })
             .into_any_element()
     }
 
-    fn render_serial_status_chip(&self, label: String) -> AnyElement {
+    fn render_terminal_toolbar_row(&self, items: Vec<AnyElement>) -> gpui::Div {
+        let mut row = div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(self.theme.tokens.spacing.one))
+            .px(px(8.0));
+        for (index, item) in items.into_iter().enumerate() {
+            if index > 0 {
+                row = row.child(self.render_terminal_toolbar_separator());
+            }
+            row = row.child(item);
+        }
+        row
+    }
+
+    fn render_terminal_toolbar_separator(&self) -> gpui::Div {
+        separator(&self.theme.tokens, SeparatorOrientation::Vertical).h(px(12.0))
+    }
+
+    fn render_terminal_toolbar_action(
+        &self,
+        label: String,
+        enabled: bool,
+        active: bool,
+    ) -> gpui::Div {
+        context_chip(
+            &self.theme.tokens,
+            ContextChipOptions::new()
+                .disabled(!enabled)
+                .radius(ButtonRadius::Sm)
+                .border_color(rgba(0x00000000))
+                .text_color(rgb(if active {
+                    self.theme.tokens.ui.accent
+                } else {
+                    self.theme.foreground
+                })),
+            None,
+            div().whitespace_nowrap().child(label).into_any_element(),
+            Vec::new(),
+        )
+        .when(!enabled, |control| control.opacity(0.45))
+    }
+
+    fn render_terminal_toolbar_status(&self, label: String) -> AnyElement {
         div()
             .flex_none()
-            .rounded(px(SERIAL_CONTROL_BUTTON_RADIUS))
-            .border_1()
-            .border_color(rgba(serial_color_alpha(self.theme.foreground, 0x26)))
-            .px(px(9.0))
-            .h(px(22.0))
-            .flex()
-            .items_center()
+            .whitespace_nowrap()
             .text_size(px(11.0))
-            .text_color(rgba(serial_color_alpha(self.theme.foreground, 0xb8)))
+            .text_color(rgb(self.theme.tokens.ui.text_muted))
             .child(label)
             .into_any_element()
     }
@@ -1420,10 +1778,10 @@ fn serial_parity_letter(parity: SerialParity) -> &'static str {
     }
 }
 
-fn serial_flow_label<'a>(
+fn serial_flow_label(
     flow_control: SerialFlowControl,
-    labels: &'a TerminalSerialControlLabels,
-) -> &'a str {
+    labels: &TerminalSerialControlLabels,
+) -> &str {
     match flow_control {
         SerialFlowControl::None => labels.flow_none.as_str(),
         SerialFlowControl::Software => labels.flow_software.as_str(),
@@ -1431,20 +1789,17 @@ fn serial_flow_label<'a>(
     }
 }
 
-fn serial_send_mode_label<'a>(
-    send_mode: SerialSendMode,
-    labels: &'a TerminalSerialControlLabels,
-) -> &'a str {
+fn serial_send_mode_label(send_mode: SerialSendMode, labels: &TerminalSerialControlLabels) -> &str {
     match send_mode {
         SerialSendMode::Text => labels.text_mode.as_str(),
         SerialSendMode::Hex => labels.hex_mode.as_str(),
     }
 }
 
-fn serial_display_mode_label<'a>(
+fn serial_display_mode_label(
     display_mode: SerialDisplayMode,
-    labels: &'a TerminalSerialControlLabels,
-) -> &'a str {
+    labels: &TerminalSerialControlLabels,
+) -> &str {
     match display_mode {
         SerialDisplayMode::Text => labels.text_mode.as_str(),
         SerialDisplayMode::Hex => labels.hex_mode.as_str(),
@@ -1452,10 +1807,10 @@ fn serial_display_mode_label<'a>(
     }
 }
 
-fn serial_line_ending_label<'a>(
+fn serial_line_ending_label(
     line_ending: SerialLineEnding,
-    labels: &'a TerminalSerialControlLabels,
-) -> &'a str {
+    labels: &TerminalSerialControlLabels,
+) -> &str {
     match line_ending {
         SerialLineEnding::Lf => labels.line_ending_lf.as_str(),
         SerialLineEnding::CrLf => labels.line_ending_crlf.as_str(),
@@ -2601,21 +2956,20 @@ fn label_with_count(template: &str, count: usize) -> String {
 
 fn terminal_background_layer(
     background: TerminalBackgroundPreferences,
-    blurred_image: Option<Arc<RenderImage>>,
+    image: Option<Arc<RenderImage>>,
 ) -> AnyElement {
-    let image = if let Some(blurred_image) = blurred_image {
-        gpui::img(blurred_image)
-            .size_full()
-            .object_fit(terminal_background_object_fit(background.fit))
-            .opacity(background.opacity.clamp(0.0, 1.0))
-            .into_any_element()
+    let image = if background.fit == TerminalBackgroundFit::Tile && background.blur <= 0.01 {
+        gpui::img(background.path.clone()).with_fallback(|| div().size_full().into_any_element())
+    } else if let Some(image) = image {
+        gpui::img(image)
     } else {
-        gpui::img(background.path)
-            .size_full()
-            .object_fit(terminal_background_object_fit(background.fit))
-            .opacity(background.opacity.clamp(0.0, 1.0))
-            .with_fallback(|| div().size_full().into_any_element())
-            .into_any_element()
+        return div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .into_any_element();
     };
 
     div()
@@ -2625,7 +2979,12 @@ fn terminal_background_layer(
         .right_0()
         .bottom_0()
         .overflow_hidden()
-        .child(image)
+        .child(
+            image
+                .size_full()
+                .object_fit(terminal_background_object_fit(background.fit))
+                .opacity(background.opacity.clamp(0.0, 1.0)),
+        )
         .into_any_element()
 }
 
@@ -2640,6 +2999,7 @@ fn terminal_background_object_fit(fit: TerminalBackgroundFit) -> ObjectFit {
 
 #[cfg(test)]
 mod tests {
+    use gpui::AppContext;
     use std::path::PathBuf;
 
     use oxideterm_terminal::TerminalCursorShape;
@@ -2649,6 +3009,204 @@ mod tests {
         terminal_cursor_shape_for_render, terminal_pane_base_is_transparent,
         terminal_visual_bell_overlay_color,
     };
+
+    struct AutosuggestTestView {
+        pane: gpui::Entity<super::TerminalPane>,
+    }
+
+    struct ControlBarTestView {
+        pane: gpui::Entity<super::TerminalPane>,
+    }
+
+    impl gpui::Render for ControlBarTestView {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::prelude::*;
+            let bar = self.pane.update(cx, |pane, cx| {
+                pane.render_terminal_control_bar(
+                    gpui::div()
+                        .size_full()
+                        .debug_selector(|| "toolbar-information".into())
+                        .child("Port"),
+                    gpui::div()
+                        .size_full()
+                        .debug_selector(|| "toolbar-controls".into())
+                        .child("Send"),
+                    cx,
+                )
+            });
+            gpui::div().size_full().relative().child(bar)
+        }
+    }
+
+    #[gpui::test]
+    fn control_bar_toggle_hides_and_restores_the_controls_row(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let pane = cx.new(|cx| {
+                super::TerminalPane::new_recording_playback(
+                    80,
+                    24,
+                    Default::default(),
+                    window,
+                    cx,
+                )
+                .unwrap()
+            });
+            cx.observe(&pane, |_, _, cx| cx.notify()).detach();
+            ControlBarTestView { pane }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(400.0), gpui::px(200.0)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let information = cx.debug_bounds("toolbar-information").unwrap();
+        let controls = cx.debug_bounds("toolbar-controls").unwrap();
+        assert!(controls.top() >= information.bottom());
+        let toggle = gpui::point(gpui::px(18.0), information.center().y);
+        cx.simulate_click(toggle, gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("toolbar-controls").is_none());
+        let collapsed_information = cx.debug_bounds("toolbar-information").unwrap();
+        assert_eq!(collapsed_information.origin, information.origin);
+        assert!(controls.bottom() - collapsed_information.bottom() >= controls.size.height);
+        cx.simulate_click(toggle, gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(cx.debug_bounds("toolbar-controls").unwrap(), controls);
+    }
+
+    impl gpui::Render for AutosuggestTestView {
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::prelude::*;
+            let size = window.viewport_size();
+            let overlay = self.pane.update(cx, |pane, cx| {
+                pane.bounds = Some(gpui::Bounds::new(
+                    gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                    size,
+                ));
+                let candidates = pane
+                    .command_history
+                    .candidates(&pane.input_tracker.state(), 8);
+                pane.render_terminal_autosuggest_overlay(candidates, 0.0, cx)
+            });
+            gpui::div().size_full().relative().child(overlay)
+        }
+    }
+
+    #[gpui::test]
+    fn autosuggest_native_list_scrolls_keyboard_selection_into_view(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut preferences = crate::terminal_ui::TerminalUiPreferences::default();
+            preferences.command_history = crate::SharedTerminalCommandHistory::from_commands(
+                (0..8)
+                    .map(|index| format!("git show {}-{index}", "project".repeat(12)))
+                    .collect(),
+            );
+            let pane = cx.new(|cx| {
+                super::TerminalPane::new_recording_playback(80, 24, preferences, window, cx)
+                    .unwrap()
+            });
+            pane.update(cx, |pane, _| {
+                pane.input_tracker.apply_bytes(b"git");
+            });
+            AutosuggestTestView { pane }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(400.0), gpui::px(500.0)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let pane = cx.update(|_, cx| view.read(cx).pane.clone());
+        let scroll = cx.update(|_, cx| pane.read(cx).autosuggest_scroll.clone());
+        assert!(scroll.max_offset().y > gpui::px(0.0));
+        pane.update(cx, |pane, cx| {
+            pane.autosuggest_selected_index = Some(7);
+            pane.autosuggest_scroll.scroll_to_item(7);
+            cx.notify();
+        });
+        view.update(cx, |_, cx| cx.notify());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let last = scroll.bounds_for_item(7).unwrap();
+        let bottom = last.bottom() + scroll.offset().y;
+        assert!(
+            bottom <= scroll.bounds().bottom(),
+            "selected command must remain visible"
+        );
+        assert!(scroll.offset().y < gpui::px(0.0));
+        assert_eq!(scroll.max_offset().x, gpui::px(0.0));
+    }
+
+    #[test]
+    fn autosuggest_hints_use_platform_key_names_in_localized_templates() {
+        let labels = crate::terminal_ui::TerminalAutosuggestLabels {
+            navigation_hint: "{{select}} 选择 · {{run}} 执行 · 单击填充".into(),
+            dismiss_hint: "{{dismiss}} 关闭 · {{remove}} 移除".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::terminal_autosuggest_hints(&labels, true),
+            (
+                "⌥↑/↓ 选择 · Return 执行 · 单击填充".into(),
+                "Esc 关闭 · ⇧⌦ 移除".into(),
+            )
+        );
+        assert_eq!(
+            super::terminal_autosuggest_hints(&labels, false),
+            (
+                "Alt+↑/↓ 选择 · Enter 执行 · 单击填充".into(),
+                "Esc 关闭 · Shift+Delete 移除".into(),
+            )
+        );
+    }
+
+    #[test]
+    fn autosuggest_matches_highlight_original_utf8_ranges() {
+        for (command, query, expected) in [
+            ("git status", "gts", vec![0..1, 2..3, 4..5]),
+            ("git status", "status", vec![4..10]),
+            ("İnfo 设置", "i", vec![0..2]),
+            ("İnfo 设置", "设置", vec![6..12]),
+        ] {
+            assert_eq!(
+                super::terminal_autosuggest_highlight_ranges(command, query),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn autosuggest_popup_fits_the_pane_and_never_covers_the_input_line() {
+        let anchor = super::super::TerminalCursorAnchor {
+            x: 120.0,
+            y: 20.0,
+            line_height: 16.0,
+            char_width: 8.0,
+            container_width: 600.0,
+            container_height: 400.0,
+        };
+        let below = super::terminal_autosuggest_bounds(anchor, 30.0, 200.0).unwrap();
+        assert_eq!(below.origin, gpui::point(gpui::px(120.0), gpui::px(70.0)));
+        let bottom = super::super::TerminalCursorAnchor { y: 380.0, ..anchor };
+        let above = super::terminal_autosuggest_bounds(bottom, 30.0, 200.0).unwrap();
+        assert_eq!(above.bottom(), gpui::px(406.0));
+        let narrow = super::super::TerminalCursorAnchor {
+            x: 240.0,
+            y: 60.0,
+            container_width: 250.0,
+            container_height: 120.0,
+            ..anchor
+        };
+        let constrained = super::terminal_autosuggest_bounds(narrow, 30.0, 200.0).unwrap();
+        assert_eq!(
+            constrained.origin,
+            gpui::point(gpui::px(8.0), gpui::px(38.0))
+        );
+        assert_eq!(
+            constrained.size,
+            gpui::size(gpui::px(234.0), gpui::px(48.0))
+        );
+    }
 
     #[test]
     fn terminal_pane_base_keeps_window_background_visible_during_visual_bell() {

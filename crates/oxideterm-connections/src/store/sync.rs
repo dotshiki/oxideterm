@@ -171,6 +171,8 @@ impl ConnectionStore {
             .records
             .iter()
             .map(|record| record.updated_at.clone())
+            .chain(snapshot.local_terminal_profiles.iter().map(|p| p.updated_at.to_rfc3339()))
+            .chain(snapshot.local_terminal_tombstones.iter().map(|p| p.deleted_at.to_rfc3339()))
             .max()
             .unwrap_or_else(|| snapshot.exported_at.clone());
 
@@ -329,6 +331,7 @@ impl ConnectionStore {
                 self.add_connection(next_connection);
                 result.applied += 1;
             }
+            self.apply_local_terminal_profiles(snapshot.local_terminal_profiles, snapshot.local_terminal_tombstones, strategy, &mut result)?;
             self.normalize();
             if result.applied > 0 {
                 self.save()?;
@@ -487,7 +490,8 @@ impl ConnectionStore {
             profile.validate()?;
         }
         let mut applied = 0usize;
-        for profile in snapshot.records {
+        for mut profile in snapshot.records {
+            profile.upstream_proxy = portable_upstream_proxy(&profile.upstream_proxy);
             if let Some(existing) = self
                 .data
                 .telnet_profiles
@@ -495,6 +499,10 @@ impl ConnectionStore {
                 .find(|existing| existing.id == profile.id)
             {
                 if profile.updated_at >= existing.updated_at {
+                    preserve_standalone_sftp_upstream_proxy_secret(
+                        &mut profile.upstream_proxy,
+                        &existing.upstream_proxy,
+                    );
                     *existing = profile;
                     applied += 1;
                 }
@@ -592,6 +600,11 @@ impl ConnectionStore {
         &mut self,
         snapshot: StandaloneSftpProfilesSyncSnapshot,
     ) -> Result<usize> {
+        if let Some(ftp) = &snapshot.ftp {
+            for profile in &ftp.records {
+                profile.validate()?;
+            }
+        }
         // Treat every incoming snapshot as portable metadata, even when it came from a .oxide file.
         let mut applied = 0usize;
         for mut profile in snapshot.records {
@@ -615,6 +628,9 @@ impl ConnectionStore {
                 self.data.standalone_sftp_profiles.push(profile);
                 applied += 1;
             }
+        }
+        if let Some(ftp) = snapshot.ftp {
+            applied += self.apply_ftp_profiles_snapshot(ftp)?;
         }
         if applied > 0 {
             self.normalize();
@@ -706,25 +722,18 @@ fn build_saved_connections_sync_snapshot(
     );
     records.sort_by(|left, right| left.id.cmp(&right.id));
 
-    let revision = sha256_hex(
-        &records
-            .iter()
-            // The exported record includes updated_at, so the snapshot revision must change with it.
-            .map(|record| {
-                (
-                    &record.id,
-                    &record.revision,
-                    &record.updated_at,
-                    record.deleted,
-                )
-            })
-            .collect::<Vec<_>>(),
-    )?;
-
+    let mut local_terminal_profiles = data.local_terminal_profiles.clone();
+    local_terminal_profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    for profile in &mut local_terminal_profiles { profile.last_used_at = None; }
+    let mut local_terminal_tombstones = active_connection_tombstones(&data.local_terminal_tombstones);
+    local_terminal_tombstones.sort_by(|a, b| a.id.cmp(&b.id));
+    let revision = sha256_hex(&(&records, &local_terminal_profiles, &local_terminal_tombstones))?;
     Ok(SavedConnectionsSyncSnapshot {
         revision,
         exported_at: Utc::now().to_rfc3339(),
         records,
+        local_terminal_profiles,
+        local_terminal_tombstones,
     })
 }
 
@@ -751,6 +760,9 @@ fn build_telnet_profiles_sync_snapshot(
     data: &ConnectionStoreData,
 ) -> Result<TelnetProfilesSyncSnapshot> {
     let mut records = data.telnet_profiles.clone();
+    for profile in &mut records {
+        profile.upstream_proxy = portable_upstream_proxy(&profile.upstream_proxy);
+    }
     records.sort_by(|left, right| left.id.cmp(&right.id));
     let revision = sha256_hex(
         &records
@@ -804,10 +816,21 @@ fn build_standalone_sftp_profiles_sync_snapshot(
             .map(|profile| (&profile.id, profile.updated_at.to_rfc3339()))
             .collect::<Vec<_>>(),
     )?;
+    let ftp = if data.ftp_profiles.is_empty() && data.ftp_tombstones.is_empty() {
+        None
+    } else {
+        Some(build_ftp_profiles_sync_snapshot(data)?)
+    };
+    let revision = if let Some(ftp) = &ftp {
+        sha256_hex(&(revision, &ftp.revision))?
+    } else {
+        revision
+    };
     Ok(StandaloneSftpProfilesSyncSnapshot {
         revision,
         exported_at: Utc::now().to_rfc3339(),
         records,
+        ftp,
     })
 }
 
@@ -845,6 +868,8 @@ fn make_standalone_sftp_endpoint_portable(endpoint: &mut StandaloneSftpEndpoint)
 fn portable_mosh_auth(auth: &SavedAuth) -> SavedAuth {
     match auth {
         SavedAuth::Password { .. } => SavedAuth::Password {
+            empty_password: auth.uses_empty_password(),
+
             keychain_id: None,
             plaintext_password: None,
         },
@@ -930,10 +955,14 @@ fn preserve_local_auth_secret(incoming: &mut SavedAuth, existing: &SavedAuth) {
     match (incoming, existing) {
         (
             SavedAuth::Password {
+                empty_password: false,
+
                 keychain_id: incoming_keychain_id,
                 plaintext_password: incoming_plaintext,
             },
             SavedAuth::Password {
+                empty_password: false,
+
                 keychain_id: existing_keychain_id,
                 plaintext_password: existing_plaintext,
             },
@@ -1174,6 +1203,8 @@ fn parse_connection_sync_timestamp(value: &str, field_name: &str) -> Result<Date
 fn saved_auth_from_connection_info(payload: &ConnectionInfo) -> SavedAuth {
     let fallback = match payload.auth_type {
         AuthType::Password => SavedAuth::Password {
+            empty_password: payload.empty_password,
+
             keychain_id: None,
             plaintext_password: None,
         },
@@ -1212,6 +1243,8 @@ fn saved_auth_from_connection_info(payload: &ConnectionInfo) -> SavedAuth {
 fn saved_auth_from_proxy_hop_info(hop: &ProxyHopInfo) -> SavedAuth {
     let fallback = match hop.auth_type {
         AuthType::Password => SavedAuth::Password {
+            empty_password: hop.empty_password,
+
             keychain_id: None,
             plaintext_password: None,
         },
@@ -1383,6 +1416,8 @@ mod mosh_tests {
             22,
             "alice",
             SavedAuth::Password {
+                empty_password: false,
+
                 keychain_id: keychain_id.map(str::to_string),
                 plaintext_password: None,
             },
@@ -1397,6 +1432,8 @@ mod mosh_tests {
             port: 22,
             username: "jump".to_string(),
             auth: SavedAuth::Password {
+                empty_password: false,
+
                 keychain_id: Some("local-proxy-keychain-entry".to_string()),
                 plaintext_password: None,
             },
@@ -1418,7 +1455,8 @@ mod mosh_tests {
             snapshot.records[0].auth,
             SavedAuth::Password {
                 keychain_id: None,
-                plaintext_password: None
+                plaintext_password: None,
+                ..
             }
         ));
         let json = serde_json::to_string(&snapshot).expect("snapshot must serialize");
@@ -1439,6 +1477,8 @@ mod mosh_tests {
             port: 22,
             username: "jump".to_string(),
             auth: SavedAuth::Password {
+                empty_password: false,
+
                 keychain_id: Some("local-proxy-keychain-entry".to_string()),
                 plaintext_password: None,
             },
@@ -1477,35 +1517,39 @@ mod mosh_tests {
         let profile = &store.mosh_profiles()[0];
         assert_eq!(profile.name, "Renamed mobile shell");
         assert!(matches!(
-            &profile.auth,
-            SavedAuth::KerberosPreferred {
-                server_identity: Some(server_identity),
-                delegate_credentials: true,
-                fallback,
-            } if server_identity == "host/mosh.example.test"
-                && matches!(
-                    fallback.as_ref(),
-                    SavedAuth::Password {
-                        keychain_id: Some(keychain_id),
-                        plaintext_password: None,
-                    } if keychain_id == "local-keychain-entry"
-                )
-        ));
+                    &profile.auth,
+                    SavedAuth::KerberosPreferred {
+                        server_identity: Some(server_identity),
+                        delegate_credentials: true,
+                        fallback,
+                    } if server_identity == "host/mosh.example.test"
+                        && matches!(
+                            fallback.as_ref(),
+                            SavedAuth::Password {
+                                keychain_id: Some(keychain_id),
+                                plaintext_password: None,
+
+                    ..
+        } if keychain_id == "local-keychain-entry"
+                        )
+                ));
         assert!(matches!(
-            &profile.proxy_chain[0].auth,
-            SavedAuth::KerberosPreferred {
-                server_identity: Some(server_identity),
-                delegate_credentials: false,
-                fallback,
-            } if server_identity == "host/jump.example.test"
-                && matches!(
-                    fallback.as_ref(),
-                    SavedAuth::Password {
-                        keychain_id: Some(keychain_id),
-                        plaintext_password: None,
-                    } if keychain_id == "local-proxy-keychain-entry"
-                )
-        ));
+                    &profile.proxy_chain[0].auth,
+                    SavedAuth::KerberosPreferred {
+                        server_identity: Some(server_identity),
+                        delegate_credentials: false,
+                        fallback,
+                    } if server_identity == "host/jump.example.test"
+                        && matches!(
+                            fallback.as_ref(),
+                            SavedAuth::Password {
+                                keychain_id: Some(keychain_id),
+                                plaintext_password: None,
+
+                    ..
+        } if keychain_id == "local-proxy-keychain-entry"
+                        )
+                ));
         let _ = std::fs::remove_file(path);
     }
 

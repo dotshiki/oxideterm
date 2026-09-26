@@ -20,8 +20,9 @@ use zeroize::Zeroizing;
 use super::{
     FreeTypeDragAction, FreeTypeDragState, HorizontalScrollbarDrag, HorizontalScrollbarGeometry,
     PendingTerminalEditorClipboard, ScrollbarDrag, ScrollbarGeometry, SelectionHighlightCache,
-    SmoothScrollAnimation, TerminalContextMenu, TerminalPane, TerminalPaneEvent,
-    TmuxSeparatorDirection, TmuxSeparatorDrag, command_mark_ui_available,
+    SmoothScrollAnimation, TerminalContextMenu, TerminalKeybindings, TerminalPane,
+    TerminalPaneEvent, TerminalShortcut, TmuxSeparatorDirection, TmuxSeparatorDrag,
+    command_mark_ui_available,
 };
 use crate::command_facts::TerminalAutosuggestInputState;
 use crate::terminal_ui::*;
@@ -53,7 +54,33 @@ struct TerminalWheelScrollDelta {
     animate_rows: bool,
 }
 
+pub(super) enum DeferredTmuxMouse {
+    Down(MouseDownEvent),
+    Move(MouseMoveEvent),
+    Up(MouseUpEvent),
+}
+
 impl TerminalPane {
+    pub(super) fn cancel_pending_tmux_mouse(&mut self) {
+        self.pending_tmux_mouse.clear();
+        self.tmux_selection_pending = false;
+        self.completed_tmux_selection = None;
+    }
+
+    pub(super) fn finish_tmux_mouse_selection(&mut self, selected: bool, cx: &mut Context<Self>) {
+        self.tmux_selection_pending = false;
+        self.completed_tmux_selection = Some(selected);
+        let events = std::mem::take(&mut self.pending_tmux_mouse);
+        for event in events {
+            match event {
+                DeferredTmuxMouse::Down(event) => self.handle_mouse_down(&event, cx),
+                DeferredTmuxMouse::Move(event) => self.handle_mouse_move(&event, cx),
+                DeferredTmuxMouse::Up(event) => self.handle_mouse_up(&event, cx),
+            }
+        }
+        self.completed_tmux_selection = None;
+    }
+
     pub(crate) fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
@@ -151,8 +178,16 @@ impl TerminalPane {
             return true;
         }
 
-        if modifiers.platform && modifiers.shift && key.eq_ignore_ascii_case("k") {
-            let result = if modifiers.alt {
+        let bindings = cx.try_global::<TerminalKeybindings>();
+        let legacy = bindings.is_none();
+        let configured = bindings.and_then(|bindings| bindings.resolve(&event.keystroke));
+        if matches!(
+            configured,
+            Some(TerminalShortcut::Terminate | TerminalShortcut::Kill)
+        ) || (legacy && modifiers.platform && modifiers.shift && key.eq_ignore_ascii_case("k"))
+        {
+            let result = if configured == Some(TerminalShortcut::Kill) || (legacy && modifiers.alt)
+            {
                 self.terminal.lock().kill_active_task()
             } else {
                 self.terminal.lock().terminate_active_task()
@@ -164,6 +199,7 @@ impl TerminalPane {
         }
 
         if key == "end" && modifiers.platform {
+            self.pending_search_reveal = false;
             let snapshot = {
                 let mut terminal = self.terminal.lock();
                 terminal.scroll_to_bottom();
@@ -176,6 +212,7 @@ impl TerminalPane {
         }
 
         if key == "home" && modifiers.platform {
+            self.pending_search_reveal = false;
             let snapshot = {
                 let mut terminal = self.terminal.lock();
                 terminal.scroll_to_top();
@@ -194,17 +231,21 @@ impl TerminalPane {
         if self.handle_free_type_clipboard_shortcut(event, mode, cx) {
             return true;
         }
-        if is_legacy_terminal_copy_shortcut(key, modifiers) {
+        if configured == Some(TerminalShortcut::Copy)
+            || (legacy && is_legacy_terminal_copy_shortcut(key, modifiers))
+        {
             // Preserve the long-standing terminal convention without consuming plain Insert.
             self.copy_current_selection_or_snapshot(cx);
             return true;
         }
-        if is_legacy_terminal_paste_shortcut(key, modifiers) {
+        if configured == Some(TerminalShortcut::Paste)
+            || (legacy && is_legacy_terminal_paste_shortcut(key, modifiers))
+        {
             // Clipboard paste must be handled before Insert is encoded as a terminal sequence.
             self.paste_from_clipboard(cx);
             return true;
         }
-        if is_platform_copy_shortcut(event) {
+        if legacy && is_platform_copy_shortcut(event) {
             // macOS terminals reserve Cmd+C for copy; Ctrl+C remains the
             // protocol interrupt path below.
             self.copy_current_selection_or_snapshot(cx);
@@ -219,7 +260,31 @@ impl TerminalPane {
             return true;
         }
 
-        if let Some(action) = oxideterm_terminal_scroll_action(&event.keystroke) {
+        // Shells may enable application cursor mode too; only alternate-screen applications
+        // and negotiated keyboard protocols bypass these shell editing shortcuts.
+        if !mode.intersects(TermMode::ALT_SCREEN | TermMode::KITTY_KEYBOARD_PROTOCOL) {
+            let sequence: Option<&[u8]> = match configured {
+                Some(TerminalShortcut::WordBackward) => Some(b"\x1bb"),
+                Some(TerminalShortcut::WordForward) => Some(b"\x1bf"),
+                _ => None,
+            };
+            if let Some(sequence) = sequence {
+                self.send_user_protocol_bytes(sequence, cx);
+                return true;
+            }
+        }
+
+        let scroll = match configured {
+            Some(TerminalShortcut::PageUp) => Some(TerminalScrollAction::PageUp),
+            Some(TerminalShortcut::PageDown) => Some(TerminalScrollAction::PageDown),
+            Some(TerminalShortcut::LineUp) => Some(TerminalScrollAction::LineUp),
+            Some(TerminalShortcut::LineDown) => Some(TerminalScrollAction::LineDown),
+            Some(TerminalShortcut::Top) => Some(TerminalScrollAction::Top),
+            Some(TerminalShortcut::Bottom) => Some(TerminalScrollAction::Bottom),
+            _ if legacy => oxideterm_terminal_scroll_action(&event.keystroke),
+            _ => None,
+        };
+        if let Some(action) = scroll {
             self.apply_scroll_action(action, cx);
             return true;
         }
@@ -278,6 +343,8 @@ impl TerminalPane {
                         .map(|index| (index + 1) % candidates.len())
                         .unwrap_or(0),
                 );
+                self.autosuggest_scroll
+                    .scroll_to_item(self.autosuggest_selected_index.unwrap_or(0));
                 cx.notify();
                 true
             }
@@ -287,6 +354,8 @@ impl TerminalPane {
                         .map(|index| index.checked_sub(1).unwrap_or(candidates.len() - 1))
                         .unwrap_or(candidates.len() - 1),
                 );
+                self.autosuggest_scroll
+                    .scroll_to_item(self.autosuggest_selected_index.unwrap_or(0));
                 cx.notify();
                 true
             }
@@ -304,13 +373,8 @@ impl TerminalPane {
                     self.autosuggest_selected_index = None;
                     return false;
                 };
-                let removed_from_shared_history = self.command_history.remove(&candidate.command);
-                self.command_fact_ledger
-                    .remove_autosuggest_command(&candidate.command);
-                if removed_from_shared_history {
-                    self.autosuggest_selected_index = None;
-                    cx.notify();
-                }
+                let command = Zeroizing::new(candidate.command.clone());
+                self.remove_terminal_autosuggest_command(&command, cx);
                 true
             }
             "enter" if !modifiers.shift && !modifiers.alt => {
@@ -403,6 +467,7 @@ impl TerminalPane {
         let Some(scroll_delta) = self.determine_scroll_delta(event, scroll_multiplier) else {
             return;
         };
+        self.pending_search_reveal = false;
 
         if mouse_mode(mode, event.modifiers.shift) {
             self.clear_smooth_scroll_remainder();
@@ -1116,9 +1181,11 @@ impl TerminalPane {
             return;
         };
 
+        self.pending_search_reveal = false;
+
         let available = (geometry.track_height - geometry.height).max(px(1.0));
         let y = (position.y - geometry.y - thumb_offset_y).clamp(px(0.0), available);
-        let scroll_fraction = f32::from(y / available);
+        let scroll_fraction = y / available;
         let history = self.snapshot.scrollback_lines;
         let offset = ((1.0 - scroll_fraction) * history as f32).round() as usize;
         let snapshot = {
@@ -1269,6 +1336,8 @@ impl TerminalPane {
             return;
         }
 
+        self.pending_search_reveal = false;
+
         let snapshot = {
             let mut terminal = self.terminal.lock();
             terminal.scroll_to_display_offset(target_offset);
@@ -1288,6 +1357,7 @@ impl TerminalPane {
     }
 
     fn apply_scroll_action(&mut self, action: TerminalScrollAction, cx: &mut Context<Self>) {
+        self.pending_search_reveal = false;
         let snapshot = {
             let mut terminal = self.terminal.lock();
             match action {
@@ -1306,6 +1376,7 @@ impl TerminalPane {
     }
 
     pub(super) fn select_next_search_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.pending_search_reveal = false;
         let matches = self.current_search_matches();
         if matches.is_empty() {
             self.selected_search_match = None;
@@ -1358,6 +1429,11 @@ impl TerminalPane {
     }
 
     pub(crate) fn handle_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if self.tmux_selection_pending {
+            self.pending_tmux_mouse
+                .push_back(DeferredTmuxMouse::Down(event.clone()));
+            return;
+        }
         if self.context_menu.is_some() {
             self.dismiss_terminal_context_menu(cx);
         }
@@ -1439,12 +1515,22 @@ impl TerminalPane {
         let mut selected_tmux_pane = false;
         if event.button == MouseButton::Left && event.click_count <= 1 {
             let point = self.terminal_point_for_position(event.position);
-            let selected_snapshot = {
-                let mut terminal = self.terminal.lock();
-                terminal
-                    .select_tmux_pane_at(point.col, point.row)
-                    .unwrap_or(false)
-                    .then(|| terminal.snapshot())
+            let selection = match self.completed_tmux_selection.take() {
+                Some(selected) => Ok(Some(selected)),
+                None => self
+                    .terminal
+                    .lock()
+                    .begin_tmux_pane_selection(point.col, point.row),
+            };
+            let selected_snapshot = match selection {
+                Ok(None) => {
+                    self.tmux_selection_pending = true;
+                    self.pending_tmux_mouse
+                        .push_back(DeferredTmuxMouse::Down(event.clone()));
+                    return;
+                }
+                Ok(Some(true)) => Some(self.terminal.lock().snapshot()),
+                _ => None,
             };
             if let Some(snapshot) = selected_snapshot {
                 self.set_selection(None);
@@ -1560,6 +1646,11 @@ impl TerminalPane {
     }
 
     pub(crate) fn handle_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.tmux_selection_pending {
+            self.pending_tmux_mouse
+                .push_back(DeferredTmuxMouse::Move(event.clone()));
+            return;
+        }
         if let Some(drag) = self.horizontal_scrollbar_drag
             && event.pressed_button == Some(MouseButton::Left)
         {
@@ -1647,6 +1738,11 @@ impl TerminalPane {
     }
 
     pub(crate) fn handle_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.tmux_selection_pending {
+            self.pending_tmux_mouse
+                .push_back(DeferredTmuxMouse::Up(event.clone()));
+            return;
+        }
         if self.horizontal_scrollbar_drag.take().is_some() {
             cx.notify();
             return;
@@ -2907,11 +3003,41 @@ fn free_type_selection_move_bytes(
     Some(bytes)
 }
 
+pub(super) fn terminal_autosuggest_edit_bytes(
+    state: &TerminalAutosuggestInputState,
+    command: &str,
+    execute: bool,
+    mode: TermMode,
+) -> Option<Zeroizing<Vec<u8>>> {
+    if !state.is_cursor_at_end || state.cursor_index != state.value.len() {
+        return None;
+    }
+    let mut bytes = if let Some(suffix) = command.strip_prefix(&state.value) {
+        Zeroizing::new(suffix.as_bytes().to_vec())
+    } else {
+        if !free_type_selected_text_can_be_command_input(command) {
+            return None;
+        }
+        // Reuse the terminal's bounded line-editing protocol; never assume Ctrl+U
+        // is bound to whole-line replacement in the remote shell.
+        let mut bytes = Zeroizing::new(free_type_current_command_delete_bytes(state, mode)?);
+        bytes.extend_from_slice(command.as_bytes());
+        bytes
+    };
+    if execute {
+        bytes.push(b'\r');
+    }
+    Some(bytes)
+}
+
 fn free_type_current_command_delete_bytes(
     input_state: &TerminalAutosuggestInputState,
     mode: TermMode,
 ) -> Option<Vec<u8>> {
-    let delete_count = command_cursor_step_count(&input_state.value);
+    // ZLE may erase one scalar while Readline erases a whole grapheme. At the
+    // command end, scalar-count backspaces clear both: extra deletes stop at
+    // the line boundary rather than leaving a combining character's base.
+    let delete_count = input_state.value.chars().count();
     if delete_count > TERMINAL_FREE_TYPE_MAX_CURSOR_STEPS {
         return None;
     }
@@ -3147,9 +3273,10 @@ fn privilege_prompt_text_from_snapshot(snapshot: &TerminalSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::{rc::Rc, sync::Arc};
 
     use crate::SharedTerminalCommandHistory;
+    use crate::app::TERMINAL_SEARCH_DEBOUNCE;
     use gpui::{AppContext, IntoElement, Render, ScrollDelta, TestAppContext, Window, div, point};
     #[cfg(unix)]
     use oxideterm_terminal::{
@@ -3168,6 +3295,45 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
         }
+    }
+
+    #[test]
+    fn autosuggest_fill_preserves_prefixes_and_replaces_fuzzy_queries_without_executing() {
+        for (query, candidate, expected) in [
+            ("git", "git status", b" status".as_slice()),
+            ("gts", "git status", b"\x08\x08\x08git status".as_slice()),
+            ("设置", "echo 设置", "\u{8}\u{8}echo 设置".as_bytes()),
+            ("e\u{301}", "echo", b"\x08\x08echo".as_slice()),
+        ] {
+            let state = TerminalAutosuggestInputState {
+                value: query.into(),
+                cursor_index: query.len(),
+                is_cursor_at_end: true,
+            };
+            let bytes =
+                terminal_autosuggest_edit_bytes(&state, candidate, false, TermMode::empty())
+                    .unwrap();
+            assert_eq!(bytes.as_slice(), expected);
+            let mut tracker = super::super::TerminalInputTracker::default();
+            tracker.apply_bytes(query.as_bytes());
+            assert_eq!(tracker.apply_bytes(&bytes), None);
+            assert_eq!(tracker.state().value, candidate);
+            let execute =
+                terminal_autosuggest_edit_bytes(&state, candidate, true, TermMode::empty())
+                    .unwrap();
+            tracker.reset();
+            tracker.apply_bytes(query.as_bytes());
+            assert_eq!(tracker.apply_bytes(&execute).as_deref(), Some(candidate));
+        }
+        let mid_line = TerminalAutosuggestInputState {
+            value: "gts".into(),
+            cursor_index: 1,
+            is_cursor_at_end: false,
+        };
+        assert!(
+            terminal_autosuggest_edit_bytes(&mid_line, "git status", true, TermMode::empty())
+                .is_none()
+        );
     }
 
     #[gpui::test]
@@ -3194,8 +3360,8 @@ mod tests {
         pane.update(cx, |pane, cx| {
             pane.test_accepts_input = true;
             pane.snapshot.lines[pane.snapshot.cursor_row].active_input = true;
-            pane.observe_autosuggest_input_bytes(b"ls", cx);
             pane.autosuggest_prompt_active = true;
+            pane.observe_autosuggest_input_bytes(b"ls", cx);
 
             assert!(pane.handle_terminal_autosuggest_key(
                 "down",
@@ -3211,6 +3377,248 @@ mod tests {
             assert_eq!(pane.autosuggest_selected_index, None);
             assert_eq!(pane.autosuggest_dismissed_query.as_deref(), Some("ls"));
         });
+    }
+
+    #[gpui::test]
+    fn word_shortcuts_send_shell_movement_but_preserve_application_keys(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| TerminalScrollTestRoot);
+        let pane = cx.update(|window, cx| {
+            cx.set_global(TerminalKeybindings {
+                bindings: vec![
+                    (
+                        gpui::KeyBinding::new("alt-left", gpui::NoAction {}, None),
+                        TerminalShortcut::WordBackward,
+                    ),
+                    (
+                        gpui::KeyBinding::new("alt-right", gpui::NoAction {}, None),
+                        TerminalShortcut::WordForward,
+                    ),
+                ],
+                normalize: |key| Some(key.clone()),
+            });
+            cx.new(|cx| {
+                TerminalPane::new_recording_playback(
+                    20,
+                    2,
+                    TerminalUiPreferences::default(),
+                    window,
+                    cx,
+                )
+                .unwrap()
+            })
+        });
+        let delivered = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let output = delivered.clone();
+        pane.update(cx, |pane, cx| {
+            pane.test_accepts_input = true;
+            pane.set_input_broadcaster(Some(Rc::new(move |_, bytes, _| {
+                output.borrow_mut().push(bytes.to_vec());
+            })));
+            let event = |key, is_held| KeyDownEvent {
+                keystroke: gpui::Keystroke::parse(key).unwrap(),
+                is_held,
+                prefer_character_input: false,
+            };
+            pane.handle_key(&event("alt-left", false), cx);
+            pane.handle_key(&event("alt-right", true), cx);
+            for (enter, exit) in [
+                (b"\x1b[?1049h".as_slice(), b"\x1b[?1049l".as_slice()),
+                (b"\x1b[?1h".as_slice(), b"\x1b[?1l".as_slice()),
+                (b"\x1b[>1u".as_slice(), b"\x1b[<u".as_slice()),
+            ] {
+                pane.terminal.lock().feed_recording_output(enter);
+                pane.handle_key(&event("alt-left", false), cx);
+                pane.handle_key(&event("alt-right", false), cx);
+                pane.terminal.lock().feed_recording_output(exit);
+            }
+            pane.handle_key(&event("alt-left", true), cx);
+            cx.set_global(TerminalKeybindings {
+                bindings: Vec::new(),
+                normalize: |key| Some(key.clone()),
+            });
+            pane.handle_key(&event("alt-right", false), cx);
+        });
+        assert_eq!(
+            delivered.borrow().as_slice(),
+            [
+                b"\x1bb".to_vec(),
+                b"\x1bf".to_vec(),
+                b"\x1b[1;3D".to_vec(),
+                b"\x1b[1;3C".to_vec(),
+                b"\x1bb".to_vec(),
+                b"\x1bf".to_vec(),
+                b"\x1b[1;3D".to_vec(),
+                b"\x1b[1;3C".to_vec(),
+                b"\x1bb".to_vec(),
+                b"\x1b[1;3C".to_vec(),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn configured_terminal_keybindings_replace_fixed_scroll_keys(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| TerminalScrollTestRoot);
+        let pane = cx.update(|window, cx| {
+            cx.set_global(TerminalKeybindings {
+                bindings: vec![(
+                    gpui::KeyBinding::new("ctrl-u", gpui::NoAction {}, None),
+                    TerminalShortcut::Top,
+                )],
+                normalize: |key| Some(key.clone()),
+            });
+            cx.new(|cx| {
+                TerminalPane::new_recording_playback(
+                    20,
+                    2,
+                    TerminalUiPreferences::default(),
+                    window,
+                    cx,
+                )
+                .unwrap()
+            })
+        });
+        let event = |key| KeyDownEvent {
+            keystroke: gpui::Keystroke::parse(key).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        pane.update(cx, |pane, cx| {
+            pane.terminal
+                .lock()
+                .feed_recording_output(b"zero\r\none\r\ntwo\r\nthree");
+            let snapshot = pane.terminal.lock().snapshot();
+            pane.snapshot = pane.stamp_snapshot(snapshot);
+            pane.handle_key(&event("shift-home"), cx);
+            assert_eq!(pane.snapshot.display_offset, 0);
+            pane.handle_key(&event("ctrl-u"), cx);
+            assert_eq!(pane.snapshot.display_offset, 2);
+            assert_eq!(
+                pane.visible_text_snapshot()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .trim_end(),
+                "zero"
+            );
+            pane.apply_scroll_action(TerminalScrollAction::Bottom, cx);
+            cx.set_global(TerminalKeybindings {
+                bindings: Vec::new(),
+                normalize: |key| Some(key.clone()),
+            });
+            pane.handle_key(&event("ctrl-u"), cx);
+            assert_eq!(pane.snapshot.display_offset, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn search_refresh_preserves_manual_scroll(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| TerminalScrollTestRoot);
+        for pending in [false, true] {
+            for input in ["wheel", "scrollbar", "keyboard"] {
+                let pane = cx.update(|window, cx| {
+                    cx.new(|cx| {
+                        TerminalPane::new_recording_playback(
+                            20,
+                            3,
+                            TerminalUiPreferences::default(),
+                            window,
+                            cx,
+                        )
+                        .unwrap()
+                    })
+                });
+                pane.update(cx, |pane, cx| {
+                    let output = (0..20)
+                        .map(|row| {
+                            if row == 0 || row == 10 {
+                                format!("needle {row}")
+                            } else {
+                                format!("row {row}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\r\n");
+                    pane.terminal
+                        .lock()
+                        .feed_recording_output(output.as_bytes());
+                    let snapshot = pane.terminal.lock().snapshot();
+                    pane.snapshot = pane.stamp_snapshot(snapshot);
+                    pane.apply_scroll_action(TerminalScrollAction::Top, cx);
+                    pane.tick(cx);
+                    pane.set_search_query(Some("needle".into()), None, cx);
+                });
+                if !pending {
+                    cx.run_until_parked();
+                    cx.executor().advance_clock(TERMINAL_SEARCH_DEBOUNCE);
+                    cx.run_until_parked();
+                    pane.update(cx, |pane, _| {
+                        assert_eq!(pane.search_status().match_count, 2);
+                        assert_eq!(pane.snapshot.display_offset, 17);
+                    });
+                }
+                let offset = pane.update(cx, |pane, cx| {
+                    match input {
+                        "wheel" => pane.handle_scroll(
+                            &ScrollWheelEvent {
+                                delta: ScrollDelta::Lines(point(0.0, -2.0)),
+                                ..Default::default()
+                            },
+                            cx,
+                        ),
+                        "scrollbar" => {
+                            let geometry = pane.scrollbar_geometry().unwrap();
+                            pane.set_scrollbar_position(
+                                point(geometry.x, geometry.y + geometry.track_height),
+                                px(0.0),
+                                cx,
+                            );
+                        }
+                        _ => pane.apply_scroll_action(TerminalScrollAction::Bottom, cx),
+                    }
+                    let offset = pane.snapshot.display_offset;
+                    assert!(offset < 17, "{input} must move away from the match");
+                    pane.tick(cx);
+                    offset
+                });
+                cx.run_until_parked();
+                cx.executor().advance_clock(TERMINAL_SEARCH_DEBOUNCE);
+                cx.run_until_parked();
+                pane.update(cx, |pane, cx| {
+                    assert_eq!(pane.search_status().match_count, 2);
+                    assert_eq!(
+                        pane.snapshot.display_offset, offset,
+                        "{input}, pending={pending}"
+                    );
+                    pane.select_next_search_result(true, cx);
+                    assert_eq!(pane.search_status().active_match, Some(1));
+                    assert!(pane.visible_text_snapshot().contains("needle 10"));
+                });
+                let output_offset = pane.update(cx, |pane, cx| {
+                    pane.terminal.lock().feed_recording_output(b"\r\nneedle 20");
+                    pane.tick(cx);
+                    pane.snapshot.display_offset
+                });
+                cx.run_until_parked();
+                cx.executor().advance_clock(TERMINAL_SEARCH_DEBOUNCE);
+                cx.run_until_parked();
+                pane.update(cx, |pane, cx| {
+                    assert_eq!(pane.search_status().match_count, 3);
+                    assert_eq!(pane.snapshot.display_offset, output_offset);
+                    pane.select_next_search_result(false, cx);
+                    assert_eq!(pane.search_status().active_match, Some(0));
+                    assert!(pane.visible_text_snapshot().contains("needle 0"));
+                    pane.tick(cx);
+                    pane.set_search_query(Some("row 5".into()), None, cx);
+                });
+                cx.run_until_parked();
+                cx.executor().advance_clock(TERMINAL_SEARCH_DEBOUNCE);
+                cx.run_until_parked();
+                pane.update(cx, |pane, _| {
+                    assert_eq!(pane.search_status().match_count, 1);
+                    assert!(pane.visible_text_snapshot().contains("row 5"));
+                });
+            }
+        }
     }
 
     #[gpui::test]
@@ -4144,6 +4552,18 @@ mod tests {
         .ok_or_else(|| "Free Type move bytes were not generated".to_string())?;
         submit_real_pty_command(session, move_command, &move_bytes)?;
         wait_for_real_pty_text(session, "OT_MOVE:efabcd")?;
+        for (index, query) in ["gts", "设置", "e\u{301}"].into_iter().enumerate() {
+            let state = TerminalAutosuggestInputState {
+                value: query.into(),
+                cursor_index: query.len(),
+                is_cursor_at_end: true,
+            };
+            let command = format!("printf 'OT_FUZZY_%s\\n' {index}");
+            let edit = terminal_autosuggest_edit_bytes(&state, &command, false, session.mode())
+                .ok_or("suggestion edit bytes were not generated")?;
+            submit_real_pty_command(session, query, &edit)?;
+            wait_for_real_pty_text(session, &format!("OT_FUZZY_{index}"))?;
+        }
         if case.mode_name == "emacs" && matches!(case.shell_id, "bash" | "zsh") {
             validate_history_search_click_in_real_pty(session)?;
         }
@@ -4171,12 +4591,12 @@ mod tests {
                         .write_protocol_bytes(b"\x12")
                         .map_err(|e| e.to_string())?;
                     session.write_text(query).map_err(|e| e.to_string())?;
-                    let mut snapshot = wait_for_real_pty_search_state(session, true)?;
+                    let mut snapshot = wait_for_real_pty_search_state(session, true, &command)?;
                     if accept_first {
                         session
                             .write_protocol_bytes(b"\x05")
                             .map_err(|e| e.to_string())?;
-                        snapshot = wait_for_real_pty_search_state(session, false)?;
+                        snapshot = wait_for_real_pty_search_state(session, false, &command)?;
                     }
                     let (start, end) =
                         active_input_block_bounds(&snapshot).ok_or("missing active input")?;
@@ -4230,17 +4650,35 @@ mod tests {
     fn wait_for_real_pty_search_state(
         session: &mut TerminalSession,
         searching: bool,
+        command: &str,
     ) -> Result<TerminalSnapshot, String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             session.read_pending();
             let snapshot = session.snapshot();
-            if history_search_command_range(&snapshot).is_some() == searching {
-                return Ok(snapshot);
+            // A PTY read can contain only the search prompt, or only the first part of
+            // its dismissal. Wait for the recalled command as well as the mode change.
+            if history_search_command_range(&snapshot).is_some() == searching
+                && let Some((start, end)) = active_input_block_bounds(&snapshot)
+            {
+                // Wide glyph spacers and Readline's wrap padding are layout, not input.
+                // Exact command contents are checked by executing the edited result below.
+                let input = snapshot.lines[start..=end]
+                    .iter()
+                    .map(TerminalRow::text)
+                    .collect::<String>();
+                let input = input.split_whitespace().collect::<String>();
+                let expected = command.split_whitespace().collect::<String>();
+                if input.ends_with(&expected) {
+                    return Ok(snapshot);
+                }
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        Err("timed out waiting for history search redraw".into())
+        Err(format!(
+            "timed out waiting for history search redraw (searching={searching}, command={command:?}); screen={:?}",
+            session.buffer_text()
+        ))
     }
 
     #[cfg(unix)]

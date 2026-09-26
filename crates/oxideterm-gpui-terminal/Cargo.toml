@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "oxideterm-gpui-terminal"
 edition.workspace = true
@@ -36,6 +39,10 @@ vte.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+russh.workspace = true
+rand10.workspace = true
+tokio.workspace = true
+crossbeam-channel.workspace = true
 criterion.workspace = true
 gpui = { workspace = true, features = ["bench"] }
 gpui_platform = { workspace = true, features = ["font-kit", "test-support"] }

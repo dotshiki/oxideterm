@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "oxideterm-gpui-app"
 edition.workspace = true
@@ -13,6 +16,8 @@ name = "oxideterm-native"
 path = "src/main.rs"
 
 [dependencies]
+oxideterm-ftp = { path = "../oxideterm-ftp" }
+futures-util.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
@@ -93,9 +98,11 @@ url.workspace = true
 walkdir = "2"
 whoami.workspace = true
 zeroize.workspace = true
+zstd = "0.13"
 
 [build-dependencies]
 embed-resource = "3.0.9"
+zstd = "0.13"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

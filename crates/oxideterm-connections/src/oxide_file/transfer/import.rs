@@ -194,6 +194,16 @@ fn apply_oxide_import_with_options_inner(
     if options.import_standalone_sftp_profiles {
         for profile in standalone_sftp_profiles_snapshot
             .as_ref()
+            .and_then(|s| s.ftp.as_ref())
+            .into_iter()
+            .flat_map(|s| &s.records)
+        {
+            profile.validate().map_err(|error| {
+                OxideFileError::InvalidFormat(format!("Invalid FTP profile: {error}"))
+            })?;
+        }
+        for profile in standalone_sftp_profiles_snapshot
+            .as_ref()
             .into_iter()
             .flat_map(|snapshot| &snapshot.records)
         {
@@ -480,7 +490,7 @@ fn apply_oxide_import_with_options_inner(
             }
         }
         if let Some(standalone_sftp_profiles_snapshot) = standalone_sftp_profiles_snapshot {
-            let profile_count = standalone_sftp_profiles_snapshot.records.len();
+            let profile_count = standalone_sftp_profiles_snapshot.record_count();
             if options.import_standalone_sftp_profiles {
                 result.imported_standalone_sftp_profiles = store
                     .apply_standalone_sftp_profiles_snapshot(standalone_sftp_profiles_snapshot)
@@ -615,7 +625,7 @@ fn count_sensitive_credentials_for_auth(
     // This reports only presence/count metadata; secret values stay in their
     // zeroizing archive owners and are never cloned into UI-facing summaries.
     match auth {
-        EncryptedAuth::Password { password } => {
+        EncryptedAuth::Password { password, .. } => {
             if !password.is_empty() {
                 counts.restored_connection_passwords += 1;
             }
@@ -862,7 +872,12 @@ fn import_auth(
     import_options: &OxideImportOptions,
 ) -> Result<SavedAuth, OxideFileError> {
     Ok(match auth {
-        EncryptedAuth::Password { password } => SavedAuth::Password {
+        EncryptedAuth::Password {
+            password,
+            empty_password,
+        } => SavedAuth::Password {
+            empty_password,
+
             keychain_id: None,
             plaintext_password: (!password.is_empty()).then(|| SecretString::from(password)),
         },
@@ -1131,6 +1146,8 @@ fn merge_auth(existing: SavedAuth, imported: SavedAuth) -> SavedAuth {
                 ..
             },
             SavedAuth::Password {
+                empty_password: false,
+
                 plaintext_password: None,
                 keychain_id: None,
             },

@@ -43,43 +43,34 @@ pub enum SerialControlLine {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum SerialLineEnding {
     Lf,
     CrLf,
     Cr,
+    #[default]
     None,
 }
 
-impl Default for SerialLineEnding {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum SerialDisplayMode {
+    #[default]
     Text,
     Hex,
     Mixed,
 }
 
-impl Default for SerialDisplayMode {
-    fn default() -> Self {
-        Self::Text
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum SerialSendMode {
+    #[default]
     Text,
     Hex,
 }
 
-impl Default for SerialSendMode {
-    fn default() -> Self {
-        Self::Text
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SerialRuntimeOptions {
@@ -191,6 +182,15 @@ pub trait TerminalSessionBackend: Send {
     fn feed_trzsz_terminal_output(&mut self, _bytes: &[u8]) {}
     fn interrupt_trzsz_transfer(&mut self) {}
     fn finish_trzsz_transfer(&mut self) {}
+    fn begin_modem_transfer(
+        &mut self,
+        request: TerminalModemTransferRequest,
+    ) -> Result<Option<ModemTransfer>> {
+        self.start_modem_transfer(request)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("Unable to start terminal transfer"))
+    }
+
     fn start_modem_transfer(
         &mut self,
         _request: TerminalModemTransferRequest,
@@ -200,6 +200,9 @@ pub trait TerminalSessionBackend: Send {
     fn interrupt_modem_transfer(&mut self) {}
     fn finish_modem_transfer(&mut self) {}
     fn mode(&self) -> TermMode;
+    fn begin_tmux_pane_selection(&mut self, col: usize, row: usize) -> Result<Option<bool>> {
+        self.select_tmux_pane_at(col, row).map(Some)
+    }
     fn select_tmux_pane_at(&mut self, _col: usize, _row: usize) -> Result<bool> {
         Ok(false)
     }

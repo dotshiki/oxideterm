@@ -173,8 +173,10 @@ fn saved_standalone_sftp_proxy_hop_from_form(
         .ok_or_else(|| anyhow::anyhow!("Proxy port is invalid"))?;
     let fallback = match hop.auth_tab {
         SshAuthTab::Password => SavedAuth::Password {
+            empty_password: hop.empty_password,
             keychain_id: None,
-            plaintext_password: Some(SecretString::from(std::mem::take(&mut hop.password))),
+            plaintext_password: (!hop.empty_password && !hop.password.is_empty())
+                .then(|| SecretString::from(std::mem::take(&mut hop.password))),
         },
         SshAuthTab::Agent => SavedAuth::Agent,
         SshAuthTab::DefaultKey => SavedAuth::Key {
@@ -342,7 +344,8 @@ fn saved_standalone_sftp_secondary_endpoint_from_form(
         .filter(|port| *port > 0)
         .ok_or_else(|| anyhow::anyhow!("Second SFTP port is invalid"))?;
     let can_preserve_auth = existing.is_some_and(|endpoint| {
-        standalone_sftp_secondary_target_matches(form, endpoint)
+        form.empty_password == endpoint.auth.uses_empty_password()
+            && standalone_sftp_secondary_target_matches(form, endpoint)
             && standalone_sftp_secondary_auth_matches(form, &endpoint.auth)
             && form.password.is_empty()
             && form.passphrase.is_empty()
@@ -352,6 +355,8 @@ fn saved_standalone_sftp_secondary_endpoint_from_form(
     } else {
         let fallback = match form.auth_tab {
             SshAuthTab::Password => SavedAuth::Password {
+                empty_password: form.empty_password,
+
                 keychain_id: None,
                 plaintext_password: (form.save_password && !form.password.is_empty())
                     .then(|| SecretString::from(std::mem::take(&mut form.password))),
@@ -424,6 +429,8 @@ fn saved_mosh_auth_from_form(form: &mut NewConnectionForm) -> SavedAuth {
             let plaintext_password = (persist_password && !form.password.is_empty())
                 .then(|| SecretString::from(std::mem::take(&mut form.password)));
             SavedAuth::Password {
+                empty_password: form.empty_password,
+
                 // An unchanged edit keeps the protected value by reference; a replacement
                 // reuses that same owner while new profiles honor the save-password choice.
                 keychain_id: persist_password
@@ -474,7 +481,14 @@ fn saved_mosh_auth_from_form(form: &mut NewConnectionForm) -> SavedAuth {
 fn runtime_mosh_auth_from_form(form: &mut NewConnectionForm) -> AuthMethod {
     let fallback = match form.auth_tab {
         SshAuthTab::Password => {
-            AuthMethod::password_secret(take_zeroizing_secret(&mut form.password))
+            if form.empty_password {
+                form.password.zeroize();
+                AuthMethod::password("")
+            } else if form.password.is_empty() {
+                AuthMethod::password_prompt()
+            } else {
+                AuthMethod::password_secret(take_zeroizing_secret(&mut form.password))
+            }
         }
         SshAuthTab::Agent => AuthMethod::Agent,
         SshAuthTab::DefaultKey => AuthMethod::key_secret(
@@ -696,13 +710,17 @@ fn auth_for_duplicate_owner(
         SavedAuth::Password {
             keychain_id: _,
             plaintext_password: Some(password),
+            ..
         } => Ok(SavedAuth::Password {
+            empty_password: false,
+
             keychain_id: None,
             plaintext_password: Some(password),
         }),
         SavedAuth::Password {
             keychain_id: Some(_),
             plaintext_password: None,
+            ..
         } => connection_store.copy_saved_auth_for_new_owner(&auth),
         SavedAuth::Key {
             key_path,
@@ -794,6 +812,7 @@ fn proxy_hop_auth_target_matches(left: &SavedProxyHop, right: &SavedProxyHop) ->
         && left.port == right.port
         && left.username == right.username
         && left.auth.gssapi_options() == right.auth.gssapi_options()
+        && left.auth.uses_empty_password() == right.auth.uses_empty_password()
         && match (
             left.auth.conventional_fallback(),
             right.auth.conventional_fallback(),
@@ -1001,14 +1020,10 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (transport, local_shell_id, drill_down_parent_id, mode) = {
+        let (transport, drill_down_parent_id, mode) = {
             let state = self.connection_form_state(cx);
             (
                 state.form.as_ref().map(|form| form.transport),
-                state
-                    .form
-                    .as_ref()
-                    .and_then(|form| form.local_shell_id.clone()),
                 state.drill_down_parent_node_id.clone(),
                 state.mode(),
             )
@@ -1035,34 +1050,15 @@ impl WorkspaceApp {
             cx.notify();
             return;
         }
+        if transport == Some(NewConnectionTransport::Ftp) {
+            self.submit_ftp_connection_form(action, cx);
+            return;
+        }
         if transport == Some(NewConnectionTransport::LocalTerminal)
             && drill_down_parent_id.is_none()
             && mode == NewConnectionFormMode::NewConnection
         {
-            // The modal is only another launch surface; the terminal tab owns the local PTY.
-            let selected_shell = self.resolved_local_shell(local_shell_id.as_deref());
-            self.close_new_connection_form(window, cx);
-            if let Some(shell) = selected_shell {
-                let mut terminal_config = self.local_terminal_config();
-                terminal_config.shell = Some(shell.clone());
-                self.edit_settings(
-                    |settings| {
-                        let recent = &mut settings.local_terminal.recent_shell_ids;
-                        recent.retain(|id| id != &shell.id);
-                        recent.insert(0, shell.id.clone());
-                        recent.truncate(5);
-                    },
-                    cx,
-                );
-                let _ = self.create_local_terminal_tab_with_config(
-                    terminal_config,
-                    shell.label,
-                    window,
-                    cx,
-                );
-            } else {
-                let _ = self.create_local_terminal_tab(window, cx);
-            }
+            self.submit_local_terminal_form(action, window, cx);
             return;
         }
         if transport == Some(NewConnectionTransport::Serial)
@@ -1225,8 +1221,16 @@ impl WorkspaceApp {
         };
         let auth_override = self.with_connection_form_mut(cx, |_this, form, _cx| {
             let form = form?;
-            (form.auth_tab == SshAuthTab::Password && !form.save_password)
-                .then(|| AuthMethod::password_secret(take_zeroizing_secret(&mut form.password)))
+            (form.auth_tab == SshAuthTab::Password && !form.save_password).then(|| {
+                if form.empty_password {
+                    form.password.zeroize();
+                    AuthMethod::password("")
+                } else if form.password.is_empty() {
+                    AuthMethod::password_prompt()
+                } else {
+                    AuthMethod::password_secret(take_zeroizing_secret(&mut form.password))
+                }
+            })
         });
 
         // The Save and Save & Connect buttons mean "persist this draft now",
@@ -1578,8 +1582,8 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((config, terminal_options, mut save_request)) =
-            self.with_connection_form_mut(cx, |this, form, cx| {
+        let Some((config, upstream_proxy, terminal_options, mut save_request)) = self
+            .with_connection_form_mut(cx, |this, form, cx| {
                 let form = form?;
                 let host = form.host.trim().to_string();
                 let port = form.port.trim().parse::<u16>().ok();
@@ -1594,6 +1598,25 @@ impl WorkspaceApp {
                     return None;
                 };
                 let editing_profile_id = form.telnet_profile_id.clone();
+                let mut upstream_proxy = match saved_upstream_proxy_policy_from_form(form) {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        form.error = Some(error.to_string());
+                        cx.notify();
+                        return None;
+                    }
+                };
+                if let SavedUpstreamProxyPolicy::Custom { proxy } = &mut upstream_proxy
+                    && let SavedUpstreamProxyAuth::Password {
+                        keychain_id,
+                        plaintext_password,
+                        ..
+                    } = &mut proxy.auth
+                    && plaintext_password.is_some()
+                {
+                    // An explicitly edited password overrides the old protected-store reference.
+                    *keychain_id = None;
+                }
                 let existing_connect_on_open = editing_profile_id.as_deref().and_then(|id| {
                     this.connection_store
                         .telnet_profiles()
@@ -1605,6 +1628,7 @@ impl WorkspaceApp {
                 let should_save_profile =
                     editing_profile_id.is_some() || action != NewConnectionSubmitAction::Connect;
                 let save_request = should_save_profile.then(|| SaveTelnetProfileRequest {
+                    upstream_proxy: Some(upstream_proxy.clone()),
                     id: editing_profile_id,
                     name: telnet_profile_name_or_endpoint(&form.telnet_profile_name, &host, port),
                     group: serial_profile_group_from_form(&form.group, &this.i18n),
@@ -1621,7 +1645,7 @@ impl WorkspaceApp {
                 let terminal_options = form.terminal.clone();
                 form.pending = true;
                 form.error = None;
-                Some((config, terminal_options, save_request))
+                Some((config, upstream_proxy, terminal_options, save_request))
             })
         else {
             return;
@@ -1679,7 +1703,8 @@ impl WorkspaceApp {
 
         // Telnet is opened as a native local terminal transport. It does not
         // create an SSH node, so SSH-only saved-connection/test flows stay out.
-        match self.create_telnet_terminal_tab(config, terminal_options, window, cx) {
+        match self.create_telnet_terminal_tab(config, upstream_proxy, terminal_options, window, cx)
+        {
             Ok(session_id) => {
                 if let Some(request) = save_request {
                     match self.connection_store.upsert_telnet_profile(request) {
@@ -2075,7 +2100,16 @@ impl WorkspaceApp {
             let auth_override = (action == NewConnectionSubmitAction::SaveAndConnect
                 && form.auth_tab == SshAuthTab::Password
                 && !form.save_password)
-                .then(|| AuthMethod::password_secret(take_zeroizing_secret(&mut form.password)));
+                .then(|| {
+                    if form.empty_password {
+                        form.password.zeroize();
+                        AuthMethod::password("")
+                    } else if form.password.is_empty() {
+                        AuthMethod::password_prompt()
+                    } else {
+                        AuthMethod::password_secret(take_zeroizing_secret(&mut form.password))
+                    }
+                });
             let secondary_endpoint =
                 if form.standalone_sftp_transfer_mode == StandaloneSftpTransferMode::RemoteRemote {
                     match saved_standalone_sftp_secondary_endpoint_from_form(
@@ -2101,9 +2135,15 @@ impl WorkspaceApp {
                 && form.standalone_sftp_secondary.auth_tab == SshAuthTab::Password
                 && !form.standalone_sftp_secondary.save_password)
                 .then(|| {
-                    AuthMethod::password_secret(take_zeroizing_secret(
-                        &mut form.standalone_sftp_secondary.password,
-                    ))
+                    let endpoint = &mut form.standalone_sftp_secondary;
+                    if endpoint.empty_password {
+                        endpoint.password.zeroize();
+                        AuthMethod::password("")
+                    } else if endpoint.password.is_empty() {
+                        AuthMethod::password_prompt()
+                    } else {
+                        AuthMethod::password_secret(take_zeroizing_secret(&mut endpoint.password))
+                    }
                 });
             let request = SaveStandaloneSftpProfileRequest {
                 id: base_request.id,
@@ -3450,12 +3490,14 @@ mod saved_connection_open_tests {
         let auth = saved_mosh_auth_from_form(&mut form);
 
         assert!(matches!(
-            auth,
-            SavedAuth::Password {
-                keychain_id: Some(keychain_id),
-                plaintext_password: None,
-            } if keychain_id == "mosh-password-owner"
-        ));
+                    auth,
+                    SavedAuth::Password {
+                        keychain_id: Some(keychain_id),
+                        plaintext_password: None,
+
+                    ..
+        } if keychain_id == "mosh-password-owner"
+                ));
         assert!(form.password.is_empty());
     }
 
@@ -3470,12 +3512,14 @@ mod saved_connection_open_tests {
         let auth = saved_mosh_auth_from_form(&mut form);
 
         assert!(matches!(
-            auth,
-            SavedAuth::Password {
-                keychain_id: Some(keychain_id),
-                plaintext_password: Some(password),
-            } if keychain_id == "mosh-password-owner" && password == "replacement-secret"
-        ));
+                    auth,
+                    SavedAuth::Password {
+                        keychain_id: Some(keychain_id),
+                        plaintext_password: Some(password),
+
+                    ..
+        } if keychain_id == "mosh-password-owner" && password == "replacement-secret"
+                ));
         assert!(form.password.is_empty());
     }
 
@@ -3491,12 +3535,14 @@ mod saved_connection_open_tests {
         let auth = saved_mosh_auth_from_form(&mut form);
 
         assert!(matches!(
-            auth,
-            SavedAuth::Password {
-                keychain_id: None,
-                plaintext_password: Some(password),
-            } if password == "replacement-secret"
-        ));
+                    auth,
+                    SavedAuth::Password {
+                        keychain_id: None,
+                        plaintext_password: Some(password),
+
+                    ..
+        } if password == "replacement-secret"
+                ));
         assert!(form.password.is_empty());
     }
 
@@ -3510,6 +3556,8 @@ mod saved_connection_open_tests {
             SavedAuth::Agent,
         );
         profile.proxy_chain = vec![password_proxy_hop(SavedAuth::Password {
+            empty_password: false,
+
             keychain_id: Some("jump-password-owner".to_string()),
             plaintext_password: None,
         })];
@@ -3546,10 +3594,14 @@ mod saved_connection_open_tests {
     #[test]
     fn unchanged_edited_proxy_hop_preserves_its_keychain_reference() {
         let persisted_proxy_chain = vec![password_proxy_hop(SavedAuth::Password {
+            empty_password: false,
+
             keychain_id: Some("persisted-proxy-password".to_string()),
             plaintext_password: None,
         })];
         let mut edited_proxy_chain = vec![password_proxy_hop(SavedAuth::Password {
+            empty_password: false,
+
             keychain_id: None,
             plaintext_password: Some(SecretString::default()),
         })];
@@ -3567,17 +3619,21 @@ mod saved_connection_open_tests {
         .unwrap();
 
         assert!(matches!(
-            &edited_proxy_chain[0].auth,
-            SavedAuth::Password {
-                keychain_id: Some(keychain_id),
-                plaintext_password: None,
-            } if keychain_id == "persisted-proxy-password"
-        ));
+                    &edited_proxy_chain[0].auth,
+                    SavedAuth::Password {
+                        keychain_id: Some(keychain_id),
+                        plaintext_password: None,
+
+                    ..
+        } if keychain_id == "persisted-proxy-password"
+                ));
     }
 
     #[test]
     fn saved_proxy_hop_added_during_edit_uses_its_independent_auth_copy() {
         let mut edited_proxy_chain = vec![password_proxy_hop(SavedAuth::Password {
+            empty_password: false,
+
             keychain_id: None,
             plaintext_password: Some(SecretString::default()),
         })];
@@ -3590,6 +3646,8 @@ mod saved_connection_open_tests {
                 has_explicit_secret_draft: false,
             }],
             vec![Some(SavedAuth::Password {
+                empty_password: false,
+
                 keychain_id: None,
                 plaintext_password: Some(SecretString::from("copied-proxy-secret")),
             })],
@@ -3598,21 +3656,27 @@ mod saved_connection_open_tests {
         .unwrap();
 
         assert!(matches!(
-            &edited_proxy_chain[0].auth,
-            SavedAuth::Password {
-                keychain_id: None,
-                plaintext_password: Some(password),
-            } if password == "copied-proxy-secret"
-        ));
+                    &edited_proxy_chain[0].auth,
+                    SavedAuth::Password {
+                        keychain_id: None,
+                        plaintext_password: Some(password),
+
+                    ..
+        } if password == "copied-proxy-secret"
+                ));
     }
 
     #[test]
     fn edited_proxy_hop_never_reuses_credentials_for_another_host() {
         let persisted_proxy_chain = vec![password_proxy_hop(SavedAuth::Password {
+            empty_password: false,
+
             keychain_id: Some("persisted-proxy-password".to_string()),
             plaintext_password: None,
         })];
         let mut edited_hop = password_proxy_hop(SavedAuth::Password {
+            empty_password: false,
+
             keychain_id: None,
             plaintext_password: Some(SecretString::default()),
         });

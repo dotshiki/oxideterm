@@ -12,6 +12,7 @@ fn auth_binding<'a>(
         SavedAuth::Password {
             keychain_id,
             plaintext_password,
+            ..
         } => (keychain_id.as_deref(), plaintext_password.as_ref()),
         SavedAuth::Key {
             passphrase_keychain_id,
@@ -182,6 +183,36 @@ impl ConnectionStore {
                 reference: profile.credential_ref.as_deref(),
                 plaintext: None,
             });
+        }
+        for profile in &self.data.telnet_profiles {
+            if let SavedUpstreamProxyPolicy::Custom { proxy } = &profile.upstream_proxy {
+                bindings.extend(proxy_binding(
+                    CredentialOwner::Telnet(profile.id.clone()),
+                    CredentialSlot::UpstreamProxy,
+                    proxy,
+                ));
+            }
+        }
+        for profile in &self.data.ftp_profiles {
+            let owner = CredentialOwner::Ftp(profile.id.clone());
+            bindings.push(CredentialBinding {
+                target: CredentialTarget {
+                    owner: owner.clone(),
+                    slot: CredentialSlot::Primary,
+                    identity: sha256_hex(&(
+                        &profile.host,
+                        profile.port,
+                        &profile.username,
+                        profile.security,
+                    ))
+                    .expect("serializable FTP identity"),
+                },
+                reference: profile.password_keychain_id.as_deref(),
+                plaintext: None,
+            });
+            if let SavedUpstreamProxyPolicy::Custom { proxy } = &profile.upstream_proxy {
+                bindings.extend(proxy_binding(owner, CredentialSlot::UpstreamProxy, proxy));
+            }
         }
         if let Some(proxy) = global_proxy {
             bindings.extend(proxy_binding(

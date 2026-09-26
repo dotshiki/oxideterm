@@ -20,6 +20,123 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "manual release-profile local PTY throughput benchmark"]
+    fn local_pty_output_benchmark() {
+        use std::time::{Duration, Instant};
+        let corpus_file = tempfile::NamedTempFile::new().unwrap();
+        let input_ack = tempfile::NamedTempFile::new().unwrap();
+        for (name, pattern) in [
+            (
+                "plain",
+                "terminal benchmark output abcdefghijklmnopqrstuvwxyz 0123456789\r\n",
+            ),
+            (
+                "ansi",
+                "\x1b[38;5;42mcolored output\x1b[0m terminal benchmark\r\n",
+            ),
+            (
+                "unicode",
+                "中文输出终端性能测试 e\u{301} 🦀 日本語かなカナ\r\n",
+            ),
+        ] {
+            let corpus = pattern.repeat((16 * 1024 * 1024) / pattern.len());
+            std::fs::write(corpus_file.path(), &corpus).unwrap();
+            for round in 0..4 {
+                std::fs::write(input_ack.path(), []).unwrap();
+                let config = crate::LocalPtyConfig {
+                    shell: Some(crate::ShellInfo::new("test-sh", "Test", "/bin/sh").with_args(vec![
+                        "-c".into(),
+                        r#"stty raw -echo; printf '\033]2;ready\007'; read line; cat "$1" & output=$!; dd bs=1 count=1 of="$2" 2>/dev/null; wait "$output"; printf '\r\nBENCH-END\r\n\033]2;done\007'; read line"#.into(),
+                        "pty-benchmark".into(),
+                        corpus_file.path().to_string_lossy().into_owned(),
+                        input_ack.path().to_string_lossy().into_owned(),
+                    ])),
+                    load_profile: false,
+                    ..Default::default()
+                };
+                let mut session = LocalPtySession::spawn_with_config_graphics_and_encoding(
+                    120,
+                    40,
+                    config,
+                    Default::default(),
+                    Default::default(),
+                    20_000,
+                )
+                .unwrap();
+                let startup = Instant::now();
+                while session.title.as_deref() != Some("ready") {
+                    assert!(
+                        startup.elapsed() < Duration::from_secs(10),
+                        "startup timeout"
+                    );
+                    session.drain_output();
+                    session.take_events();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let started = Instant::now();
+                session.write_input(b"\n").unwrap();
+                let mut report = TerminalDrainReport::default();
+                let mut input_started = None;
+                let mut input_latency = None;
+                while session.title.as_deref() != Some("done") {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "output timeout: {name}"
+                    );
+                    report.combine(session.drain_output_with_budget(
+                        TerminalDrainBudget::unlimited().with_performance_metrics(true),
+                    ));
+                    if report.drained_bytes >= 256 * 1024 && input_started.is_none() {
+                        input_started = Some(Instant::now());
+                        session.write_input(b"x").unwrap();
+                    }
+                    if let Some(started) = input_started {
+                        if input_latency.is_none()
+                            && std::fs::read(input_ack.path()).unwrap() == b"x"
+                        {
+                            input_latency = Some(started.elapsed());
+                        }
+                    }
+                    session.take_events();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let elapsed = started.elapsed();
+                let snapshot = session.snapshot();
+                assert!(snapshot.lines.iter().any(|line| {
+                    line.cells
+                        .iter()
+                        .map(|cell| cell.ch)
+                        .collect::<String>()
+                        .starts_with("BENCH-END")
+                }));
+                session.write_input(b"\n").unwrap();
+                let shutdown = Instant::now();
+                while session.lifecycle().is_running() {
+                    assert!(
+                        shutdown.elapsed() < Duration::from_secs(5),
+                        "shutdown timeout"
+                    );
+                    session.drain_output();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                eprintln!(
+                    "PTY_BENCH {name} round={round} bytes={} elapsed_ms={:.3} parse_ms={:.3} lock_ms={:.3} max_chunk={} input_ack_ms={:.3}",
+                    corpus.len(),
+                    elapsed.as_secs_f64() * 1000.0,
+                    report.output_processing_duration.as_secs_f64() * 1000.0,
+                    report.terminal_lock_wait_duration.as_secs_f64() * 1000.0,
+                    report.max_data_chunk_bytes,
+                    input_latency
+                        .expect("input was not acknowledged during output")
+                        .as_secs_f64()
+                        * 1000.0
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn busy_render_snapshot_preserves_damage_and_selection_for_retry() {
         let config = crate::LocalPtyConfig {
             shell: Some(
@@ -103,7 +220,7 @@ mod tests {
 
     #[test]
     fn ssh_terminal_is_not_interactive_until_shell_channel_is_ready() {
-        let session = SshPtySession::new_disconnected_for_test(
+        let session = crate::session::SshPtyCore::new_disconnected_for_test(
             SshSessionConfig::new("127.0.0.1", 9, "nobody"),
             80,
             24,
@@ -118,7 +235,7 @@ mod tests {
 
     #[test]
     fn ssh_resize_resets_command_mark_coordinates_only_when_grid_changes() {
-        let mut session = SshPtySession::new_disconnected_for_test(
+        let mut session = crate::session::SshPtyCore::new_disconnected_for_test(
             SshSessionConfig::new("127.0.0.1", 9, "nobody"),
             80,
             24,
@@ -460,6 +577,79 @@ mod tests {
         assert_eq!(image.cols, 1);
         assert_eq!(image.rows, 1);
         assert!(image.data.is_some());
+    }
+
+    #[test]
+    fn split_synchronized_redraw_keeps_cursor_and_cells_until_frame_end() {
+        let size = TerminalSize {
+            cols: 20,
+            rows: 5,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        // Exercise the same graphics and shell scanners that precede the local PTY parser.
+        for recording in [false, true] {
+            let term = std::cell::RefCell::new(Term::new(Config::default(), &size, VoidListener));
+            let mut parser = Processor::<StdSyncHandler>::new();
+            let mut ingress = GraphicsIngress::new(GraphicsOptions::default());
+            let mut shell = crate::shell_integration::TerminalShellIntegration::default();
+            let graphics = TerminalGraphicsState::default();
+            parser.advance(&mut *term.borrow_mut(), b"\x1b[4;3H");
+            let mut snapshot = snapshot_from_term(&term.borrow(), size, &graphics);
+            let frame = b"\x1b[?2026h\x1b[2;1H*\x1b[4;5H\x1b[?2026l";
+            for (index, byte) in frame.iter().enumerate() {
+                ingress.advance_ordered(
+                    std::slice::from_ref(byte),
+                    |segment| match segment {
+                        TerminalGraphicsSegment::Terminal(bytes) => {
+                            if recording {
+                                shell.advance_with_recording(
+                                    &mut parser,
+                                    &mut term.borrow_mut(),
+                                    &bytes,
+                                    |_| {},
+                                );
+                            } else {
+                                shell.advance(&mut parser, &mut term.borrow_mut(), &bytes, |_| {});
+                            }
+                        }
+                        TerminalGraphicsSegment::Event(_) => {
+                            panic!("redraw must stay terminal output")
+                        }
+                    },
+                    || graphics_cursor_from_term(&term.borrow(), size),
+                );
+                snapshot = incremental_snapshot_from_term(
+                    &mut term.borrow_mut(),
+                    size,
+                    &graphics,
+                    &snapshot,
+                );
+                let complete = index + 1 == frame.len();
+                assert_eq!(
+                    (snapshot.cursor_row, snapshot.cursor_col),
+                    if complete { (3, 4) } else { (3, 2) },
+                    "byte {index}, recording {recording}"
+                );
+                assert_eq!(
+                    snapshot.lines[1].cells[0].ch,
+                    if complete { '*' } else { ' ' }
+                );
+                assert_eq!(snapshot.cursor_shape, TerminalCursorShape::Block);
+                let painted_cursors = snapshot
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(row, line)| {
+                        line.cells
+                            .iter()
+                            .enumerate()
+                            .filter_map(move |(col, cell)| cell.cursor.then_some((row, col)))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(painted_cursors, [if complete { (3, 4) } else { (3, 2) }]);
+            }
+        }
     }
 
     #[test]
@@ -1357,37 +1547,79 @@ mod tests {
 
     #[test]
     fn terminal_recording_bytes_exclude_private_osc_across_chunks() {
-        let size = TerminalSize {
-            cols: 80,
-            rows: 8,
-            cell_width: 8,
-            cell_height: 17,
-        };
-        let mut term = Term::new(Config::default(), &size, VoidListener);
-        let mut parser = Processor::<StdSyncHandler>::new();
-        let mut integration = crate::shell_integration::TerminalShellIntegration::default();
-        let mut events = Vec::new();
+        for terminator in ["\x07", "\x1b\\"] {
+            let input = format!(
+                "before\x1b]7719;v=3;kind=editor-clipboard;app=vim;op=copy;data=%73%65%63%72%65%74{terminator}after\x1b]0;title\x07"
+            );
+            for split in 0..=input.len() {
+                let size = TerminalSize {
+                    cols: 80,
+                    rows: 8,
+                    cell_width: 8,
+                    cell_height: 17,
+                };
+                let mut term = Term::new(Config::default(), &size, VoidListener);
+                let mut parser = Processor::<StdSyncHandler>::new();
+                let mut integration = crate::shell_integration::TerminalShellIntegration::default();
+                let mut events = Vec::new();
+                let mut recorded = Vec::new();
+                for chunk in [&input.as_bytes()[..split], &input.as_bytes()[split..]] {
+                    let (_, bytes) = integration.advance_with_recording(
+                        &mut parser,
+                        &mut term,
+                        chunk,
+                        |event| events.push(event),
+                    );
+                    recorded.extend(bytes);
+                }
+                assert_eq!(recorded, b"beforeafter\x1b]0;title\x07", "split {split}");
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, TerminalEvent::EditorClipboard(_)))
+                        .count(),
+                    1,
+                    "split {split}"
+                );
+            }
+        }
+    }
 
-        let (_, first) = integration.advance_with_recording(
-            &mut parser,
-            &mut term,
-            b"before\x1b]7719;v=3;kind=editor-clipboard;app=vim;op=copy;data=%73%65%63%72%65%74\x1b",
-            |event| events.push(event),
-        );
-        let (_, second) = integration.advance_with_recording(
-            &mut parser,
-            &mut term,
-            b"\\after\x1b]0;title\x07",
-            |event| events.push(event),
-        );
-        let recorded = [first, second].concat();
-
-        assert_eq!(recorded, b"beforeafter\x1b]0;title\x07");
-        assert!(!String::from_utf8_lossy(&recorded).contains("7719;"));
-        assert!(!String::from_utf8_lossy(&recorded).contains("%73%65%63%72%65%74"));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, TerminalEvent::EditorClipboard(_))));
+    #[test]
+    fn osc_capture_preserves_link_payload_and_recording_at_every_split() {
+        let input = b"\x1b]77190;not-private\x07\x1b]8;id=build;https://ex\0ample.com/log?a=1;b=2\x1b\\AB\x1b]8;;\x07C";
+        for split in 0..=input.len() {
+            let size = TerminalSize {
+                cols: 80,
+                rows: 2,
+                cell_width: 8,
+                cell_height: 17,
+            };
+            let mut term = Term::new(Config::default(), &size, VoidListener);
+            let mut parser = Processor::<StdSyncHandler>::new();
+            let mut integration = crate::shell_integration::TerminalShellIntegration::default();
+            let mut recorded = Vec::new();
+            for chunk in [&input[..split], &input[split..]] {
+                let (_, bytes) =
+                    integration.advance_with_recording(&mut parser, &mut term, chunk, |_| {});
+                recorded.extend(bytes);
+            }
+            assert_eq!(recorded, input, "split {split}");
+            let snapshot = snapshot_from_term(&term, size, &TerminalGraphicsState::default());
+            assert_eq!(snapshot.lines[0].text().trim_end(), "ABC", "split {split}");
+            assert_eq!(
+                snapshot.lines[0].cells[..3]
+                    .iter()
+                    .map(TerminalCell::hyperlink)
+                    .collect::<Vec<_>>(),
+                vec![
+                    Some("https://example.com/log?a=1;b=2"),
+                    Some("https://example.com/log?a=1;b=2"),
+                    None
+                ],
+                "split {split}"
+            );
+        }
     }
 
     #[test]

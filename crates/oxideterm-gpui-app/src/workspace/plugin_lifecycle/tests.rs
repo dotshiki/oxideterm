@@ -33,6 +33,8 @@ const TEST_CONNECTIONS_UPDATED_AT: &str = "2026-05-25T00:00:00Z";
 // Shared fixtures keep unrelated sync tests insulated from snapshot field additions.
 fn saved_connections_sync_fixture() -> SavedConnectionsSyncSnapshot {
     SavedConnectionsSyncSnapshot {
+        local_terminal_profiles: Vec::new(),
+        local_terminal_tombstones: Vec::new(),
         revision: TEST_CONNECTIONS_REVISION.to_string(),
         exported_at: TEST_CONNECTIONS_UPDATED_AT.to_string(),
         records: Vec::new(),
@@ -606,6 +608,7 @@ fn ide_file_maps_detect_open_close_and_active_changes() {
 fn ai_host_calls_return_sanitized_messages_and_provider_info() {
     let chat = oxideterm_ai::AiChatState {
         conversations: vec![oxideterm_ai::AiConversation {
+            archived: false,
             id: "conversation-1".to_string(),
             title: "Deploy help".to_string(),
             messages: vec![

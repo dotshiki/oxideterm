@@ -33,6 +33,8 @@ impl AuthType {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SavedAuth {
     Password {
+        #[serde(default, skip_serializing_if = "is_false")]
+        empty_password: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         keychain_id: Option<String>,
         #[serde(default, rename = "password", skip_serializing)]
@@ -77,6 +79,16 @@ pub enum SavedAuth {
 }
 
 impl SavedAuth {
+    pub fn uses_empty_password(&self) -> bool {
+        matches!(
+            self.conventional_fallback(),
+            Self::Password {
+                empty_password: true,
+                ..
+            }
+        )
+    }
+
     pub fn auth_type(&self) -> AuthType {
         match self {
             Self::Password { .. } => AuthType::Password,
@@ -426,7 +438,9 @@ pub enum SavedUpstreamProxyProtocol {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SavedUpstreamProxyAuth {
+    #[default]
     None,
     Password {
         username: String,
@@ -437,11 +451,6 @@ pub enum SavedUpstreamProxyAuth {
     },
 }
 
-impl Default for SavedUpstreamProxyAuth {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -459,7 +468,9 @@ pub struct SavedUpstreamProxyConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SavedUpstreamProxyPolicy {
+    #[default]
     UseGlobal,
     Direct,
     Custom { proxy: SavedUpstreamProxyConfig },
@@ -471,11 +482,6 @@ impl SavedUpstreamProxyPolicy {
     }
 }
 
-impl Default for SavedUpstreamProxyPolicy {
-    fn default() -> Self {
-        Self::UseGlobal
-    }
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SavedProxyCommand {
@@ -537,6 +543,8 @@ pub struct ProxyHopInfo {
     pub port: u16,
     pub username: String,
     pub auth_type: AuthType,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub empty_password: bool,
     pub key_path: Option<String>,
     pub cert_path: Option<String>,
     pub managed_key_id: Option<String>,
@@ -564,6 +572,7 @@ impl From<&SavedProxyHop> for ProxyHopInfo {
             port: hop.port,
             username: hop.username.clone(),
             auth_type: hop.auth.auth_type(),
+            empty_password: hop.auth.uses_empty_password(),
             key_path: hop.auth.key_path().map(ToOwned::to_owned),
             cert_path: hop.auth.cert_path().map(ToOwned::to_owned),
             managed_key_id: hop.auth.managed_key_id().map(ToOwned::to_owned),
@@ -682,6 +691,8 @@ pub struct ConnectionInfo {
     pub port: u16,
     pub username: String,
     pub auth_type: AuthType,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub empty_password: bool,
     pub key_path: Option<String>,
     pub cert_path: Option<String>,
     pub managed_key_id: Option<String>,
@@ -797,6 +808,7 @@ impl From<&SavedConnection> for ConnectionInfo {
             port: conn.port,
             username: conn.username.clone(),
             auth_type: conn.auth.auth_type(),
+            empty_password: conn.auth.uses_empty_password(),
             key_path: conn.auth.key_path().map(ToOwned::to_owned),
             cert_path: conn.auth.cert_path().map(ToOwned::to_owned),
             managed_key_id: conn.auth.managed_key_id().map(ToOwned::to_owned),
@@ -853,6 +865,41 @@ pub enum SerialLineEnding {
     Cr,
     #[default]
     None,
+}
+
+/// A reusable launch configuration, independent of any running PTY.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalTerminalProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_background_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SaveLocalTerminalProfileRequest {
+    pub id: Option<String>,
+    pub name: String,
+    pub group: Option<String>,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub icon_background_color: Option<String>,
+    pub shell_id: Option<String>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -931,6 +978,8 @@ pub struct TelnetProfile {
     pub icon_background_color: Option<String>,
     pub host: String,
     pub port: u16,
+    #[serde(default = "default_telnet_upstream_proxy")]
+    pub upstream_proxy: SavedUpstreamProxyPolicy,
     #[serde(
         default,
         skip_serializing_if = "ConnectionTerminalOptions::inherits_application_defaults"
@@ -955,6 +1004,7 @@ pub struct SaveTelnetProfileRequest {
     pub icon_background_color: Option<String>,
     pub host: String,
     pub port: u16,
+    pub upstream_proxy: Option<SavedUpstreamProxyPolicy>,
     pub terminal: ConnectionTerminalOptions,
     pub connect_on_open: Option<bool>,
 }
@@ -1487,6 +1537,10 @@ impl SerialProfile {
     }
 }
 
+pub fn default_telnet_upstream_proxy() -> SavedUpstreamProxyPolicy {
+    SavedUpstreamProxyPolicy::Direct
+}
+
 impl TelnetProfile {
     pub fn new(name: impl Into<String>, host: impl Into<String>, port: u16) -> Self {
         let now = Utc::now();
@@ -1500,6 +1554,7 @@ impl TelnetProfile {
             icon_background_color: None,
             host: host.into(),
             port,
+            upstream_proxy: SavedUpstreamProxyPolicy::Direct,
             terminal: ConnectionTerminalOptions::default(),
             connect_on_open: false,
             created_at: now,
@@ -1517,6 +1572,11 @@ impl TelnetProfile {
         }
         if self.host.trim().is_empty() {
             bail!("Telnet host is required");
+        }
+        if let SavedUpstreamProxyPolicy::Custom { proxy } = &self.upstream_proxy
+            && (proxy.host.trim().is_empty() || proxy.port == 0)
+        {
+            bail!("Telnet upstream proxy requires a host and a nonzero port");
         }
         Ok(())
     }
@@ -1865,7 +1925,15 @@ pub struct ConnectionStoreData {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub serial_profiles: Vec<SerialProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_terminal_profiles: Vec<LocalTerminalProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_terminal_tombstones: Vec<DeletedConnectionTombstone>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub telnet_profiles: Vec<TelnetProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ftp_profiles: Vec<FtpProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ftp_tombstones: Vec<DeletedConnectionTombstone>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mosh_profiles: Vec<MoshProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1894,7 +1962,11 @@ impl Default for ConnectionStoreData {
             connection_tombstones: Vec::new(),
             managed_ssh_keys: Vec::new(),
             serial_profiles: Vec::new(),
+            local_terminal_profiles: Vec::new(),
+            local_terminal_tombstones: Vec::new(),
             telnet_profiles: Vec::new(),
+            ftp_profiles: Vec::new(),
+            ftp_tombstones: Vec::new(),
             mosh_profiles: Vec::new(),
             standalone_sftp_profiles: Vec::new(),
             remote_desktop_profiles: Vec::new(),
@@ -1939,6 +2011,14 @@ pub struct StandaloneSftpProfilesSyncSnapshot {
     pub exported_at: String,
     #[serde(default)]
     pub records: Vec<StandaloneSftpProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ftp: Option<FtpProfilesSyncSnapshot>,
+}
+
+impl StandaloneSftpProfilesSyncSnapshot {
+    pub fn record_count(&self) -> usize {
+        self.records.len() + self.ftp.as_ref().map_or(0, |ftp| ftp.records.len())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2005,6 +2085,22 @@ pub struct SavedConnectionsSyncSnapshot {
     pub revision: String,
     pub exported_at: String,
     pub records: Vec<SavedConnectionSyncRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_terminal_profiles: Vec<LocalTerminalProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_terminal_tombstones: Vec<DeletedConnectionTombstone>,
+}
+
+impl SavedConnectionsSyncSnapshot {
+    pub fn record_count(&self) -> usize {
+        self.records.len() + self.local_terminal_profiles.len() + self.local_terminal_tombstones.len()
+    }
+
+    pub fn record_ids(&self) -> impl Iterator<Item = &str> {
+        self.records.iter().map(|r| r.id.as_str())
+            .chain(self.local_terminal_profiles.iter().map(|p| p.id.as_str()))
+            .chain(self.local_terminal_tombstones.iter().map(|p| p.id.as_str()))
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

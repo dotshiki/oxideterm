@@ -3,7 +3,70 @@
 
 use super::*;
 
+pub(in crate::workspace) fn remote_desktop_keyboard_capture(
+    root: gpui::Stateful<gpui::Div>,
+    session: Entity<RemoteDesktopSessionEntity>,
+    overrides: serde_json::Map<String, serde_json::Value>,
+) -> gpui::Stateful<gpui::Div> {
+    let key_down_session = session.clone();
+    let key_up_session = session.clone();
+    let key_down_overrides = overrides.clone();
+    // Bind the native window directly to its mounted session, independently of the main tab.
+    root.capture_key_down(move |event, window, cx| {
+        key_down_session.update(cx, |session, cx| {
+            session.forward_key_down(event, &key_down_overrides, cx);
+        });
+        window.prevent_default();
+        cx.stop_propagation();
+    })
+    .on_key_up(move |event, _window, cx| {
+        key_up_session.update(cx, |session, _cx| {
+            session.forward_key_up(event, &overrides);
+        });
+        cx.stop_propagation();
+    })
+    .on_modifiers_changed(move |event, _window, cx| {
+        session.update(cx, |session, _cx| {
+            session.sync_modifiers(event.modifiers);
+            session.sync_lock_keys(event.capslock);
+        });
+        cx.stop_propagation();
+    })
+}
+
 impl RemoteDesktopSessionEntity {
+    fn forward_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        overrides: &serde_json::Map<String, serde_json::Value>,
+        cx: &mut App,
+    ) {
+        if remote_desktop_paste_shortcut(&event.keystroke, overrides) {
+            self.release_shortcut_modifiers(&event.keystroke);
+            if let Some(item) = cx.read_from_clipboard() {
+                self.paste_clipboard(item);
+            }
+        } else if remote_desktop_copy_shortcut(&event.keystroke, overrides) {
+            self.release_shortcut_modifiers(&event.keystroke);
+            self.send_control_shortcut("c");
+        } else {
+            self.handle_key(&event.keystroke, RemoteDesktopKeyState::Pressed);
+            self.sync_lock_key_press(&event.keystroke);
+        }
+    }
+
+    fn forward_key_up(
+        &mut self,
+        event: &KeyUpEvent,
+        overrides: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        if !remote_desktop_paste_shortcut(&event.keystroke, overrides)
+            && !remote_desktop_copy_shortcut(&event.keystroke, overrides)
+        {
+            self.handle_key(&event.keystroke, RemoteDesktopKeyState::Released);
+        }
+    }
+
     pub(super) fn send_request(&mut self, request: RemoteDesktopHelperRequest) {
         if matches!(request, RemoteDesktopHelperRequest::Resize { .. })
             && !self.provider.capabilities.resize
@@ -259,10 +322,12 @@ impl RemoteDesktopSessionEntity {
         if text.is_empty() {
             return;
         }
-        // Some pre-login fields do not honor CLIPRDR, so retain the explicit
-        // text injection fallback after updating the remote clipboard.
-        self.send_request(RemoteDesktopHelperRequest::ClipboardText { text: text.clone() });
-        self.send_request(RemoteDesktopHelperRequest::Text { text });
+        if self.profile.protocol == RemoteDesktopProtocol::Rdp {
+            self.send_request(RemoteDesktopHelperRequest::PasteText { text: text.into() });
+        } else {
+            self.send_request(RemoteDesktopHelperRequest::ClipboardText { text: text.clone() });
+            self.send_request(RemoteDesktopHelperRequest::Text { text });
+        }
     }
 }
 
@@ -334,18 +399,6 @@ impl WorkspaceApp {
             })
     }
 
-    pub(in crate::workspace) fn handle_remote_desktop_key(
-        &mut self,
-        tab_id: TabId,
-        keystroke: &gpui::Keystroke,
-        state: RemoteDesktopKeyState,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(session) = self.remote_desktop_session_entity(tab_id, cx) {
-            session.update(cx, |session, _cx| session.handle_key(keystroke, state));
-        }
-    }
-
     pub(in crate::workspace) fn sync_remote_desktop_modifiers(
         &mut self,
         tab_id: TabId,
@@ -368,19 +421,6 @@ impl WorkspaceApp {
         }
     }
 
-    pub(in crate::workspace) fn sync_remote_desktop_lock_key_press(
-        &mut self,
-        tab_id: TabId,
-        keystroke: &gpui::Keystroke,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(session) = self.remote_desktop_session_entity(tab_id, cx) {
-            session.update(cx, |session, _cx| {
-                session.sync_lock_key_press(keystroke);
-            });
-        }
-    }
-
     pub(in crate::workspace) fn forward_remote_desktop_modifiers_changed(
         &mut self,
         event: &ModifiersChangedEvent,
@@ -399,24 +439,16 @@ impl WorkspaceApp {
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(tab_id) = self.active_remote_desktop_tab_id(cx) else {
+        let Some(session) = self
+            .active_remote_desktop_tab_id(cx)
+            .and_then(|tab_id| self.remote_desktop_session_entity(tab_id, cx))
+        else {
             return false;
         };
-        if remote_desktop_paste_shortcut(&event.keystroke) {
-            self.paste_remote_desktop_from_keystroke(&event.keystroke, cx);
-            return true;
-        }
-        if remote_desktop_copy_shortcut(&event.keystroke) {
-            self.copy_remote_desktop_from_keystroke(&event.keystroke, cx);
-            return true;
-        }
-        self.handle_remote_desktop_key(
-            tab_id,
-            &event.keystroke,
-            RemoteDesktopKeyState::Pressed,
-            cx,
-        );
-        self.sync_remote_desktop_lock_key_press(tab_id, &event.keystroke, cx);
+        let overrides = &self.settings_store.settings().keybindings.overrides;
+        session.update(cx, |session, cx| {
+            session.forward_key_down(event, overrides, cx)
+        });
         true
     }
 
@@ -425,33 +457,15 @@ impl WorkspaceApp {
         event: &KeyUpEvent,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(tab_id) = self.active_remote_desktop_tab_id(cx) else {
+        let Some(session) = self
+            .active_remote_desktop_tab_id(cx)
+            .and_then(|tab_id| self.remote_desktop_session_entity(tab_id, cx))
+        else {
             return false;
         };
-        if remote_desktop_paste_shortcut(&event.keystroke)
-            || remote_desktop_copy_shortcut(&event.keystroke)
-        {
-            return true;
-        }
-        self.handle_remote_desktop_key(
-            tab_id,
-            &event.keystroke,
-            RemoteDesktopKeyState::Released,
-            cx,
-        );
+        let overrides = &self.settings_store.settings().keybindings.overrides;
+        session.update(cx, |session, _cx| session.forward_key_up(event, overrides));
         true
-    }
-
-    pub(in crate::workspace) fn copy_remote_desktop_from_keystroke(
-        &mut self,
-        keystroke: &gpui::Keystroke,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(tab_id) = self.active_remote_desktop_tab_id(cx) else {
-            return false;
-        };
-        self.release_remote_desktop_shortcut_modifiers(tab_id, keystroke, cx);
-        self.copy_remote_desktop(cx)
     }
 
     pub(in crate::workspace) fn copy_remote_desktop(&mut self, cx: &mut Context<Self>) -> bool {
@@ -460,18 +474,6 @@ impl WorkspaceApp {
         };
         self.send_remote_desktop_control_shortcut(tab_id, "c", cx);
         true
-    }
-
-    pub(in crate::workspace) fn paste_remote_desktop_from_keystroke(
-        &mut self,
-        keystroke: &gpui::Keystroke,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(tab_id) = self.active_remote_desktop_tab_id(cx) else {
-            return false;
-        };
-        self.release_remote_desktop_shortcut_modifiers(tab_id, keystroke, cx);
-        self.paste_remote_desktop(cx)
     }
 
     pub(in crate::workspace) fn paste_remote_desktop(&mut self, cx: &mut Context<Self>) -> bool {
@@ -485,19 +487,6 @@ impl WorkspaceApp {
             session.update(cx, |session, _cx| session.paste_clipboard(item));
         }
         true
-    }
-
-    pub(in crate::workspace) fn release_remote_desktop_shortcut_modifiers(
-        &mut self,
-        tab_id: TabId,
-        keystroke: &gpui::Keystroke,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(session_entity) = self.remote_desktop_session_entity(tab_id, cx) {
-            session_entity.update(cx, |session, _cx| {
-                session.release_shortcut_modifiers(keystroke);
-            });
-        }
     }
 
     pub(in crate::workspace) fn send_remote_desktop_control_shortcut(
@@ -525,5 +514,220 @@ impl WorkspaceApp {
             RemoteDesktopProtocol::Rdp => self.i18n.t("remote_desktop.rdp_preview_title"),
             RemoteDesktopProtocol::Vnc => self.i18n.t("remote_desktop.vnc_preview_title"),
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    struct RemoteKeyboardWindow {
+        session: Entity<RemoteDesktopSessionEntity>,
+        focus: FocusHandle,
+        surface_focus: FocusHandle,
+    }
+
+    impl Render for RemoteKeyboardWindow {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            remote_desktop_keyboard_capture(
+                div()
+                    .id("remote-keyboard-window")
+                    .size_full()
+                    .track_focus(&self.focus)
+                    .child(div().size_full().track_focus(&self.surface_focus)),
+                self.session.clone(),
+                serde_json::Map::new(),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn remote_window_routes_keyboard_and_clipboard_to_its_own_session(cx: &mut TestAppContext) {
+        let mut windows = Vec::new();
+        for protocol in [RemoteDesktopProtocol::Rdp, RemoteDesktopProtocol::Vnc] {
+            let (tx, rx) = mpsc::channel();
+            let handle = cx.add_window(|window, cx| {
+                let provider = builtin_preview_provider_registry()
+                    .unwrap()
+                    .get_for_protocol(protocol)
+                    .cloned()
+                    .unwrap();
+                let session = cx.new(|_| {
+                    let mut session = RemoteDesktopSessionEntity::new(
+                        TabId(if protocol == RemoteDesktopProtocol::Rdp {
+                            71
+                        } else {
+                            72
+                        }),
+                        preview_remote_desktop_profile(protocol),
+                        provider,
+                        None,
+                        std::path::PathBuf::new(),
+                        RemoteDesktopFrameDeliverySlot::new(),
+                        window.window_handle(),
+                    );
+                    session.worker = Some(RemoteDesktopWorkerOwner {
+                        request_tx: Some(tx),
+                        worker_thread: None,
+                    });
+                    session
+                });
+                let focus = cx.focus_handle();
+                let surface_focus = cx.focus_handle();
+                window.focus(&surface_focus, cx);
+                RemoteKeyboardWindow {
+                    session,
+                    focus,
+                    surface_focus,
+                }
+            });
+            let window = gpui::VisualTestContext::from_window(handle.into(), cx);
+            windows.push((window, rx, protocol));
+        }
+        for index in 0..windows.len() {
+            let (window, rx, protocol) = &mut windows[index];
+            let stroke = gpui::Keystroke::parse("a").unwrap();
+            window.simulate_event(KeyDownEvent {
+                keystroke: stroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            window.simulate_event(KeyUpEvent { keystroke: stroke });
+            window.simulate_event(ModifiersChangedEvent {
+                modifiers: gpui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            window.simulate_event(ModifiersChangedEvent::default());
+            let mut keys = Vec::new();
+            let mut lock_states = Vec::new();
+            for request in rx.try_iter() {
+                match request {
+                    RemoteDesktopHelperRequest::Key { key, state } => keys.push((key.code, state)),
+                    RemoteDesktopHelperRequest::SynchronizeLockKeys { keys } => {
+                        lock_states.push(keys.caps_lock)
+                    }
+                    _ => panic!("unexpected remote input request"),
+                }
+            }
+            assert_eq!(
+                keys,
+                vec![
+                    ("a".into(), RemoteDesktopKeyState::Pressed),
+                    ("a".into(), RemoteDesktopKeyState::Released),
+                    ("ShiftLeft".into(), RemoteDesktopKeyState::Pressed),
+                    ("ShiftLeft".into(), RemoteDesktopKeyState::Released),
+                ]
+            );
+            assert_eq!(lock_states, vec![false]);
+            window.update(|_, app| {
+                app.write_to_clipboard(ClipboardItem::new_string("remote paste".into()))
+            });
+            let paste = gpui::Keystroke::parse(if cfg!(target_os = "macos") {
+                "cmd-v"
+            } else {
+                "ctrl-v"
+            })
+            .unwrap();
+            window.simulate_event(KeyDownEvent {
+                keystroke: paste.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            window.simulate_event(KeyUpEvent { keystroke: paste });
+            let mut expected = vec![RemoteDesktopHelperRequest::Key {
+                key: RemoteDesktopKey {
+                    code: if cfg!(target_os = "macos") {
+                        "meta"
+                    } else {
+                        "control"
+                    }
+                    .into(),
+                    text: None,
+                    alt: false,
+                    ctrl: false,
+                    shift: false,
+                    meta: false,
+                },
+                state: RemoteDesktopKeyState::Released,
+            }];
+            match protocol {
+                RemoteDesktopProtocol::Rdp => {
+                    expected.push(RemoteDesktopHelperRequest::PasteText {
+                        text: "remote paste".into(),
+                    })
+                }
+                RemoteDesktopProtocol::Vnc => {
+                    expected.push(RemoteDesktopHelperRequest::ClipboardText {
+                        text: "remote paste".into(),
+                    });
+                    expected.push(RemoteDesktopHelperRequest::Text {
+                        text: "remote paste".into(),
+                    });
+                }
+            }
+            assert!(
+                rx.try_iter().collect::<Vec<_>>() == expected,
+                "unexpected {protocol:?} paste requests"
+            );
+            assert!(
+                windows[1 - index].1.try_recv().is_err(),
+                "input leaked to another window"
+            );
+        }
+    }
+
+    struct ClipboardTestWindow;
+    impl Render for ClipboardTestWindow {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn rdp_paste_sends_one_clipboard_transaction_and_respects_text_permission(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_window, _cx| ClipboardTestWindow);
+        let provider = builtin_preview_provider_registry()
+            .unwrap()
+            .get_for_protocol(RemoteDesktopProtocol::Rdp)
+            .cloned()
+            .unwrap();
+        let mut session = RemoteDesktopSessionEntity::new(
+            TabId(71),
+            preview_remote_desktop_profile(RemoteDesktopProtocol::Rdp),
+            provider,
+            None,
+            std::path::PathBuf::new(),
+            RemoteDesktopFrameDeliverySlot::new(),
+            window.into(),
+        );
+        let (tx, rx) = mpsc::channel();
+        session.worker = Some(RemoteDesktopWorkerOwner {
+            request_tx: Some(tx),
+            worker_thread: None,
+        });
+        let text = "code\n\t中文🦀\r\n".repeat(512);
+        session.paste_clipboard(ClipboardItem::new_string(text.clone()));
+        match rx.try_recv().unwrap() {
+            RemoteDesktopHelperRequest::PasteText { text: received } => {
+                assert_eq!(received.expose_secret(), text)
+            }
+            _ => panic!("RDP paste must use a single clipboard transaction"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "paste must not also inject keyboard text"
+        );
+        session.profile.session_options.clipboard.text = false;
+        session.paste_clipboard(ClipboardItem::new_string("blocked".to_string()));
+        assert!(
+            rx.try_recv().is_err(),
+            "disabled clipboard text must not be sent"
+        );
     }
 }

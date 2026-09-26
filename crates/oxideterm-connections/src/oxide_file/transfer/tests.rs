@@ -93,6 +93,38 @@ mod tests {
     }
 
     #[test]
+    fn explicit_empty_password_survives_oxide_without_password_export() {
+        let store = temp_store("empty-password-export");
+        for empty in [false, true] {
+            let auth = SavedAuth::Password {
+                empty_password: empty,
+                keychain_id: None,
+                plaintext_password: None,
+            };
+            let exported = export_auth(&store, &auth, &OxideExportOptions::default()).unwrap();
+            let bytes = serde_json::to_vec(&exported).unwrap();
+            let decoded = serde_json::from_slice(&bytes).unwrap();
+            let restored = import_auth(
+                &store,
+                decoded,
+                &mut HashMap::new(),
+                &mut Vec::new(),
+                &OxideImportOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(restored.uses_empty_password(), empty);
+            assert!(matches!(
+                restored,
+                SavedAuth::Password {
+                    plaintext_password: None,
+                    keychain_id: None,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
     fn export_import_roundtrip_preserves_connections_and_payload_sections() {
         let mut source = temp_store("source");
         source
@@ -243,6 +275,8 @@ mod tests {
         let mut source = temp_store("transaction-source");
         let mut imported_connection = saved_connection("conn-import", "Imported");
         imported_connection.auth = SavedAuth::Password {
+            empty_password: false,
+
             keychain_id: None,
             plaintext_password: Some(SecretString::from(CONNECTION_SECRET)),
         };
@@ -361,6 +395,16 @@ mod tests {
         let telnet_profile = source
             .upsert_telnet_profile(SaveTelnetProfileRequest {
                 id: Some("telnet-1".to_string()),
+                upstream_proxy: Some(SavedUpstreamProxyPolicy::Custom {
+                    proxy: SavedUpstreamProxyConfig {
+                        protocol: SavedUpstreamProxyProtocol::Socks5,
+                        host: "proxy.example.test".into(),
+                        port: 1080,
+                        auth: SavedUpstreamProxyAuth::None,
+                        remote_dns: true,
+                        no_proxy: "*.internal".into(),
+                    },
+                }),
                 name: "Router console".to_string(),
                 host: "router.example.test".to_string(),
                 port: 2323,
@@ -512,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn export_import_roundtrip_preserves_standalone_sftp_without_credentials() {
+    fn export_import_preserves_file_transfer_profiles_without_credentials() {
         const PASSWORD: &str = "standalone-sftp-archive-secret";
         let mut source = temp_store("standalone-sftp-profile-source");
         let mut request = crate::SaveStandaloneSftpProfileRequest {
@@ -527,6 +571,8 @@ mod tests {
             port: 2222,
             username: "backup".to_string(),
             auth: SavedAuth::Password {
+                empty_password: false,
+
                 keychain_id: None,
                 plaintext_password: Some(SecretString::from(PASSWORD)),
             },
@@ -553,6 +599,21 @@ mod tests {
             ssh_algorithms: SshAlgorithmPreferences::default(),
         });
         source.upsert_standalone_sftp_profile(request).unwrap();
+        let mut ftp = crate::FtpProfile::new(
+            "TLS files".into(),
+            "files.example.test".into(),
+            "backup".into(),
+            crate::FtpSecurity::ExplicitTls,
+        );
+        ftp.initial_path = "/archive".into();
+        ftp.upstream_proxy = SavedUpstreamProxyPolicy::UseGlobal;
+        source
+            .upsert_ftp_profile(crate::SaveFtpProfileRequest {
+                profile: ftp,
+                password: Some(SecretString::from("ftp-archive-secret")),
+                clear_password: false,
+            })
+            .unwrap();
 
         let snapshot_json = serde_json::to_string_pretty(
             &source.export_standalone_sftp_profiles_snapshot().unwrap(),
@@ -560,6 +621,15 @@ mod tests {
         .unwrap();
         assert!(!snapshot_json.contains(PASSWORD));
         assert!(!snapshot_json.contains("oxide_conn_password_"));
+        assert!(!snapshot_json.contains("ftp-archive-secret"));
+        assert!(
+            !snapshot_json.contains(
+                source.ftp_profiles()[0]
+                    .password_keychain_id
+                    .as_deref()
+                    .unwrap()
+            )
+        );
 
         let bytes = export_connections_to_oxide(
             &source,
@@ -572,7 +642,7 @@ mod tests {
         )
         .unwrap();
         let file = OxideFile::from_bytes(&bytes).unwrap();
-        assert_eq!(file.metadata.standalone_sftp_profiles_count, Some(1));
+        assert_eq!(file.metadata.standalone_sftp_profiles_count, Some(2));
         let preview = preview_oxide_import(
             &temp_store("standalone-sftp-profile-preview"),
             &bytes,
@@ -580,7 +650,7 @@ mod tests {
             ImportConflictStrategy::Rename,
         )
         .unwrap();
-        assert_eq!(preview.standalone_sftp_profiles_count, 1);
+        assert_eq!(preview.standalone_sftp_profiles_count, 2);
 
         let mut target = temp_store("standalone-sftp-profile-target");
         let imported = apply_oxide_import(
@@ -590,7 +660,26 @@ mod tests {
             ImportConflictStrategy::Rename,
         )
         .unwrap();
-        assert_eq!(imported.imported_standalone_sftp_profiles, 1);
+        assert_eq!(imported.imported_standalone_sftp_profiles, 2);
+        let ftp = &target.ftp_profiles()[0];
+        assert_eq!(
+            (
+                &*ftp.host,
+                &*ftp.username,
+                &*ftp.initial_path,
+                ftp.port,
+                ftp.security
+            ),
+            (
+                "files.example.test",
+                "backup",
+                "/archive",
+                21,
+                crate::FtpSecurity::ExplicitTls
+            )
+        );
+        assert_eq!(ftp.upstream_proxy, SavedUpstreamProxyPolicy::UseGlobal);
+        assert!(ftp.password_keychain_id.is_none());
         let imported_profile = &target.standalone_sftp_profiles()[0];
         assert_eq!(imported_profile.id, "sftp-archive");
         assert_eq!(imported_profile.port, 2222);

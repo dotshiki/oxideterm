@@ -76,12 +76,12 @@ pub enum CloudSyncDelivery {
 /// completion wakes the owning Entity immediately. Tests and non-GPUI callers
 /// may continue to use a standard channel.
 pub trait CloudSyncDeliverySink: Clone + Send + Sync + 'static {
-    fn send(&self, delivery: CloudSyncDelivery) -> Result<(), CloudSyncDelivery>;
+    fn send(&self, delivery: CloudSyncDelivery) -> Result<(), Box<CloudSyncDelivery>>;
 }
 
 impl CloudSyncDeliverySink for std::sync::mpsc::Sender<CloudSyncDelivery> {
-    fn send(&self, delivery: CloudSyncDelivery) -> Result<(), CloudSyncDelivery> {
-        std::sync::mpsc::Sender::send(self, delivery).map_err(|error| error.0)
+    fn send(&self, delivery: CloudSyncDelivery) -> Result<(), Box<CloudSyncDelivery>> {
+        std::sync::mpsc::Sender::send(self, delivery).map_err(|error| Box::new(error.0))
     }
 }
 
@@ -669,17 +669,13 @@ pub async fn deliver_cloud_sync_apply_preview(
                 preview: preview.clone(),
                 source: source.clone(),
             });
+            let options = crate::cloud_sync_legacy_import_options(&summary, &selection);
             service
-                .apply_legacy_preview(
+                .apply_legacy_preview_with_options(
                     &mut connection_store,
-                    &settings,
                     &preview,
                     sync_password.as_ref().map(|password| password.as_str()),
-                    selection.effective_import_connections(&summary),
-                    selection.selected_connection_names_for_import(&summary),
-                    selection.import_forwards,
-                    selection.import_sensitive_credentials,
-                    selection.conflict_strategy.clone(),
+                    options.oxide_options,
                     Some(&mut apply_progress),
                 )
                 .map(|outcome| CloudSyncApplyOutcome::Legacy {
@@ -710,6 +706,12 @@ fn filter_structured_preview_for_selection(
 ) {
     // Apply only selected structured records while preserving the downloaded preview metadata.
     if let Some(snapshot) = preview.connections_snapshot.as_mut() {
+        snapshot
+            .local_terminal_profiles
+            .retain(|p| selection.selected_connection_ids.contains(&p.id));
+        snapshot
+            .local_terminal_tombstones
+            .retain(|p| selection.selected_connection_ids.contains(&p.id));
         snapshot
             .records
             .retain(|record| selection.selected_connection_ids.contains(&record.id));
@@ -777,12 +779,30 @@ fn read_apply_sync_password(
         CloudSyncPendingPreview::Legacy { .. } => true,
     };
     let needs_sync_password = apply_requires_password || create_rollback_backup;
-    let secret_result = get_action_secrets(
-        settings,
-        provider,
-        needs_sync_password,
-        SecretReadMode::Prompt,
-    );
+    let secret_result = if matches!(
+        preview,
+        CloudSyncPendingPreview::Legacy {
+            source: CloudSyncPreviewSource::LocalFile,
+            ..
+        }
+    ) {
+        use oxideterm_cloud_sync::secrets::CloudSyncSecretProvider;
+        provider
+            .get_secret(secret_keys::SYNC_PASSWORD, SecretReadMode::Prompt)
+            .map(
+                |sync_password| oxideterm_cloud_sync::secrets::CloudSyncSecrets {
+                    sync_password,
+                    ..Default::default()
+                },
+            )
+    } else {
+        get_action_secrets(
+            settings,
+            provider,
+            needs_sync_password,
+            SecretReadMode::Prompt,
+        )
+    };
     match (secret_result, needs_sync_password) {
         (Ok(secrets), true) => {
             let password = secrets.sync_password.unwrap_or_default();
@@ -947,6 +967,8 @@ mod tests {
             remote_metadata: Default::default(),
             manifest,
             connections_snapshot: Some(SavedConnectionsSyncSnapshot {
+                local_terminal_profiles: Vec::new(),
+                local_terminal_tombstones: Vec::new(),
                 revision: "empty-connections".to_string(),
                 exported_at: "2026-08-21T00:00:00Z".to_string(),
                 records: Vec::new(),

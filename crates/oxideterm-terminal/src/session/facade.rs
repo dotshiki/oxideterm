@@ -184,6 +184,7 @@ impl TerminalSession {
         Self::telnet_with_login_and_encoding(
             config,
             None,
+            None,
             cols,
             rows,
             graphics_options,
@@ -195,6 +196,7 @@ impl TerminalSession {
     pub fn telnet_with_login_and_encoding(
         config: TelnetSessionConfig,
         login: Option<TelnetLoginCredentials>,
+        upstream_proxy: Option<oxideterm_network_proxy::tcp::UpstreamProxyConfig>,
         cols: usize,
         rows: usize,
         graphics_options: GraphicsOptions,
@@ -206,6 +208,7 @@ impl TerminalSession {
             backend: Box::new(TelnetSession::new_with_login(
                 config,
                 login,
+                upstream_proxy,
                 cols,
                 rows,
                 graphics_options,
@@ -388,11 +391,11 @@ impl TerminalSession {
         self.backend.finish_trzsz_transfer();
     }
 
-    pub fn start_modem_transfer(
+    pub fn begin_modem_transfer(
         &mut self,
         request: TerminalModemTransferRequest,
-    ) -> Option<ModemTransfer> {
-        self.backend.start_modem_transfer(request)
+    ) -> Result<Option<ModemTransfer>> {
+        self.backend.begin_modem_transfer(request)
     }
 
     pub fn interrupt_modem_transfer(&mut self) {
@@ -447,8 +450,8 @@ impl TerminalSession {
         self.backend.mode()
     }
 
-    pub fn select_tmux_pane_at(&mut self, col: usize, row: usize) -> Result<bool> {
-        self.backend.select_tmux_pane_at(col, row)
+    pub fn begin_tmux_pane_selection(&mut self, col: usize, row: usize) -> Result<Option<bool>> {
+        self.backend.begin_tmux_pane_selection(col, row)
     }
 
     pub fn tmux_local_point(&self, col: usize, row: usize) -> (usize, usize) {

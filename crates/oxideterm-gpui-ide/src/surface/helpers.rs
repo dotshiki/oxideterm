@@ -1,11 +1,3 @@
-fn tree_svg_icon(path: &'static str, size: f32, color: u32) -> AnyElement {
-    svg()
-        .path(path)
-        .size(px(size))
-        .text_color(rgb(color))
-        .into_any_element()
-}
-
 fn tree_spinner_icon(
     tokens: &ThemeTokens,
     id: impl Into<gpui::ElementId>,
@@ -55,6 +47,8 @@ fn apply_editor_runtime_settings(
     editor.update(cx, |editor, cx| {
         editor.apply_ide_runtime_settings(
             &tokens,
+            runtime_settings.editor_font_family.clone(),
+            runtime_settings.editor_font_weight,
             runtime_settings.editor_font_fallback.clone(),
             runtime_settings.editor_font_size,
             runtime_settings.editor_line_height,
