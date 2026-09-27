@@ -4,8 +4,6 @@ use itertools::Itertools;
 use scheduler::{Instant, SpawnTime};
 #[cfg(feature = "profiler")]
 use smallvec::SmallVec;
-#[cfg(all(test, feature = "profiler"))]
-use std::sync::{Mutex, MutexGuard};
 use std::{
     cell::LazyCell,
     collections::{HashMap, VecDeque},
@@ -707,41 +705,6 @@ const TRACE_SETTING_ENABLED: u64 = 1 << 63;
 const TRACE_SCOPE_COUNT_MASK: u64 = TRACE_SETTING_ENABLED - 1;
 static TRACE_STATE: AtomicU64 = AtomicU64::new(0);
 
-/// Serializes tests that change process-wide tracing state or keep a trace scope active.
-#[cfg(all(test, feature = "profiler"))]
-pub(crate) struct TraceTestGuard {
-    was_enabled: bool,
-    _lock: MutexGuard<'static, ()>,
-}
-
-#[cfg(all(test, feature = "profiler"))]
-static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[cfg(all(test, feature = "profiler"))]
-impl TraceTestGuard {
-    pub(crate) fn new() -> Self {
-        let lock = TRACE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let was_enabled = trace_enabled();
-        set_trace_enabled(false);
-        Self {
-            was_enabled,
-            _lock: lock,
-        }
-    }
-}
-
-#[cfg(all(test, feature = "profiler"))]
-impl Drop for TraceTestGuard {
-    fn drop(&mut self) {
-        set_trace_enabled(false);
-        if self.was_enabled {
-            set_trace_enabled(true);
-        }
-    }
-}
-
 /// Enables or disables profiler trace collection at runtime.
 ///
 /// When transitioning from enabled to disabled, `add_task_timing` becomes
@@ -779,10 +742,10 @@ pub fn set_trace_enabled(enabled: bool) -> bool {
     }
 }
 
-#[cfg(any(feature = "bench", all(test, feature = "profiler")))]
+#[cfg(any(feature = "bench-support", all(test, feature = "profiler")))]
 pub(crate) struct TraceGuard;
 
-#[cfg(any(feature = "bench", all(test, feature = "profiler")))]
+#[cfg(any(feature = "bench-support", all(test, feature = "profiler")))]
 pub(crate) fn trace_scope() -> TraceGuard {
     let incremented = TRACE_STATE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
         (state & TRACE_SCOPE_COUNT_MASK < TRACE_SCOPE_COUNT_MASK).then_some(state + 1)
@@ -791,7 +754,7 @@ pub(crate) fn trace_scope() -> TraceGuard {
     TraceGuard
 }
 
-#[cfg(any(feature = "bench", all(test, feature = "profiler")))]
+#[cfg(any(feature = "bench-support", all(test, feature = "profiler")))]
 impl Drop for TraceGuard {
     fn drop(&mut self) {
         let previous_state =
@@ -897,6 +860,8 @@ pub enum FrameEvent {
 #[cfg(feature = "profiler")]
 #[derive(Clone)]
 pub struct FrameDurationSnapshot {
+    /// Histogram of durations from the first invalidation through presentation, in nanoseconds.
+    pub dirty_to_present_histogram: Histogram<u64>,
     /// Histogram of `Window::draw` durations, in nanoseconds.
     pub draw_duration_histogram: Histogram<u64>,
     /// Histogram of intervals between consecutively presented frames while the
@@ -939,6 +904,7 @@ pub struct WindowProfiler {
     window_id: WindowId,
     active_activities: SmallVec<[WindowActivity; 4]>,
     active_actions: SmallVec<[(&'static str, Instant); 2]>,
+    dirty_to_present_histogram: Histogram<u64>,
     draw_duration_histogram: Histogram<u64>,
     present_interval_histogram: Histogram<u64>,
     first_input_at: Option<Instant>,
@@ -959,6 +925,9 @@ impl WindowProfiler {
             window_id,
             active_activities: SmallVec::new(),
             active_actions: SmallVec::new(),
+            dirty_to_present_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create dirty-to-present histogram: {error}")
+            })?,
             draw_duration_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create draw duration histogram: {error}")
             })?,
@@ -1115,6 +1084,7 @@ impl WindowProfiler {
     /// Returns a snapshot of the current frame-duration histograms.
     pub fn frame_duration_snapshot(&self) -> FrameDurationSnapshot {
         FrameDurationSnapshot {
+            dirty_to_present_histogram: self.dirty_to_present_histogram.clone(),
             draw_duration_histogram: self.draw_duration_histogram.clone(),
             present_interval_histogram: self.present_interval_histogram.clone(),
         }
@@ -1154,8 +1124,16 @@ impl WindowProfiler {
         };
         journal::record_present(present_timing, frame);
 
-        if frame.is_none() {
+        let Some(frame) = frame else {
             return;
+        };
+
+        if let Some(dirty_at) = frame.dirty_at
+            && let Err(error) = self
+                .dirty_to_present_histogram
+                .record(present_end.duration_since(dirty_at).as_nanos() as u64)
+        {
+            log::error!("failed to record dirty-to-present frame timing: {error}");
         }
 
         if let Some(animation_interval) = animation_interval {
@@ -1269,6 +1247,7 @@ impl FrameTimingCollector {
 #[cfg(all(test, feature = "profiler"))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
 
     #[test]
     fn records_draw_events_only_while_tracing() {
@@ -1452,6 +1431,22 @@ mod tests {
         assert_eq!(window_profiler.present_interval_histogram.len(), 1);
     }
 
+    #[test]
+    fn records_dirty_to_present_durations() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(8)).expect("window profiler should initialize");
+        let draw_end = Instant::now();
+        let present_end = draw_end + Duration::from_millis(6);
+
+        record_test_draw(&mut window_profiler, draw_end);
+        window_profiler.record_present_at(present_end, present_end, true, false);
+
+        let snapshot = window_profiler.frame_duration_snapshot();
+        let histogram = snapshot.dirty_to_present_histogram;
+        assert_eq!(histogram.len(), 1);
+        assert!(histogram.max() >= Duration::from_millis(10).as_nanos() as u64);
+    }
+
     #[cfg(feature = "profiler")]
     #[test]
     fn records_every_draw_duration() {
@@ -1521,6 +1516,35 @@ mod tests {
     }
 
     const FRAME: Duration = Duration::from_millis(16);
+    static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TraceTestGuard {
+        was_enabled: bool,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl TraceTestGuard {
+        fn new() -> Self {
+            let lock = TRACE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let was_enabled = trace_enabled();
+            set_trace_enabled(false);
+            Self {
+                was_enabled,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for TraceTestGuard {
+        fn drop(&mut self) {
+            set_trace_enabled(false);
+            if self.was_enabled {
+                set_trace_enabled(true);
+            }
+        }
+    }
 
     fn event_matches_window(event: FrameEvent, window_id: WindowId) -> bool {
         match event {

@@ -166,7 +166,7 @@ fn encrypt_managed_ssh_key_secret(
 ) -> Result<ManagedSshKeySecretEnvelope> {
     let mut nonce = [0u8; MANAGED_SSH_KEY_SECRET_NONCE_LEN];
     let mut rng = rand::rngs::OsRng;
-    rand::RngCore::fill_bytes(&mut rng, &mut nonce);
+    rand::TryRngCore::try_fill_bytes(&mut rng, &mut nonce).expect("OS CSPRNG must be available");
 
     let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
         .context("failed to initialize managed SSH key secret cipher")?;
@@ -312,7 +312,7 @@ fn encrypt_connection_store_data(
     );
     let mut nonce = [0u8; CONFIG_ENCRYPTION_NONCE_LEN];
     let mut rng = rand::rngs::OsRng;
-    rand::RngCore::fill_bytes(&mut rng, &mut nonce);
+    rand::TryRngCore::try_fill_bytes(&mut rng, &mut nonce).expect("OS CSPRNG must be available");
 
     let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
         .context("failed to initialize connections cipher")?;
@@ -407,7 +407,7 @@ fn get_or_create_config_encryption_key() -> Result<(ConfigEncryptionKey, bool)> 
 
     let mut key = zeroize::Zeroizing::new([0u8; CONFIG_ENCRYPTION_KEY_LEN]);
     let mut rng = rand::rngs::OsRng;
-    rand::RngCore::fill_bytes(&mut rng, &mut key[..]);
+    rand::TryRngCore::try_fill_bytes(&mut rng, &mut key[..]).expect("OS CSPRNG must be available");
     store_config_key_secret(&encode_config_encryption_key(&key)?)?;
     remember_config_encryption_key(&key);
     Ok((key, true))

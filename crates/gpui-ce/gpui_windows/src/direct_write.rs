@@ -6,8 +6,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use collections::HashMap;
+use gpui_render::shaders::emoji_rasterization::GlyphLayerTextureParams;
 use gpui_util::{ResultExt, maybe};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use wgsl_rs::std::{vec2i, vec3f, vec4f};
 use windows::{
     Win32::{
         Foundation::*,
@@ -33,26 +35,6 @@ struct FontInfo {
     features: IDWriteTypography,
     fallbacks: Option<IDWriteFontFallback>,
     font_collection: IDWriteFontCollection1,
-}
-
-impl FontInfo {
-    fn from_shaping_face(
-        font_face: IDWriteFontFace3,
-        features: IDWriteTypography,
-        font_collection: IDWriteFontCollection1,
-        locale: &HSTRING,
-    ) -> Result<Self> {
-        let names = unsafe { font_face.GetFamilyNames()? };
-        Ok(Self {
-            font_family_h: HSTRING::from(get_name(names, locale)?),
-            // Glyph indices and the COM cache key both belong to this object.
-            // Retaining it prevents a name lookup from substituting another face.
-            font_face,
-            features,
-            fallbacks: None,
-            font_collection,
-        })
-    }
 }
 
 pub(crate) struct DirectWriteTextSystem {
@@ -151,23 +133,16 @@ impl GPUState {
             sampler
         };
 
+        let bytecode = shader_resources::ShaderModule::EmojiRasterization.bytecode()?;
         let vertex_shader = {
-            let source = shader_resources::RawShaderBytes::new(
-                shader_resources::ShaderModule::EmojiRasterization,
-                shader_resources::ShaderTarget::Vertex,
-            )?;
             let mut shader = None;
-            unsafe { device.CreateVertexShader(source.as_bytes(), None, Some(&mut shader)) }?;
+            unsafe { device.CreateVertexShader(bytecode.vertex, None, Some(&mut shader)) }?;
             shader.unwrap()
         };
 
         let pixel_shader = {
-            let source = shader_resources::RawShaderBytes::new(
-                shader_resources::ShaderModule::EmojiRasterization,
-                shader_resources::ShaderTarget::Fragment,
-            )?;
             let mut shader = None;
-            unsafe { device.CreatePixelShader(source.as_bytes(), None, Some(&mut shader)) }?;
+            unsafe { device.CreatePixelShader(bytecode.fragment, None, Some(&mut shader)) }?;
             shader.unwrap()
         };
 
@@ -401,6 +376,9 @@ impl DirectWriteState {
         let set = unsafe { components.builder.CreateFontSet()? };
         let collection = unsafe { components.factory.CreateFontCollectionFromFontSet(&set)? };
         self.custom_font_collection = collection;
+        // New custom faces take precedence over previously selected system faces.
+        // Existing FontIds stay valid for shaped lines; future requests must reselect.
+        self.font_to_font_id.clear();
 
         Ok(())
     }
@@ -1017,24 +995,6 @@ impl DirectWriteState {
         }
 
         let gpu_state = &self.gpu_state;
-        let params_buffer = {
-            let desc = D3D11_BUFFER_DESC {
-                ByteWidth: std::mem::size_of::<GlyphLayerTextureParams>() as u32,
-                Usage: D3D11_USAGE_DYNAMIC,
-                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-                MiscFlags: 0,
-                StructureByteStride: 0,
-            };
-
-            let mut buffer = None;
-            unsafe {
-                gpu_state
-                    .device
-                    .CreateBuffer(&desc, None, Some(&mut buffer))
-            }?;
-            buffer
-        };
 
         let render_target_texture = {
             let mut texture = None;
@@ -1080,6 +1040,41 @@ impl DirectWriteState {
             rtv
         };
 
+        Self::composite_color_layers(
+            gpu_state,
+            &glyph_layers,
+            bitmap_size,
+            &render_target_texture,
+            &render_target_view,
+        )
+    }
+
+    fn composite_color_layers(
+        gpu_state: &GPUState,
+        glyph_layers: &[GlyphLayerTexture],
+        bitmap_size: Size<DevicePixels>,
+        render_target_texture: &ID3D11Texture2D,
+        render_target_view: &Option<ID3D11RenderTargetView>,
+    ) -> Result<Vec<u8>> {
+        let params_buffer = {
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: std::mem::size_of::<GlyphLayerTextureParams>() as u32,
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                MiscFlags: 0,
+                StructureByteStride: 0,
+            };
+
+            let mut buffer = None;
+            unsafe {
+                gpu_state
+                    .device
+                    .CreateBuffer(&desc, None, Some(&mut buffer))
+            }?;
+            buffer
+        };
+
         let staging_texture = {
             let mut texture = None;
             let desc = D3D11_TEXTURE2D_DESC {
@@ -1116,9 +1111,14 @@ impl DirectWriteState {
             device_context.PSSetConstantBuffers(0, Some(std::slice::from_ref(&params_buffer)))
         };
         unsafe {
-            device_context.OMSetRenderTargets(Some(std::slice::from_ref(&render_target_view)), None)
+            device_context.OMSetRenderTargets(Some(std::slice::from_ref(render_target_view)), None)
         };
-        unsafe { device_context.PSSetSamplers(0, Some(std::slice::from_ref(&gpu_state.sampler))) };
+        unsafe {
+            if let Some(render_target_view) = render_target_view.as_ref() {
+                device_context.ClearRenderTargetView(render_target_view, &[0.0, 0.0, 0.0, 0.0]);
+            }
+        }
+        unsafe { device_context.PSSetSamplers(2, Some(std::slice::from_ref(&gpu_state.sampler))) };
         unsafe { device_context.OMSetBlendState(&gpu_state.blend_state, None, 0xffffffff) };
 
         let crate::FontInfo {
@@ -1129,11 +1129,22 @@ impl DirectWriteState {
 
         for layer in glyph_layers {
             let params = GlyphLayerTextureParams {
-                run_color: layer.run_color,
-                bounds: layer.bounds,
-                gamma_ratios: *gamma_ratios,
+                bounds_origin: vec2i(layer.bounds.origin.x, layer.bounds.origin.y),
+                bounds_size: vec2i(layer.bounds.size.width, layer.bounds.size.height),
+                run_color: vec4f(
+                    layer.run_color.red,
+                    layer.run_color.green,
+                    layer.run_color.blue,
+                    layer.run_color.alpha,
+                ),
+                gamma_ratios: vec4f(
+                    gamma_ratios[0],
+                    gamma_ratios[1],
+                    gamma_ratios[2],
+                    gamma_ratios[3],
+                ),
                 grayscale_enhanced_contrast: *grayscale_enhanced_contrast,
-                _pad: [0f32; 3],
+                padding: vec3f(0.0, 0.0, 0.0),
             };
             unsafe {
                 let mut dest = std::mem::zeroed();
@@ -1150,8 +1161,8 @@ impl DirectWriteState {
                     .Unmap(params_buffer.as_ref().unwrap(), 0);
             };
 
-            let texture = [Some(layer.texture_view)];
-            unsafe { device_context.PSSetShaderResources(0, Some(&texture)) };
+            let texture = [Some(layer.texture_view.clone())];
+            unsafe { device_context.PSSetShaderResources(1, Some(&texture)) };
 
             let viewport = [D3D11_VIEWPORT {
                 TopLeftX: layer.bounds.origin.x as f32,
@@ -1166,7 +1177,7 @@ impl DirectWriteState {
             unsafe { device_context.Draw(4, 0) };
         }
 
-        unsafe { device_context.CopyResource(&staging_texture, &render_target_texture) };
+        unsafe { device_context.CopyResource(&staging_texture, render_target_texture) };
 
         let mapped_data = {
             let mut mapped_data = D3D11_MAPPED_SUBRESOURCE::default();
@@ -1357,15 +1368,6 @@ impl GlyphLayerTexture {
     }
 }
 
-#[repr(C)]
-struct GlyphLayerTextureParams {
-    bounds: Bounds<i32>,
-    run_color: Rgba,
-    gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
-    _pad: [f32; 3],
-}
-
 struct TextRendererWrapper(IDWriteTextRenderer);
 
 impl TextRendererWrapper {
@@ -1516,29 +1518,33 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             ));
         };
 
-        let font_face_key = font_face.cast::<IUnknown>()?.as_raw().addr();
-        let font_id = if let Some(id) = context.text_system.font_info_cache.get(&font_face_key) {
-            *id
-        } else {
-            let state = &mut context.text_system;
-            let collection =
-                if unsafe { state.custom_font_collection.GetFontFromFontFace(font_face) }.is_ok() {
-                    state.custom_font_collection.clone()
-                } else {
-                    state.system_font_collection.clone()
-                };
-            let info = FontInfo::from_shaping_face(
-                font_face.clone(),
-                unsafe { context.components.factory.CreateTypography()? },
-                collection,
-                &self.locale,
-            )
-            .map_err(|error| Error::new(DWRITE_E_NOFONT, error.to_string()))?;
-            let id = FontId(state.fonts.len());
-            state.fonts.push(info);
-            state.font_info_cache.insert(font_face_key, id);
-            id
-        };
+        let font_face_key = font_face.cast::<IUnknown>().unwrap().as_raw().addr();
+        let font_id = context
+            .text_system
+            .font_info_cache
+            .get(&font_face_key)
+            .copied()
+            // in some circumstances, we might be getting served a FontFace that we did not create ourselves
+            // so create a new font from it and cache it accordingly. The usual culprit here seems to be Segoe UI Symbol
+            .map_or_else(
+                || {
+                    let font = font_face_to_font(font_face, &self.locale)
+                        .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?;
+                    let font_id = match context.text_system.font_to_font_id.get(&font) {
+                        Some(&font_id) => font_id,
+                        None => context
+                            .text_system
+                            .select_and_cache_font(context.components, &font)
+                            .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?,
+                    };
+                    context
+                        .text_system
+                        .font_info_cache
+                        .insert(font_face_key, font_id);
+                    windows::core::Result::Ok(font_id)
+                },
+                Ok,
+            )?;
 
         let color_font = unsafe { font_face.IsColorFont().as_bool() };
 
@@ -1719,8 +1725,21 @@ fn font_style_to_dwrite(style: FontStyle) -> DWRITE_FONT_STYLE {
     }
 }
 
+fn font_style_from_dwrite(value: DWRITE_FONT_STYLE) -> FontStyle {
+    match value.0 {
+        0 => FontStyle::Normal,
+        1 => FontStyle::Italic,
+        2 => FontStyle::Oblique,
+        _ => unreachable!(),
+    }
+}
+
 fn font_weight_to_dwrite(weight: FontWeight) -> DWRITE_FONT_WEIGHT {
     DWRITE_FONT_WEIGHT(weight.0 as i32)
+}
+
+fn font_weight_from_dwrite(value: DWRITE_FONT_WEIGHT) -> FontWeight {
+    FontWeight(value.0 as f32)
 }
 
 fn get_font_names_from_collection(
@@ -1745,6 +1764,20 @@ fn get_font_names_from_collection(
 
         result
     }
+}
+
+fn font_face_to_font(font_face: &IDWriteFontFace3, locale: &HSTRING) -> Option<Font> {
+    let localized_family_name = unsafe { font_face.GetFamilyNames().log_err() }?;
+    let family_name = get_name(localized_family_name, locale).log_err()?;
+    let weight = unsafe { font_face.GetWeight() };
+    let style = unsafe { font_face.GetStyle() };
+    Some(Font {
+        family: family_name.into(),
+        features: FontFeatures::default(),
+        weight: font_weight_from_dwrite(weight),
+        style: font_style_from_dwrite(style),
+        fallbacks: None,
+    })
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/dwrite/ne-dwrite-dwrite_font_feature_tag
@@ -1919,48 +1952,20 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 
 #[cfg(test)]
 mod tests {
+    use super::{DirectWriteState, DirectWriteTextSystem, GPUState, GlyphLayerTexture};
     use crate::direct_write::ClusterAnalyzer;
-
-    #[test]
-    fn windows_text_shaping_face_retains_identity() {
-        use super::*;
-
-        // DirectWrite alone is sufficient; this regression does not require
-        // a graphics adapter, a visible window, or optional CJK font packs.
-        let factory: IDWriteFactory5 =
-            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
-        let mut collection = None;
-        unsafe { factory.GetSystemFontCollection(false, &mut collection, false) }.unwrap();
-        let collection = collection.unwrap();
-        let family = unsafe { collection.GetFontFamily(0) }.unwrap();
-        for style in [
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STYLE_ITALIC,
-            DWRITE_FONT_STYLE_OBLIQUE,
-        ] {
-            let font = unsafe {
-                family.GetFirstMatchingFont(
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    style,
-                )
-            }
-            .unwrap();
-            let face: IDWriteFontFace3 = unsafe { font.CreateFontFace() }.unwrap().cast().unwrap();
-            let identity = face.cast::<IUnknown>().unwrap().as_raw().addr();
-            let info = FontInfo::from_shaping_face(
-                face,
-                unsafe { factory.CreateTypography() }.unwrap(),
-                collection.clone(),
-                &HSTRING::from("en-US"),
-            )
-            .unwrap();
-            assert_eq!(
-                info.font_face.cast::<IUnknown>().unwrap().as_raw().addr(),
-                identity
-            );
-        }
-    }
+    use crate::directx_devices::DirectXDevices;
+    use anyhow::Result;
+    use gpui::{
+        DevicePixels, Font, PlatformTextSystem, RenderGlyphParams, Rgba, bounds, point, px, size,
+    };
+    use std::ffi::c_void;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0,
+        D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_RTV,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
     #[test]
     fn test_cluster_map() {
@@ -1997,5 +2002,154 @@ mod tests {
         assert_eq!(next, Some((5, 1)));
         let next = analyzer.next();
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn color_emoji_rasterization_is_stable_across_batches() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let text_system = DirectWriteTextSystem::new(&devices)?;
+
+        let font = Font {
+            family: "Segoe UI Emoji".into(),
+            ..Default::default()
+        };
+        let font_id = text_system.font_id(&font)?;
+
+        let mut params_list = Vec::new();
+        for ch in ['🫠', '🥹', '🧗', '🏋', '🚀', '🥺'] {
+            let Some(glyph_id) = text_system.glyph_for_char(font_id, ch) else {
+                log::info!("no glyph found for {ch}");
+                continue;
+            };
+            let params = RenderGlyphParams {
+                font_id,
+                glyph_id,
+                font_size: px(48.0),
+                subpixel_variant: point(0u8, 0u8),
+                scale_factor: 1.0,
+                is_emoji: true,
+                subpixel_rendering: false,
+                dilation: 0,
+            };
+            let raster_bounds = text_system.glyph_raster_bounds(&params)?;
+            if raster_bounds.size.width.0 == 0 || raster_bounds.size.height.0 == 0 {
+                log::info!("raster bounds are empty for {ch}");
+                continue;
+            }
+            params_list.push((params, raster_bounds));
+        }
+        assert!(!params_list.is_empty());
+
+        let first: Vec<_> = params_list
+            .iter()
+            .map(|(params, bounds)| text_system.rasterize_glyph(params, *bounds))
+            .collect::<Result<_>>()?;
+
+        // Churn the texture heap with further rasterization passes. If the color
+        // compositing leaks leftover texture data (the render target is not cleared),
+        // the second batch can pick up different contents and differ from the first.
+        // With an explicit clear both batches are deterministic and identical.
+        for _ in 0..3 {
+            for (params, bounds) in &params_list {
+                text_system.rasterize_glyph(params, *bounds)?;
+            }
+        }
+        let second: Vec<_> = params_list
+            .iter()
+            .map(|(params, bounds)| text_system.rasterize_glyph(params, *bounds))
+            .collect::<Result<_>>()?;
+
+        assert_eq!(
+            first, second,
+            "color glyph rasterization changed between batches; \
+             render target contents are leaking into the glyph bitmaps"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn color_emoji_composites_over_cleared_texture() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let gpu_state = GPUState::new(&devices)?;
+
+        const SIZE: u32 = 32;
+        // Seed the render target with solid red so that any texel which the
+        // compositing pass fails to clear/overwrite remains identifiable after
+        // the readback.
+        let poison = {
+            let mut v = vec![0u8; (SIZE * SIZE * 4) as usize];
+            for pixel in v.chunks_exact_mut(4) {
+                pixel[2] = 255;
+                pixel[3] = 255;
+            }
+            v
+        };
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: SIZE,
+            Height: SIZE,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let initial_data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: poison.as_ptr() as *const c_void,
+            SysMemPitch: SIZE * 4,
+            SysMemSlicePitch: 0,
+        };
+        let texture = unsafe {
+            let mut texture = None;
+            gpu_state
+                .device
+                .CreateTexture2D(&desc, Some(&initial_data), Some(&mut texture))?;
+            texture.unwrap()
+        };
+        let render_target_view = unsafe {
+            let desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
+                },
+            };
+            let mut rtv = None;
+            gpu_state
+                .device
+                .CreateRenderTargetView(&texture, Some(&desc), Some(&mut rtv))?;
+            rtv.unwrap()
+        };
+
+        // A single opaque layer in the top-left corner; the bottom-right corner
+        // of the texture is covered by no layer at all.
+        let layer_alpha = vec![255u8; 4 * 4];
+        let layer = GlyphLayerTexture::new(
+            &gpu_state,
+            Rgba::new(1.0, 1.0, 1.0, 1.0),
+            bounds(point(0, 0), size(4, 4)),
+            &layer_alpha,
+        )?;
+
+        let rasterized = DirectWriteState::composite_color_layers(
+            &gpu_state,
+            std::slice::from_ref(&layer),
+            size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            &texture,
+            &Some(render_target_view),
+        )?;
+
+        let corner = (SIZE as usize - 1 + (SIZE as usize - 1) * SIZE as usize) * 4;
+        assert_eq!(
+            &rasterized[corner..corner + 4],
+            &[0, 0, 0, 0],
+            "uncovered texel retained the poison from the uninitialized render target"
+        );
+        Ok(())
     }
 }

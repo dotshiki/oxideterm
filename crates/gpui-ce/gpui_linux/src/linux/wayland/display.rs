@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use uuid::Uuid;
 use wayland_backend::client::ObjectId;
 
-use gpui::{Bounds, DevicePixels, DisplayId, Pixels, PlatformDisplay};
+use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay};
 
 #[derive(Debug, Clone)]
 pub(crate) struct WaylandDisplay {
@@ -15,8 +15,6 @@ pub(crate) struct WaylandDisplay {
     pub id: ObjectId,
     pub name: Option<String>,
     pub bounds: Bounds<Pixels>,
-    pub physical_bounds: Bounds<DevicePixels>,
-    pub scale_factor: f32,
 }
 
 impl Hash for WaylandDisplay {
@@ -40,13 +38,5 @@ impl PlatformDisplay for WaylandDisplay {
 
     fn bounds(&self) -> Bounds<Pixels> {
         self.bounds
-    }
-
-    fn physical_bounds(&self) -> Bounds<DevicePixels> {
-        self.physical_bounds
-    }
-
-    fn scale_factor(&self) -> f32 {
-        self.scale_factor
     }
 }

@@ -1,11 +1,11 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use gpui::{FontFallbacks, FontRun, PlatformTextSystem, font, px};
-use gpui_wgpu::CosmicTextSystem;
+use gpui_ce_wgpu::CosmicTextSystem;
 use std::borrow::Cow;
 
-const LILEX: &[u8] = include_bytes!("../../../../assets/fonts/lilex/Lilex-Regular.ttf");
+const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 const IBM_PLEX: &[u8] =
-    include_bytes!("../../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
 
 // ~4 000 chars of typical ASCII code text, as a single display line.
 //

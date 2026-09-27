@@ -92,6 +92,12 @@ impl WindowsDisplay {
         WindowsDisplay::new(Self::display_id_for_monitor(monitor))
     }
 
+    /// The DPI scale factor of this monitor, independent of whatever monitor
+    /// a not-yet-positioned window currently happens to be on.
+    pub(crate) fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
     /// Check if the center point of given bounds is inside this monitor
     pub fn check_given_bounds(&self, bounds: Bounds<Pixels>) -> bool {
         let center = bounds.center();
@@ -138,14 +144,6 @@ impl PlatformDisplay for WindowsDisplay {
 
     fn bounds(&self) -> Bounds<Pixels> {
         self.bounds
-    }
-
-    fn physical_bounds(&self) -> Bounds<DevicePixels> {
-        self.physical_bounds
-    }
-
-    fn scale_factor(&self) -> f32 {
-        self.scale_factor
     }
 
     fn visible_bounds(&self) -> Bounds<Pixels> {

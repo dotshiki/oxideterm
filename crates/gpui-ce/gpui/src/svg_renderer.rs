@@ -1,9 +1,10 @@
 use crate::{
-    AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
+    AssetRegistry, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
     swap_rgba_pa_to_bgra,
 };
 use image::Frame;
 use resvg::tiny_skia::Pixmap;
+use skrifa::{FontRef, MetadataProvider};
 use smallvec::SmallVec;
 use std::{
     hash::Hash,
@@ -41,9 +42,9 @@ fn is_emoji_presentation(c: char) -> bool {
 
 fn font_has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, ch: char) -> bool {
     db.with_face_data(id, |font_data, face_index| {
-        ttf_parser::Face::parse(font_data, face_index)
+        FontRef::from_index(font_data, face_index)
             .ok()
-            .and_then(|face| face.glyph_index(ch))
+            .and_then(|face| face.charmap().map(ch))
             .is_some()
     })
     .unwrap_or(false)
@@ -77,29 +78,6 @@ fn select_emoji_font(
     None
 }
 
-fn select_text_fallback(
-    ch: char,
-    used: &[usvg::fontdb::ID],
-    db: &usvg::fontdb::Database,
-) -> Option<usvg::fontdb::ID> {
-    let base = db.face(*used.first()?)?;
-    let supports = |id| !used.contains(&id) && font_has_char(db, id, ch);
-    // Prefer matching text metrics before accepting any face that can supply the glyph.
-    // Keep the exact-style and relaxed search passes disjoint.
-    for exact_match in [true, false] {
-        for face in db.faces() {
-            let matching = face.style == base.style
-                && face.weight == base.weight
-                && face.stretch == base.stretch
-                && face.monospaced == base.monospaced;
-            if matching == exact_match && supports(face.id) {
-                return Some(face.id);
-            }
-        }
-    }
-    None
-}
-
 /// When rendering SVGs, we render them at twice the size to get a higher-quality result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
 
@@ -113,7 +91,7 @@ pub struct RenderSvgParams {
 #[derive(Clone)]
 /// A struct holding everything necessary to render SVGs.
 pub struct SvgRenderer {
-    asset_source: Arc<dyn AssetSource>,
+    asset_registry: Arc<AssetRegistry>,
     usvg_options: Arc<usvg::Options<'static>>,
 }
 
@@ -144,7 +122,7 @@ impl From<f32> for SvgSize {
 
 impl SvgRenderer {
     /// Creates a new SVG renderer with the provided asset source.
-    pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
+    pub fn new(asset_registry: Arc<AssetRegistry>) -> Self {
         static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
             let mut db = usvg::fontdb::Database::new();
             db.load_system_fonts();
@@ -159,12 +137,12 @@ impl SvgRenderer {
 
         let default_font_resolver = usvg::FontResolver::default_font_selector();
         let font_resolver = Box::new({
-            let asset_source = asset_source.clone();
+            let asset_database = asset_registry.clone();
             move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
                 if db.is_empty() {
                     let fontdb = enriched_fontdb.get_or_init(|| {
                         let mut db = (**SYSTEM_FONT_DB).clone();
-                        load_bundled_fonts(&*asset_source, &mut db);
+                        load_bundled_fonts(&asset_database, &mut db);
                         fix_generic_font_families(&mut db);
                         Arc::new(db)
                     });
@@ -183,6 +161,7 @@ impl SvgRenderer {
                     .or_else(|| db.faces().next().map(|f| f.id))
             }
         });
+        let default_fallback_selection = usvg::FontResolver::default_fallback_selector();
         let fallback_selection = Box::new(
             move |ch: char, fonts: &[usvg::fontdb::ID], db: &mut Arc<usvg::fontdb::Database>| {
                 if is_emoji_presentation(ch) {
@@ -192,11 +171,7 @@ impl SvgRenderer {
                     }
                 }
 
-                let selected = select_text_fallback(ch, fonts, db);
-                if let Some(face) = selected.and_then(|id| db.face(id)) {
-                    log::debug!("SVG character fallback selected {}", face.post_script_name);
-                }
-                selected
+                default_fallback_selection(ch, fonts, db)
             },
         );
         let options = usvg::Options {
@@ -207,7 +182,7 @@ impl SvgRenderer {
             ..Default::default()
         };
         Self {
-            asset_source,
+            asset_registry,
             usvg_options: Arc::new(options),
         }
     }
@@ -282,7 +257,7 @@ impl SvgRenderer {
 
         if let Some(bytes) = bytes {
             render_pixmap(bytes)
-        } else if let Some(bytes) = self.asset_source.load(&params.path)? {
+        } else if let Some(bytes) = self.asset_registry.load(&params.path) {
             render_pixmap(&bytes)
         } else {
             Ok(None)
@@ -334,19 +309,15 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
     Ok(pixmap)
 }
 
-fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
-    let font_paths = match asset_source.list("fonts") {
-        Ok(paths) => paths,
-        Err(error) => {
-            log::warn!("Failed to list bundled SVG fonts: {error}");
-            return;
-        }
-    };
+fn load_bundled_fonts(asset_database: &AssetRegistry, db: &mut usvg::fontdb::Database) {
+    let font_paths = [
+        "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
+        "fonts/lilex/Lilex-Regular.ttf",
+    ];
     for path in font_paths {
-        match asset_source.load(&path) {
-            Ok(Some(data)) => db.load_font_data(data.into_owned()),
-            Ok(None) => log::warn!("Bundled font not found: {path}"),
-            Err(error) => log::warn!("Failed to load bundled font {path}: {error}"),
+        match asset_database.load(path) {
+            Some(data) => db.load_font_data(data.into_owned()),
+            None => log::warn!("Bundled font not found: {path}"),
         }
     }
 }
@@ -357,40 +328,27 @@ fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Dat
 fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
     use usvg::fontdb::{Family, Query};
 
-    let sans = db
-        .faces()
-        .find(|face| !face.monospaced)
-        .or_else(|| db.faces().next())
-        .and_then(|face| face.families.first())
-        .map(|family| family.0.clone());
-    let mono = db
-        .faces()
-        .find(|face| face.monospaced)
-        .and_then(|face| face.families.first())
-        .map(|family| family.0.clone());
-    let families_and_fallbacks = [
-        (Family::SansSerif, sans.as_deref()),
-        (Family::Serif, sans.as_deref()),
-        (Family::Monospace, mono.as_deref().or(sans.as_deref())),
-        (Family::Cursive, sans.as_deref()),
-        (Family::Fantasy, sans.as_deref()),
+    let families_and_fallbacks: &[(Family<'_>, &str)] = &[
+        (Family::SansSerif, "IBM Plex Sans"),
+        // No serif font bundled; use sans-serif as best available fallback.
+        (Family::Serif, "IBM Plex Sans"),
+        (Family::Monospace, "Lilex"),
+        (Family::Cursive, "IBM Plex Sans"),
+        (Family::Fantasy, "IBM Plex Sans"),
     ];
 
     for (family, fallback_name) in families_and_fallbacks {
-        let Some(fallback_name) = fallback_name else {
-            continue;
-        };
         let query = Query {
-            families: &[family],
+            families: &[*family],
             ..Default::default()
         };
         if db.query(&query).is_none() {
             match family {
-                Family::SansSerif => db.set_sans_serif_family(fallback_name),
-                Family::Serif => db.set_serif_family(fallback_name),
-                Family::Monospace => db.set_monospace_family(fallback_name),
-                Family::Cursive => db.set_cursive_family(fallback_name),
-                Family::Fantasy => db.set_fantasy_family(fallback_name),
+                Family::SansSerif => db.set_sans_serif_family(*fallback_name),
+                Family::Serif => db.set_serif_family(*fallback_name),
+                Family::Monospace => db.set_monospace_family(*fallback_name),
+                Family::Cursive => db.set_cursive_family(*fallback_name),
+                Family::Fantasy => db.set_fantasy_family(*fallback_name),
                 _ => {}
             }
         }
@@ -403,61 +361,12 @@ mod tests {
     use usvg::fontdb::{Database, Family, Query};
 
     const IBM_PLEX_REGULAR: &[u8] =
-        include_bytes!("../../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-    const LILEX_REGULAR: &[u8] = include_bytes!("../../../../assets/fonts/lilex/Lilex-Regular.ttf");
-
-    struct FontAssets;
-
-    impl AssetSource for FontAssets {
-        fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-            assert_eq!(path, "fonts");
-            Ok(vec!["custom/sans.ttf".into(), "custom/mono.ttf".into()])
-        }
-
-        fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
-            let bytes = match path {
-                "custom/sans.ttf" => IBM_PLEX_REGULAR,
-                "custom/mono.ttf" => LILEX_REGULAR,
-                _ => panic!("renderer requested an undeclared font: {path}"),
-            };
-            Ok(Some(std::borrow::Cow::Borrowed(bytes)))
-        }
-    }
-
-    #[test]
-    fn bundled_svg_fonts_follow_the_asset_source_manifest() {
-        let mut db = Database::new();
-        load_bundled_fonts(&FontAssets, &mut db);
-        let families = db
-            .faces()
-            .map(|face| face.families[0].0.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(families, ["IBM Plex Sans", "Lilex"]);
-    }
-
-    #[test]
-    fn text_fallback_checks_glyphs_and_does_not_retry_excluded_fonts() {
-        let db = db_with_bundled_fonts();
-        let base = db
-            .query(&Query {
-                families: &[Family::Name("IBM Plex Sans")],
-                ..Default::default()
-            })
-            .unwrap();
-        let fallback = db
-            .query(&Query {
-                families: &[Family::Name("Lilex")],
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(select_text_fallback('│', &[base], &db), Some(fallback));
-        assert_eq!(select_text_fallback('│', &[base, fallback], &db), None);
-        assert_eq!(select_text_fallback('\u{10ffff}', &[base], &db), None);
-    }
+        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
     #[test]
     fn renders_parsed_svg_at_requested_size() -> Result<()> {
-        let renderer = SvgRenderer::new(Arc::new(()));
+        let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
         let svg = renderer.parse_svg(
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="24pt" height="12pt"></svg>"#,
         )?;
@@ -470,7 +379,7 @@ mod tests {
 
     #[test]
     fn preserves_aspect_ratio_for_width_constrained_size() -> Result<()> {
-        let renderer = SvgRenderer::new(Arc::new(()));
+        let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
         let svg = renderer.parse_svg(
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="24pt" height="12pt"></svg>"#,
         )?;

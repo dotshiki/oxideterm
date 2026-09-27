@@ -1,4 +1,3 @@
-// OxideTerm vendor modification: expose virtual-adapter classification to product policy.
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 #![allow(clippy::type_complexity)] // Not useful, GPUI makes heavy use of callbacks
@@ -6,10 +5,9 @@
 #![allow(unused_mut)] // False positives in platform specific code
 
 extern crate self as gpui;
-#[doc(hidden)]
-pub static GPUI_MANIFEST_DIR: &'static str = env!("CARGO_MANIFEST_DIR");
 #[macro_use]
 mod action;
+mod animated;
 mod app;
 
 mod arena;
@@ -35,6 +33,7 @@ mod interactive;
 mod key_dispatch;
 mod keymap;
 mod lerp;
+mod motion;
 mod path_builder;
 mod platform;
 pub mod prelude;
@@ -44,9 +43,9 @@ pub mod profiler;
     test,
     target_os = "windows",
     target_os = "linux",
-    target_os = "freebsd",
     target_family = "wasm",
-    feature = "test-support"
+    feature = "test-support",
+    feature = "bench-support"
 ))]
 #[expect(missing_docs)]
 pub mod queue;
@@ -54,6 +53,7 @@ mod scene;
 mod shared_uri;
 mod spring;
 mod style;
+mod style_transitions;
 mod styled;
 mod subscription;
 mod svg_renderer;
@@ -95,6 +95,7 @@ pub use accesskit;
 pub use accesskit::Action as AccessibleAction;
 pub use accesskit::{Orientation, Role, Toggled};
 pub use action::*;
+pub use animated::*;
 pub use anyhow::Result;
 pub use app::*;
 pub(crate) use arena::*;
@@ -107,8 +108,6 @@ pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
-/// OxideTerm compatibility alias for the pre-vendor anchored-element API.
-pub use geometry::Anchor as Corner;
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;
@@ -150,23 +149,18 @@ pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
 pub use lerp::*;
+pub use motion::*;
 pub use path_builder::*;
 pub use platform::*;
 pub use profiler::*;
-#[cfg(any(
-    target_os = "windows",
-    target_os = "linux",
-    target_os = "freebsd",
-    target_family = "wasm"
-))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;
 pub use shared_uri::*;
-/// OxideTerm compatibility re-export for existing detached task delays.
-pub use smol::Timer;
 use std::{any::Any, future::Future};
 pub use style::*;
+pub use style_transitions::*;
 pub use styled::*;
 pub use subscription::*;
 pub use svg_renderer::*;
@@ -181,6 +175,7 @@ pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;
 
+#[cfg(not(target_family = "wasm"))]
 pub use pollster::block_on;
 
 /// The context trait, allows the different contexts in GPUI to be used
@@ -225,6 +220,16 @@ pub trait AppContext {
     where
         T: 'static;
 
+    /// Tell GPUI that an entity has changed and observers of it should be notified.
+    fn notify(&mut self, entity_id: EntityId);
+
+    /// Emit an event of the specified type, which can be handled by other entities that have subscribed via `subscribe` methods on their respective contexts.
+    /// A globally-callable equivalent to `Context::emit` without requiring an entity update.
+    fn emit<EntityType, EventType>(&mut self, entity: &Entity<EntityType>, event: EventType)
+    where
+        EntityType: EventEmitter<EventType>,
+        EventType: 'static;
+
     /// Update a window for the given handle.
     fn update_window<T, F>(&mut self, window: AnyWindowHandle, f: F) -> Result<T>
     where
@@ -258,6 +263,17 @@ pub trait AppContext {
     fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> R
     where
         G: Global;
+
+    /// Stores an entity in the app such that it wont be dropped if no other entities are referencing it.
+    /// Entities stored this way are dropped when the app is dropped, unless otherwise removed by [`remove_global_entity`].
+    fn insert_global_entity<T: 'static>(&mut self, entity: Entity<T>);
+
+    /// Removes the entity from global storage. If no other entities are holding reference to it,
+    /// it will be dropped in the very near future.
+    fn remove_global_entity<T: 'static>(&mut self, entity: &Entity<T>);
+
+    /// Returns an iterator of all globally-stored entities which match the provided type.
+    fn global_entities<T: 'static>(&self) -> impl Iterator<Item = Entity<T>>;
 }
 
 /// Returned by [Context::reserve_entity] to later be passed to [Context::insert_entity].
@@ -359,9 +375,6 @@ where
 pub struct GpuSpecs {
     /// Whether the GPU is really a fake (like `llvmpipe`) running on the CPU.
     pub is_software_emulated: bool,
-    /// Whether the renderer identifies the adapter as a virtual GPU.
-    #[serde(default)]
-    pub is_virtual_gpu: bool,
     /// The name of the device, as reported by Vulkan.
     pub device_name: String,
     /// The name of the driver, as reported by Vulkan.

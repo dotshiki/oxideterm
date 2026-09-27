@@ -11,7 +11,7 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use oxideterm_atomic_file::{durable_remove, durable_write};
 use oxideterm_secret_store::NativeSecretStore;
 use parking_lot::RwLock;
-use rand::RngCore;
+use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -248,7 +248,7 @@ fn persist_session_to_path(
     let cipher = ChaCha20Poly1305::new_from_slice(&*session.key)
         .map_err(|_| PortableKeystoreError::Crypto)?;
     let mut nonce = [0u8; PORTABLE_KEYSTORE_NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::rngs::OsRng.try_fill_bytes(&mut nonce).expect("OS CSPRNG must be available");
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
         .map_err(|_| PortableKeystoreError::Crypto)?;
@@ -387,7 +387,7 @@ pub fn create_portable_keystore(password: &str) -> Result<(), PortableKeystoreEr
         return Err(PortableKeystoreError::AlreadyExists);
     }
     let mut salt = [0u8; PORTABLE_KEYSTORE_SALT_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng.try_fill_bytes(&mut salt).expect("OS CSPRNG must be available");
     let key = derive_key(password, &salt, PORTABLE_KEYSTORE_CURRENT_KDF)?;
     let session = PortableKeystoreSession {
         salt,
@@ -422,7 +422,7 @@ pub fn change_portable_keystore_password(
     let current_session = load_session_from_path(&path, current_password)?;
     let auto_unlock_enabled = portable_auto_unlock_enabled()?;
     let mut new_salt = [0u8; PORTABLE_KEYSTORE_SALT_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut new_salt);
+    rand::rngs::OsRng.try_fill_bytes(&mut new_salt).expect("OS CSPRNG must be available");
     let new_key = derive_key(new_password, &new_salt, PORTABLE_KEYSTORE_CURRENT_KDF)?;
     let next_session = PortableKeystoreSession {
         salt: new_salt,
@@ -857,7 +857,7 @@ mod tests {
 
         let restored = load_session_from_path(&path, "secret123").unwrap();
         let mut new_salt = [0u8; PORTABLE_KEYSTORE_SALT_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut new_salt);
+        rand::rngs::OsRng.try_fill_bytes(&mut new_salt).expect("OS CSPRNG must be available");
         let rewritten = PortableKeystoreSession {
             salt: new_salt,
             key: derive_key("new-secret123", &new_salt, PORTABLE_KEYSTORE_CURRENT_KDF).unwrap(),

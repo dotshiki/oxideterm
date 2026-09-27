@@ -1,10 +1,10 @@
-# Modified by OxideTerm to preserve the upstream license in the product workspace.
 [package]
-name = "gpui_shared_string"
+name = "gpui_ce_shared_string"
 version = "0.1.0"
+description = "Shared immutable string types for GPUI CE"
 publish.workspace = true
 edition.workspace = true
-license = "Apache-2.0"
+license.workspace = true
 
 [lib]
 path = "gpui_shared_string.rs"

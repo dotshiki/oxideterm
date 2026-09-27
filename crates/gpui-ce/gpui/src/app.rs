@@ -23,9 +23,12 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 
-use crate::http_client::{HttpClient, NullHttpClient};
+use crate::{
+    AssetRegistry,
+    http_client::{HttpClient, NullHttpClient},
+};
 pub use async_context::*;
-#[cfg(feature = "bench")]
+#[cfg(feature = "bench-support")]
 pub use bench_context::{BenchAppContext, BenchReport, BenchWindowContext, bench_platform};
 use collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, TypeIdHashSet, VecDeque};
 pub use context::*;
@@ -47,22 +50,22 @@ use crate::InspectorElementRegistry;
 use crate::MacActivationPolicy;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError,
-    CursorStyle, DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle,
-    FocusMap, ForegroundExecutor, Global, HapticFeedbackStyle, KeyBinding, KeyContext, Keymap,
-    Keystroke, LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
-    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
-    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
-    Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
-    TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout,
-    WindowHandle, WindowId, WindowInvalidator,
+    ArenaBox, Asset, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError, CursorStyle,
+    DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle, FocusMap,
+    ForegroundExecutor, Global, HapticFeedbackStyle, KeyBinding, KeyContext, Keymap, Keystroke,
+    LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
+    PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
+    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
+    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
+    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
+    WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
 
 mod async_context;
-#[cfg(feature = "bench")]
+#[cfg(feature = "bench-support")]
 mod bench_context;
 mod context;
 mod entity_map;
@@ -75,7 +78,8 @@ mod test_context;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 mod visual_test_context;
 
-/// The duration for which futures returned from [Context::on_app_quit] can run before the application fully quits.
+/// The duration for which native applications wait for futures returned from
+/// [Context::on_app_quit] before fully quitting.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
@@ -179,7 +183,7 @@ impl Application {
     pub fn with_platform(platform: Rc<dyn Platform>) -> Self {
         Self(App::new_app(
             platform,
-            Arc::new(()),
+            AssetRegistry::default().into(),
             Arc::new(NullHttpClient),
         ))
     }
@@ -199,12 +203,23 @@ impl Application {
         this
     }
 
+    /// Build every window's accessibility tree every frame, even when no
+    /// assistive technology is connected.
+    ///
+    /// For automation and tree inspection: [`crate::Window::debug_a11y_tree_json`]
+    /// otherwise reports nothing until a screen reader activates the platform
+    /// adapter. [`Application::new_inaccessible`] still wins when both are set.
+    pub fn with_accessibility_forced(self) -> Self {
+        self.0.borrow_mut().accessibility_forced = true;
+        self
+    }
+
     /// Assigns the source of assets for the application.
-    pub fn with_assets(self, asset_source: impl AssetSource) -> Self {
+    pub fn with_assets(self, assets: impl Into<AssetRegistry>) -> Self {
         let mut context_lock = self.0.borrow_mut();
-        let asset_source = Arc::new(asset_source);
-        context_lock.asset_source = asset_source.clone();
-        context_lock.svg_renderer = SvgRenderer::new(asset_source);
+        let asset_registry = Arc::new(assets.into());
+        context_lock.asset_registry = asset_registry.clone();
+        context_lock.svg_renderer = SvgRenderer::new(asset_registry);
         drop(context_lock);
         self
     }
@@ -288,17 +303,13 @@ impl Application {
         ApplicationHandle { app: self.0 }
     }
 
-    /// Register a handler with application access for platform URL-open requests.
+    /// Register a handler to be invoked when the platform instructs the application
+    /// to open one or more URLs.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self
     where
-        F: 'static + FnMut(Vec<String>, &mut App),
+        F: 'static + FnMut(Vec<String>),
     {
-        let this = Rc::downgrade(&self.0);
-        self.0.borrow().platform.on_open_urls(Box::new(move |urls| {
-            if let Some(app) = this.upgrade() {
-                callback(urls, &mut app.borrow_mut());
-            }
-        }));
+        self.0.borrow().platform.on_open_urls(Box::new(callback));
         self
     }
 
@@ -762,7 +773,7 @@ pub struct App {
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
-    asset_source: Arc<dyn AssetSource>,
+    asset_registry: Arc<AssetRegistry>,
     pub(crate) svg_renderer: SvgRenderer,
     http_client: Arc<dyn HttpClient>,
 
@@ -795,6 +806,9 @@ pub struct App {
     /// Whether the app was created by [`Application::new_inaccessible`]. No
     /// accesskit APIs will be called when this flag is set.
     pub(crate) accessibility_force_disabled: bool,
+    /// Whether windows build their accessibility tree every frame without an
+    /// assistive-technology client. See [`Application::with_accessibility_forced`].
+    pub(crate) accessibility_forced: bool,
     flushing_effects: bool,
     pending_updates: usize,
     quit_mode: QuitMode,
@@ -810,7 +824,7 @@ impl App {
     #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new_app(
         platform: Rc<dyn Platform>,
-        asset_source: Arc<dyn AssetSource>,
+        asset_registry: Arc<AssetRegistry>,
         http_client: Arc<dyn HttpClient>,
     ) -> Rc<AppCell> {
         let background_executor = platform.background_executor();
@@ -847,9 +861,9 @@ impl App {
                 foreground_executor,
                 #[cfg(feature = "profiler")]
                 foreground_journal,
-                svg_renderer: SvgRenderer::new(asset_source.clone()),
+                svg_renderer: SvgRenderer::new(asset_registry.clone()),
                 loading_assets: Default::default(),
-                asset_source,
+                asset_registry,
                 http_client,
                 globals_by_type: Default::default(),
                 global_entities: Default::default(),
@@ -896,6 +910,7 @@ impl App {
                 reduce_motion: false,
                 synced_animation_epoch,
                 accessibility_force_disabled: false,
+                accessibility_forced: false,
 
                 #[cfg(any(test, feature = "test-support", debug_assertions))]
                 name: None,
@@ -1002,8 +1017,11 @@ impl App {
         self.entities.assert_no_new_leaks(snapshot)
     }
 
-    /// Quit the application gracefully. Handlers registered with [`Context::on_app_quit`]
-    /// will be given `SHUTDOWN_TIMEOUT` to complete before exiting.
+    /// Quit the application gracefully.
+    ///
+    /// Native applications give handlers registered with [`Context::on_app_quit`]
+    /// [`SHUTDOWN_TIMEOUT`] to complete. WebAssembly runs them asynchronously as best-effort cleanup
+    /// because its event-loop thread cannot block.
     pub fn shutdown(&mut self) {
         let mut futures = Vec::new();
 
@@ -1017,6 +1035,7 @@ impl App {
         self.quitting = true;
 
         let futures = futures::future::join_all(futures);
+        #[cfg(not(target_family = "wasm"))]
         if self
             .foreground_executor
             .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
@@ -1024,6 +1043,8 @@ impl App {
         {
             log::error!("timed out waiting on app_will_quit");
         }
+        #[cfg(target_family = "wasm")]
+        self.foreground_executor.spawn(futures).detach();
 
         self.quitting = false;
     }
@@ -1119,24 +1140,6 @@ impl App {
             self.flushing_effects = false;
         }
         self.pending_updates -= 1;
-    }
-
-    /// Emit an event of the specified type, which can be handled by other entities that have subscribed via `subscribe` methods on their respective contexts.
-    /// A globally-callable equivalent to `Context::emit` without requiring an entity update.
-    pub fn emit<EntityType, EventType>(&mut self, entity: &Entity<EntityType>, event: EventType)
-    where
-        EntityType: EventEmitter<EventType>,
-        EventType: 'static,
-    {
-        let event = self
-            .event_arena
-            .alloc(|| event)
-            .map(|it| it as &mut dyn Any);
-        self.pending_effects.push_back(Effect::Emit {
-            emitter: entity.entity_id(),
-            event_type: TypeId::of::<EventType>(),
-            event,
-        });
     }
 
     /// Arrange a callback to be invoked when the given entity calls `notify` on its respective context.
@@ -1302,7 +1305,6 @@ impl App {
     /// Register additional GPU device requirements (extra features and/or
     /// limits) before opening any windows.  The `Box` must contain a
     /// `gpui_wgpu::WgpuDeviceRequirements`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn set_gpu_requirements(&self, requirements: Box<dyn std::any::Any>) {
         self.platform.set_gpu_requirements(requirements);
     }
@@ -1782,7 +1784,7 @@ impl App {
                     }
                 }
             } else {
-                #[cfg(any(test, feature = "test-support", feature = "bench"))]
+                #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
                 for window in self
                     .windows
                     .values()
@@ -1844,9 +1846,9 @@ impl App {
                 if focus.ref_count.load(SeqCst) == 0 {
                     for window_handle in self.windows() {
                         window_handle
-                            .update(self, |_, window, _| {
+                            .update(self, |_, window, cx| {
                                 if window.focus == Some(handle_id) {
-                                    window.blur();
+                                    window.blur(cx);
                                 }
                             })
                             .unwrap();
@@ -2078,8 +2080,8 @@ impl App {
     }
 
     /// Accessor for the application's asset source, which is provided when constructing the `App`.
-    pub fn asset_source(&self) -> &Arc<dyn AssetSource> {
-        &self.asset_source
+    pub fn assets(&self) -> &Arc<AssetRegistry> {
+        &self.asset_registry
     }
 
     /// Accessor for the text system.
@@ -2189,28 +2191,6 @@ impl App {
 
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type.insert(global_type, lease.global);
-    }
-
-    /// Stores an entity in the app such that it wont be dropped if no other entities are referencing it.
-    /// Entities stored this way are dropped when the app is dropped, unless otherwise removed by [`remove_global_entity`].
-    pub fn insert_global_entity<T: 'static>(&mut self, entity: Entity<T>) {
-        let any = entity.into_any();
-        if !self.global_entities.contains(&any) {
-            self.global_entities.push(any);
-        }
-    }
-
-    /// Removes the entity from global storage. If no other entities are holding reference to it,
-    /// it will be dropped in the very near future.
-    pub fn remove_global_entity<T: 'static>(&mut self, entity: &Entity<T>) {
-        self.global_entities
-            .retain(|any| any.entity_id() != entity.entity_id());
-    }
-
-    /// Returns an iterator of all globally-stored entities which match the provided type.
-    pub fn global_entities<T: 'static>(&self) -> impl Iterator<Item = Entity<T>> {
-        let mut iter = self.global_entities.iter();
-        iter.filter_map(|any| any.clone().downcast::<T>().ok())
     }
 
     pub(crate) fn new_entity_observer(
@@ -2492,10 +2472,7 @@ impl App {
         for window in self.windows() {
             window
                 .update(self, |_, window, cx| {
-                    if window.pending_input_keystrokes().is_some() {
-                        window.clear_pending_keystrokes();
-                        window.pending_input_changed(cx);
-                    }
+                    window.clear_pending_keystrokes(cx);
                 })
                 .ok();
         }
@@ -2623,21 +2600,44 @@ impl App {
         self.active_drag.is_some()
     }
 
+    /// Returns a reference to the current drag payload.
+    pub fn active_drag(&self) -> Option<&AnyDrag> {
+        self.active_drag.as_ref()
+    }
+
     /// Gets the cursor style of the currently active drag operation.
     pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
     }
 
-    /// Stops active drag and clears any related effects.
-    pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
-        if self.active_drag.is_some() {
-            self.active_drag = None;
-            if self.platform_owned_drag.as_ref().is_some_and(|drag| {
-                drag.source_window == window.window_handle().window_id()
-                    && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
-            }) {
+    /// Sets the current drag payload. Its recommended the window be refreshed when this is called.
+    pub fn start_drag(&mut self, drag: AnyDrag) {
+        debug_assert!(self.active_drag.is_none());
+        self.active_drag = Some(drag);
+    }
+
+    /// Takes the current drag payload. Its recommended the window be refreshed when this is called.
+    /// If there is a platform drag interop active, it is canceled.
+    pub fn stop_drag(&mut self, window: &Window) -> Option<Arc<dyn Any>> {
+        let drag = self.active_drag.take();
+        if drag.is_some()
+            && let Some(platform_drag) = self.platform_owned_drag.as_ref()
+        {
+            if platform_drag.source_window == window.window_handle().window_id()
+                && matches!(
+                    &platform_drag.state,
+                    PlatformOwnedDragState::RestoredInSourceWindow
+                )
+            {
                 self.platform_owned_drag = None;
             }
+        }
+        Some(drag?.value)
+    }
+
+    /// Stops active drag and clears any related effects.
+    pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
+        if self.stop_drag(window).is_some() {
             window.refresh();
             true
         } else {
@@ -2784,43 +2784,6 @@ impl App {
         FocusHandle::new(&self.focus_handles)
     }
 
-    /// Tell GPUI that an entity has changed and observers of it should be notified.
-    pub fn notify(&mut self, entity_id: EntityId) {
-        let window_invalidators = mem::take(
-            self.window_invalidators_by_entity
-                .entry(entity_id)
-                .or_default(),
-        );
-
-        // `window_invalidators_by_entity` is monotonic, so an entry alone
-        // doesn't mean the window is currently rendering the entity. Filter
-        // through `tracked_entities` to keep invalidation tight to windows
-        // that actually display this entity right now.
-        let live_invalidators: SmallVec<[WindowInvalidator; 2]> = window_invalidators
-            .iter()
-            .filter(|(window_id, _)| {
-                self.tracked_entities
-                    .get(window_id)
-                    .is_some_and(|set| set.contains(&entity_id))
-            })
-            .map(|(_, invalidator)| invalidator.clone())
-            .collect();
-
-        if live_invalidators.is_empty() {
-            if self.pending_notifications.insert(entity_id) {
-                self.pending_effects
-                    .push_back(Effect::Notify { emitter: entity_id });
-            }
-        } else {
-            for invalidator in &live_invalidators {
-                invalidator.invalidate_view(entity_id, self);
-            }
-        }
-
-        self.window_invalidators_by_entity
-            .insert(entity_id, window_invalidators);
-    }
-
     /// Returns the name for this [`App`].
     #[cfg(any(test, feature = "test-support", debug_assertions))]
     pub fn get_name(&self) -> Option<&'static str> {
@@ -2941,6 +2904,58 @@ impl AppContext for App {
         read(entity, self)
     }
 
+    fn notify(&mut self, entity_id: EntityId) {
+        let window_invalidators = mem::take(
+            self.window_invalidators_by_entity
+                .entry(entity_id)
+                .or_default(),
+        );
+
+        // `window_invalidators_by_entity` is monotonic, so an entry alone
+        // doesn't mean the window is currently rendering the entity. Filter
+        // through `tracked_entities` to keep invalidation tight to windows
+        // that actually display this entity right now.
+        let live_invalidators: SmallVec<[WindowInvalidator; 2]> = window_invalidators
+            .iter()
+            .filter(|(window_id, _)| {
+                self.tracked_entities
+                    .get(window_id)
+                    .is_some_and(|set| set.contains(&entity_id))
+            })
+            .map(|(_, invalidator)| invalidator.clone())
+            .collect();
+
+        if live_invalidators.is_empty() {
+            if self.pending_notifications.insert(entity_id) {
+                self.pending_effects
+                    .push_back(Effect::Notify { emitter: entity_id });
+            }
+        } else {
+            for invalidator in &live_invalidators {
+                invalidator.invalidate_view(entity_id, self);
+            }
+        }
+
+        self.window_invalidators_by_entity
+            .insert(entity_id, window_invalidators);
+    }
+
+    fn emit<EntityType, EventType>(&mut self, entity: &Entity<EntityType>, event: EventType)
+    where
+        EntityType: EventEmitter<EventType>,
+        EventType: 'static,
+    {
+        let event = self
+            .event_arena
+            .alloc(|| event)
+            .map(|it| it as &mut dyn Any);
+        self.pending_effects.push_back(Effect::Emit {
+            emitter: entity.entity_id(),
+            event_type: TypeId::of::<EventType>(),
+            event,
+        });
+    }
+
     fn update_window<T, F>(&mut self, handle: AnyWindowHandle, update: F) -> Result<T>
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> T,
@@ -2992,6 +3007,23 @@ impl AppContext for App {
     {
         let mut g = self.global::<G>();
         callback(g, self)
+    }
+
+    fn insert_global_entity<T: 'static>(&mut self, entity: Entity<T>) {
+        let any = entity.into_any();
+        if !self.global_entities.contains(&any) {
+            self.global_entities.push(any);
+        }
+    }
+
+    fn remove_global_entity<T: 'static>(&mut self, entity: &Entity<T>) {
+        self.global_entities
+            .retain(|any| any.entity_id() != entity.entity_id());
+    }
+
+    fn global_entities<T: 'static>(&self) -> impl Iterator<Item = Entity<T>> {
+        let mut iter = self.global_entities.iter();
+        iter.filter_map(|any| any.clone().downcast::<T>().ok())
     }
 }
 
@@ -3082,6 +3114,44 @@ pub struct AnyDrag {
     /// Resolves the payload to offer the platform if the drag leaves the window.
     /// Invoked at most once per drag gesture, at promotion time.
     pub external_payload_source: Option<ExternalDragPayloadSource>,
+}
+impl AnyDrag {
+    /// Constructs a new drag with a value and view.
+    pub fn new<T: 'static + Sized>(value: T, view: impl Into<AnyView>) -> Self {
+        Self {
+            view: view.into(),
+            value: Arc::new(value),
+            cursor_offset: Point::default(),
+            cursor_style: None,
+            external_payload_source: None,
+        }
+    }
+
+    /// Assigns the offset of the view from the cursor when dragging begins.
+    pub fn offset(mut self, offset: Point<Pixels>) -> Self {
+        self.cursor_offset = offset;
+        self
+    }
+
+    /// Assigns the style of the cursor while dragging is active.
+    pub fn cursor_style(mut self, style: Option<CursorStyle>) -> Self {
+        self.cursor_style = style;
+        self
+    }
+
+    /// Assigns a constructor of an external payload to be called when the drag moves outside of the application window.
+    pub fn external_payload(
+        mut self,
+        predicate: impl FnOnce(&mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+    ) -> Self {
+        self.external_payload_source = Some(Box::new(predicate));
+        self
+    }
+
+    /// Returns true if the type of the internal value matches the provided type.
+    pub fn is_type<T: 'static>(&self) -> bool {
+        self.value.type_id() == TypeId::of::<T>()
+    }
 }
 
 /// Lazily resolves the payload handed to the platform when an internal drag is

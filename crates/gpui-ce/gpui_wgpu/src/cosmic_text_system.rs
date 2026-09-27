@@ -6,7 +6,7 @@ use cosmic_text::{
 };
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun, GlyphId,
-    LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
+    IsZero as _, LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
     SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, point,
     size,
 };
@@ -44,6 +44,7 @@ struct CosmicTextSystemState {
     font_system: FontSystem,
     scratch: ShapeBuffer,
     swash_scale_context: ScaleContext,
+    pending_glyph_images: HashMap<RenderGlyphParams, swash::scale::image::Image>,
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
     loaded_fonts: Vec<LoadedFont>,
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
@@ -90,6 +91,7 @@ impl CosmicTextSystem {
             font_system,
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
+            pending_glyph_images: HashMap::default(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
@@ -106,6 +108,7 @@ impl CosmicTextSystem {
             font_system,
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
+            pending_glyph_images: HashMap::default(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
@@ -276,6 +279,9 @@ impl CosmicTextSystemState {
         for bytes in fonts {
             db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
         }
+        // Missing families and fallback chains may now resolve. Keep old FontIds alive
+        // for already-shaped lines, but reselect families against the updated database.
+        self.font_ids_by_family_cache.clear();
         Ok(())
     }
 
@@ -340,19 +346,8 @@ impl CosmicTextSystemState {
                 .get_font(font_id, cosmic_text::Weight::NORMAL)
                 .context("Could not load font")?;
 
-            // HACK: To let the storybook run and render Windows caption icons. We should actually do better font fallback.
-            let allowed_bad_font_names = [
-                "SegoeFluentIcons", // NOTE: Segoe fluent icons postscript name is inconsistent
-                "Segoe Fluent Icons",
-            ];
-
-            if font.as_swash().charmap().map('m') == 0
-                && !allowed_bad_font_names.contains(&postscript_name.as_str())
-            {
-                self.font_system.db_mut().remove_face(font.id());
-                continue;
-            };
-
+            // Symbol, icon and non-Latin fonts need not contain Latin 'm'. Removing
+            // such faces makes explicitly requested icon fonts disappear on Linux.
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
             self.loaded_fonts.push(LoadedFont {
@@ -385,10 +380,14 @@ impl CosmicTextSystemState {
 
     fn raster_bounds(&mut self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         let image = self.render_glyph_image(params)?;
-        Ok(Bounds {
+        let bounds = Bounds {
             origin: point(image.placement.left.into(), (-image.placement.top).into()),
             size: size(image.placement.width.into(), image.placement.height.into()),
-        })
+        };
+        if !bounds.is_zero() {
+            self.pending_glyph_images.insert(params.clone(), image);
+        }
+        Ok(bounds)
     }
 
     #[profiling::function]
@@ -401,7 +400,10 @@ impl CosmicTextSystemState {
             anyhow::bail!("glyph bounds are empty");
         }
 
-        let mut image = self.render_glyph_image(params)?;
+        let mut image = match self.pending_glyph_images.remove(params) {
+            Some(image) => image,
+            None => self.render_glyph_image(params)?,
+        };
         let bitmap_size = glyph_bounds.size;
         match image.content {
             swash::scale::image::Content::Color | swash::scale::image::Content::SubpixelMask => {
@@ -412,7 +414,12 @@ impl CosmicTextSystemState {
                 Ok((bitmap_size, image.data))
             }
             swash::scale::image::Content::Mask => {
-                if params.subpixel_rendering {
+                if params.is_emoji {
+                    // Color fonts can fall back to an outline (Source::Outline below).
+                    // AtlasKey still selects a four-channel color tile in that case.
+                    let expanded = image.data.iter().flat_map(|&a| [0, 0, 0, a]).collect();
+                    Ok((bitmap_size, expanded))
+                } else if params.subpixel_rendering {
                     // We must always return RGBA data when subpixel rendering is requested.
                     let expanded = image.data.iter().flat_map(|&a| [a, a, a, a]).collect();
                     Ok((bitmap_size, expanded))
@@ -623,6 +630,8 @@ impl CosmicTextSystemState {
                 .letter_spacing
                 .map(|spacing| spacing.as_f32() / font_size.as_f32());
 
+            // build one `Attrs` per slot up front. each clone of span attrs
+            // would otherwise re-allocate the `font_features` Vec.
             let mut primary_attrs =
                 properties.attributes(run.font_id, &properties.primary_family_name);
             if let Some(letter_spacing) = letter_spacing {
@@ -1066,7 +1075,7 @@ mod tests {
     }
 
     const IBM_PLEX: &[u8] =
-        include_bytes!("../../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
 
     /// Every code point of `Bidi_Class=B`, each of which starts a new bidi
     /// paragraph and so can split one line into mixed-direction paragraphs.

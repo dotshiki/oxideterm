@@ -1,7 +1,10 @@
-// OxideTerm modifications: commit child ownership after renderer setup; preserve restored window state.
+use core::mem;
 use std::{
     cell::{Cell, Ref, RefCell, RefMut},
+    collections::BTreeSet,
     ffi::c_void,
+    io::Write,
+    os::fd::AsFd,
     ptr::NonNull,
     rc::Rc,
     sync::Arc,
@@ -9,14 +12,16 @@ use std::{
 
 use calloop::ping::Ping;
 use collections::{FxHashMap, HashMap};
+use filedescriptor::FileDescriptor;
 use futures::channel::oneshot::Receiver;
 
+use image::{ImageBuffer, Rgba, imageops::FilterType};
 use raw_window_handle as rwh;
 use wayland_backend::client::ObjectId;
 use wayland_client::WEnum;
 use wayland_client::{
     Proxy,
-    protocol::{wl_callback, wl_output, wl_seat, wl_surface},
+    protocol::{wl_callback, wl_output, wl_seat, wl_shm, wl_surface},
 };
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
@@ -43,7 +48,7 @@ use gpui::{
     popup::PopupOptions,
     px, size,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRecoveryStatus, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -95,28 +100,6 @@ struct InProgressConfigure {
     tiling: Tiling,
 }
 
-impl InProgressConfigure {
-    fn resolve_size(
-        &mut self,
-        restore_on_open: bool,
-        got_unmaximized: bool,
-        restored_size: Size<Pixels>,
-        inset: Pixels,
-    ) {
-        if self.fullscreen || self.maximized {
-            return;
-        }
-        let tiled = self.tiling.top || self.tiling.bottom || self.tiling.left || self.tiling.right;
-        self.size = if !tiled && (restore_on_open || got_unmaximized) {
-            // The first floating-window configure is a suggestion, not a replacement
-            // for saved application bounds. Tiled windows must obey the compositor.
-            Some(restored_size)
-        } else {
-            compute_outer_size(inset, self.size, self.tiling)
-        };
-    }
-}
-
 pub struct WaylandWindowState {
     surface_state: WaylandSurfaceState,
     parent: Option<WaylandWindowStatePtr>,
@@ -125,6 +108,8 @@ pub struct WaylandWindowState {
     children: FxHashMap<ObjectId, bool>,
     pub surface: wl_surface::WlSurface,
     app_id: Option<String>,
+    title: Option<String>,
+    window_min_size: Option<Size<Pixels>>,
     appearance: WindowAppearance,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
     viewport: Option<wp_viewport::WpViewport>,
@@ -145,6 +130,7 @@ pub struct WaylandWindowState {
     handle: AnyWindowHandle,
     active: bool,
     hovered: bool,
+    visible: bool,
     redraw_requested: bool,
     presentation: PresentationState,
     pending_frame_callback: Option<wl_callback::WlCallback>,
@@ -154,6 +140,8 @@ pub struct WaylandWindowState {
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    icon: Option<Arc<ImageBuffer<Rgba<u8>, Vec<u8>>>>,
+    generated_icons: Vec<FileDescriptor>,
 }
 
 pub enum WaylandSurfaceState {
@@ -254,6 +242,10 @@ impl WaylandSurfaceState {
                 xdg_popup.grab(&seat, serial);
             }
 
+            // Non-blocking: the parent keeps its input so it can dismiss the popup on
+            // clicks in its own window.
+            parent.add_child(surface.id(), false);
+
             return Ok(WaylandSurfaceState::Popup(WaylandPopupSurfaceState {
                 xdg_surface,
                 xdg_popup,
@@ -280,6 +272,10 @@ impl WaylandSurfaceState {
                 xdg_dialog.set_modal();
                 xdg_dialog
             });
+
+            if let Some(parent) = parent.as_ref() {
+                parent.add_child(surface.id(), true);
+            }
 
             dialog
         } else {
@@ -599,9 +595,15 @@ impl WaylandWindowState {
             )?
         };
 
+        let title = options
+            .titlebar
+            .as_ref()
+            .and_then(|titlebar| titlebar.title.as_ref())
+            .map(ToString::to_string);
+
         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {
-            if let Some(title) = options.titlebar.and_then(|titlebar| titlebar.title) {
-                xdg_state.toplevel.set_title(title.to_string());
+            if let Some(title) = title.as_ref() {
+                xdg_state.toplevel.set_title(title.clone());
             }
 
             if let Some(app_id) = options.app_id.as_ref() {
@@ -622,6 +624,10 @@ impl WaylandWindowState {
             children: FxHashMap::default(),
             surface,
             app_id: options.app_id,
+            title,
+            window_min_size: options.window_min_size,
+            icon: options.icon,
+            generated_icons: Vec::default(),
             blur: None,
             viewport,
             globals,
@@ -644,6 +650,7 @@ impl WaylandWindowState {
             handle,
             active: false,
             hovered: false,
+            visible: options.show,
             redraw_requested: false,
             presentation: PresentationState::Unpresented,
             pending_frame_callback: None,
@@ -657,6 +664,40 @@ impl WaylandWindowState {
     pub fn is_transparent(&self) -> bool {
         self.decorations == WindowDecorations::Client
             || self.background_appearance != WindowBackgroundAppearance::Opaque
+    }
+
+    fn prepare_to_map(&self) {
+        let WaylandSurfaceState::Xdg(xdg_state) = &self.surface_state else {
+            return;
+        };
+
+        if let Some(title) = self.title.as_ref() {
+            xdg_state.toplevel.set_title(title.clone());
+        }
+        if let Some(app_id) = self.app_id.as_ref() {
+            xdg_state.toplevel.set_app_id(app_id.clone());
+        }
+        if let Some(size) = self.window_min_size {
+            xdg_state
+                .toplevel
+                .set_min_size(f32::from(size.width) as i32, f32::from(size.height) as i32);
+        }
+
+        let max_texture_size = self.renderer.max_texture_size() as i32;
+        xdg_state
+            .toplevel
+            .set_max_size(max_texture_size, max_texture_size);
+
+        if let Some(parent) = self.parent.as_ref() {
+            let parent_toplevel = parent.toplevel();
+            xdg_state.toplevel.set_parent(parent_toplevel.as_ref());
+        }
+
+        if self.fullscreen {
+            xdg_state.toplevel.set_fullscreen(None);
+        } else if self.maximized {
+            xdg_state.toplevel.set_maximized();
+        }
     }
 
     fn update_subpixel_layout(&mut self) {
@@ -719,69 +760,8 @@ impl PresentationState {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{InProgressConfigure, PresentationState};
-    use gpui::{Tiling, px, size};
-
-    #[test]
-    fn floating_configure_restores_saved_size_only_on_open_or_unmaximize() {
-        let restored = size(px(1100.0), px(720.0));
-        let suggested = size(px(800.0), px(600.0));
-        for (initial, unmaximized, suggestion, expected) in [
-            (true, false, Some(suggested), Some(restored)),
-            (true, false, None, Some(restored)),
-            (false, true, Some(suggested), Some(restored)),
-            (
-                false,
-                false,
-                Some(suggested),
-                Some(size(px(820.0), px(620.0))),
-            ),
-            (false, false, None, None),
-        ] {
-            let mut configure = InProgressConfigure {
-                size: suggestion,
-                fullscreen: false,
-                maximized: false,
-                resizing: false,
-                tiling: Tiling::default(),
-            };
-            configure.resolve_size(initial, unmaximized, restored, px(10.0));
-            assert_eq!(
-                configure.size, expected,
-                "initial={initial}, unmaximized={unmaximized}"
-            );
-        }
-    }
-
-    #[test]
-    fn constrained_configure_keeps_compositor_size() {
-        for (fullscreen, maximized, tiling, expected) in [
-            (true, false, Tiling::default(), size(px(800.0), px(600.0))),
-            (false, true, Tiling::default(), size(px(800.0), px(600.0))),
-            (
-                false,
-                false,
-                Tiling {
-                    top: true,
-                    left: true,
-                    bottom: true,
-                    right: false,
-                },
-                size(px(810.0), px(600.0)),
-            ),
-        ] {
-            let mut configure = InProgressConfigure {
-                size: Some(size(px(800.0), px(600.0))),
-                fullscreen,
-                maximized,
-                resizing: false,
-                tiling,
-            };
-            configure.resolve_size(true, false, size(px(1100.0), px(720.0)), px(10.0));
-            assert_eq!(configure.size, Some(expected));
-        }
-    }
+mod presentation_state_tests {
+    use super::PresentationState;
 
     #[test]
     fn failure_tracks_whether_the_surface_has_presented() {
@@ -906,12 +886,6 @@ impl WaylandWindow {
         popup_grab: Option<(u32, wl_seat::WlSeat)>,
         target_output: Option<wl_output::WlOutput>,
     ) -> anyhow::Result<(Self, ObjectId)> {
-        let child_blocks_parent = match &params.kind {
-            WindowKind::AnchoredPopup(_) => Some(false),
-            WindowKind::Dialog => Some(true),
-            _ => None,
-        };
-        let child_parent = parent.clone();
         let surface = globals.compositor.create_surface(&globals.qh, ());
         let surface_state = WaylandSurfaceState::new(
             &surface,
@@ -932,34 +906,31 @@ impl WaylandWindow {
             .map(|viewporter| viewporter.get_viewport(&surface, &globals.qh, ()));
 
         let frame_ping = globals.frame_ping.clone();
-        let state = WaylandWindowState::new(
-            handle,
-            surface.clone(),
-            surface_state,
-            appearance,
-            viewport,
-            client,
-            globals,
-            gpu_context,
-            compositor_gpu,
-            gpu_requirements,
-            params,
-            parent,
-        )?;
-        if let (Some(parent), Some(blocking)) = (child_parent, child_blocks_parent) {
-            // No fallible setup remains after this point, so a failed renderer cannot strand a
-            // blocking dialog or stale popup in the parent's ownership registry.
-            parent.add_child(surface.id(), blocking);
-        }
         let this = Self(WaylandWindowStatePtr {
-            state: Rc::new(RefCell::new(state)),
+            state: Rc::new(RefCell::new(WaylandWindowState::new(
+                handle,
+                surface.clone(),
+                surface_state,
+                appearance,
+                viewport,
+                client,
+                globals,
+                gpu_context,
+                compositor_gpu,
+                gpu_requirements,
+                params,
+                parent,
+            )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
             frame_loop: Rc::new(Cell::new(FrameLoop::Unconfigured)),
             frame_ping,
         });
 
-        // Kick things off
-        surface.commit();
+        // An initial empty commit asks the compositor to configure the surface. If the caller
+        // requested a hidden window, defer that commit until the window is shown.
+        if this.borrow().visible {
+            surface.commit();
+        }
 
         Ok((this, surface.id()))
     }
@@ -1042,7 +1013,8 @@ impl WaylandWindowStatePtr {
         let mut state = self.state.borrow_mut();
 
         let frame_loop = self.frame_loop.get();
-        if frame_loop == FrameLoop::AwaitingCallback {
+        // Hiding during a frame resets the loop; wait for a new configure before retrying.
+        if frame_loop == FrameLoop::Unconfigured || frame_loop == FrameLoop::AwaitingCallback {
             return;
         }
 
@@ -1155,8 +1127,6 @@ impl WaylandWindowStatePtr {
 
     pub fn handle_xdg_surface_event(&self, event: xdg_surface::Event) {
         if let xdg_surface::Event::Configure { serial } = event {
-            let initial_configure = self.frame_loop.get() == FrameLoop::Unconfigured;
-            let mut window_state_changed = false;
             {
                 let mut state = self.state.borrow_mut();
                 if let Some(window_controls) = state.in_progress_window_controls.take() {
@@ -1174,38 +1144,28 @@ impl WaylandWindowStatePtr {
 
                 if let Some(mut configure) = state.in_progress_configure.take() {
                     let got_unmaximized = state.maximized && !configure.maximized;
-                    window_state_changed = state.fullscreen != configure.fullscreen
-                        || state.maximized != configure.maximized;
                     state.fullscreen = configure.fullscreen;
                     state.maximized = configure.maximized;
                     state.tiling = configure.tiling;
                     // Limit interactive resizes to once per vblank
                     if configure.resizing && state.resize_throttle {
                         state.surface_state.ack_configure(serial);
-                        drop(state);
-                        if window_state_changed {
-                            self.notify_window_state_changed();
-                        }
                         return;
                     } else if configure.resizing {
                         state.resize_throttle = true;
                     }
-                    configure.resolve_size(
-                        // Popup and layer-shell sizes are compositor constraints.
-                        initial_configure
-                            && matches!(&state.surface_state, WaylandSurfaceState::Xdg(_)),
-                        got_unmaximized,
-                        state.window_bounds.size,
-                        state.inset(),
-                    );
-                    if !configure.fullscreen
-                        && !configure.maximized
-                        && let Some(size) = configure.size
-                    {
-                        state.window_bounds = Bounds {
-                            origin: Point::default(),
-                            size,
+                    if !configure.fullscreen && !configure.maximized {
+                        configure.size = if got_unmaximized {
+                            Some(state.window_bounds.size)
+                        } else {
+                            compute_outer_size(state.inset(), configure.size, state.tiling)
                         };
+                        if let Some(size) = configure.size {
+                            state.window_bounds = Bounds {
+                                origin: Point::default(),
+                                size,
+                            };
+                        }
                     }
                     drop(state);
                     if let Some(size) = configure.size {
@@ -1231,25 +1191,16 @@ impl WaylandWindowStatePtr {
                 window_geometry.size.height,
             );
 
+            let initial_configure = self.frame_loop.get() == FrameLoop::Unconfigured;
+            let visible = state.visible;
             drop(state);
-            if initial_configure {
+            if !visible {
+                return;
+            } else if initial_configure {
                 self.frame();
             } else {
                 self.request_redraw();
             }
-            if window_state_changed {
-                self.notify_window_state_changed();
-            }
-        }
-    }
-
-    fn notify_window_state_changed(&self) {
-        // GPUI's bounds observer uses this callback for state-only changes too.
-        // Release both RefCells before calling back into application code.
-        let callback = self.callbacks.borrow_mut().moved.take();
-        if let Some(mut callback) = callback {
-            callback();
-            self.callbacks.borrow_mut().moved = Some(callback);
         }
     }
 
@@ -1698,6 +1649,87 @@ impl WaylandWindowStatePtr {
     pub fn primary_output_scale(&self) -> i32 {
         self.state.borrow_mut().primary_output_scale()
     }
+
+    pub fn regenerate_icons(&self, icon_sizes: &BTreeSet<i32>) {
+        let mut state = self.state.borrow_mut();
+        let state = &mut *state;
+
+        let Some(icon) = &state.icon else { return };
+        let Some(icon_manager) = &state.globals.icon_manager else {
+            return;
+        };
+
+        let squared = {
+            let (width, height) = icon.dimensions();
+            let size = width.max(height);
+
+            let mut image = ImageBuffer::from_pixel(size, size, Rgba([0u8, 0, 0, 0]));
+
+            image::imageops::overlay(
+                &mut image,
+                icon.as_ref(),
+                (size - width) as i64 / 2,
+                (size - height) as i64 / 2,
+            );
+
+            image
+        };
+
+        let icons: Vec<_> = icon_sizes
+            .iter()
+            .copied()
+            .filter_map(|size| {
+                let mem = memfd::MemfdOptions::new()
+                    .allow_sealing(true)
+                    .create(format!("icon-{size}x{size}"))
+                    .ok()?;
+
+                let buffer_len = size * size * mem::size_of::<Rgba<u8>>() as i32;
+                mem.as_file()
+                    .set_len(u64::try_from(buffer_len).ok()?)
+                    .ok()?;
+
+                let mut fd = FileDescriptor::new(mem);
+
+                let pool =
+                    state
+                        .globals
+                        .shm
+                        .create_pool(fd.as_fd(), buffer_len, &state.globals.qh, ());
+
+                let buffer = pool.create_buffer(
+                    0,
+                    size,
+                    size,
+                    size * 4,
+                    wl_shm::Format::Argb8888,
+                    &state.globals.qh,
+                    (),
+                );
+
+                let image = image::imageops::resize(
+                    &squared,
+                    size as u32,
+                    size as u32,
+                    FilterType::CatmullRom,
+                )
+                .into_raw_bgra();
+
+                fd.write_all(&image).unwrap();
+
+                Some((buffer, fd))
+            })
+            .collect();
+
+        let icon = icon_manager.create_icon(&state.globals.qh, ());
+        icon.set_name(state.app_id.clone().unwrap_or_default());
+        state.generated_icons = Vec::new();
+        for (ref buffer, fd) in icons {
+            icon.add_buffer(buffer, 1);
+            state.generated_icons.push(fd)
+        }
+        icon_manager.set_icon(state.surface_state.toplevel().unwrap(), Some(&icon));
+    }
 }
 
 fn extract_states<'a, S: TryFrom<u32> + 'a>(states: &'a [u8]) -> impl Iterator<Item = S> + 'a
@@ -1745,11 +1777,6 @@ impl PlatformWindow for WaylandWindow {
 
     fn is_maximized(&self) -> bool {
         self.borrow().maximized
-    }
-
-    fn is_minimized(&self) -> bool {
-        // xdg-shell does not report compositor-owned minimized state to clients.
-        false
     }
 
     fn window_bounds(&self) -> WindowBounds {
@@ -1845,8 +1872,6 @@ impl PlatformWindow for WaylandWindow {
                 id: id.clone(),
                 name: display.name.clone(),
                 bounds: display.bounds.to_pixels(state.scale),
-                physical_bounds: display.bounds,
-                scale_factor: state.scale,
             }) as Rc<dyn PlatformDisplay>
         })
     }
@@ -1914,7 +1939,9 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn set_title(&mut self, title: &str) {
-        if let Some(toplevel) = self.borrow().surface_state.toplevel() {
+        let mut state = self.borrow_mut();
+        state.title = Some(title.to_owned());
+        if let Some(toplevel) = state.surface_state.toplevel() {
             toplevel.set_title(title.to_string());
         }
     }
@@ -1939,6 +1966,29 @@ impl PlatformWindow for WaylandWindow {
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.borrow().background_appearance
+    }
+
+    fn set_visible(&self, visible: bool) {
+        let mut state = self.borrow_mut();
+        if state.visible == visible {
+            return;
+        }
+
+        state.visible = visible;
+        if visible {
+            // Remapping an xdg surface starts with an empty commit and a fresh configure cycle.
+            state.prepare_to_map();
+            state.surface.commit();
+        } else {
+            // Attaching a null buffer unmaps an xdg surface without destroying its role objects.
+            // The next map must wait for a new configure before presenting another buffer.
+            state.pending_frame_callback.take();
+            state.surface.attach(None, 0, 0);
+            state.surface.commit();
+            state.presentation = PresentationState::Unpresented;
+            state.redraw_requested = true;
+            self.0.frame_loop.set(FrameLoop::Unconfigured);
+        }
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -2029,6 +2079,12 @@ impl PlatformWindow for WaylandWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
 
+        if !state.visible {
+            state.redraw_requested = true;
+            self.0.frame_loop.set(FrameLoop::Unconfigured);
+            return;
+        }
+
         if state.renderer.device_lost() {
             let raw_window = RawWindow {
                 window: state.surface.id().as_ptr().cast::<std::ffi::c_void>(),
@@ -2040,18 +2096,14 @@ impl PlatformWindow for WaylandWindow {
                     .display_ptr()
                     .cast::<std::ffi::c_void>(),
             };
-            state.redraw_requested = match state.renderer.recover(&raw_window) {
-                Ok(WgpuRecoveryStatus::Recovered | WgpuRecoveryStatus::Deferred) => true,
-                Ok(WgpuRecoveryStatus::Failed) => {
-                    // A terminal recovery result must not keep the compositor frame loop busy.
-                    log::error!("GPU recovery exhausted; restart OxideTerm to restore rendering");
-                    false
-                }
+            match state.renderer.recover(&raw_window) {
+                Ok(()) => {}
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");
-                    true
                 }
-            };
+            }
+
+            state.redraw_requested = true;
             return;
         }
 
@@ -2236,6 +2288,13 @@ impl PlatformWindow for WaylandWindow {
     fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
         let (device, queue) = self.borrow().renderer.gpu_context();
         Some(Box::new((device, queue)))
+    }
+
+    fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
+        self.borrow()
+            .renderer
+            .gpu_context_info()
+            .map(|context| Box::new(context) as Box<dyn std::any::Any>)
     }
 
     fn gpu_device_lost(&self) -> Option<bool> {

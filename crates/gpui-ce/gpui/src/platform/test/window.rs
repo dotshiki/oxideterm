@@ -2,13 +2,13 @@ use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputConfiguration,
+    TextInputStateChange, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowParams,
 };
-#[cfg(test)]
-use crate::{DynamicTextureId, DynamicTextureParams};
 use collections::HashMap;
 use gpui_util::ResultExt as _;
+#[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -43,6 +43,9 @@ pub(crate) struct TestWindowState {
     frame_scheduled: bool,
     frame_callback_pending: bool,
     input_handler: Option<PlatformInputHandler>,
+    text_input_configurations: Vec<TextInputConfiguration>,
+    text_input_state_changes: Vec<TextInputStateChange>,
+    visible: bool,
     is_fullscreen: bool,
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
@@ -105,6 +108,9 @@ impl TestWindow {
             frame_scheduled: false,
             frame_callback_pending: false,
             input_handler: None,
+            text_input_configurations: Vec::new(),
+            text_input_state_changes: Vec::new(),
+            visible: params.show,
             is_fullscreen: false,
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
@@ -132,6 +138,20 @@ impl TestWindow {
 
     pub fn frame_scheduled(&self) -> bool {
         self.0.lock().frame_scheduled
+    }
+
+    /// Returns whether this test window is visible.
+    pub fn is_visible(&self) -> bool {
+        self.0.lock().visible
+    }
+
+    /// Every [`TextInputConfiguration`] forwarded to this window, in order.
+    pub fn text_input_configurations(&self) -> Vec<TextInputConfiguration> {
+        self.0.lock().text_input_configurations.clone()
+    }
+
+    pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
+        self.0.lock().text_input_state_changes.clone()
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
@@ -259,6 +279,14 @@ impl PlatformWindow for TestWindow {
         self.0.lock().input_handler.take()
     }
 
+    fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
+        self.0.lock().text_input_configurations.push(configuration);
+    }
+
+    fn text_input_state_changed(&self, change: TextInputStateChange) {
+        self.0.lock().text_input_state_changes.push(change);
+    }
+
     fn prompt(
         &self,
         _level: crate::PromptLevel,
@@ -308,6 +336,10 @@ impl PlatformWindow for TestWindow {
     fn set_app_id(&mut self, _app_id: &str) {}
 
     fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
+
+    fn set_visible(&self, visible: bool) {
+        self.0.lock().visible = visible;
+    }
 
     fn set_edited(&mut self, edited: bool) {
         self.0.lock().edited = edited;
@@ -462,15 +494,6 @@ impl PlatformWindow for TestWindow {
 pub(crate) struct TestAtlasState {
     next_id: u32,
     tiles: HashMap<AtlasKey, AtlasTile>,
-    updates: Vec<TestAtlasUpdate>,
-    resource_generation: u64,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct TestAtlasUpdate {
-    key: AtlasKey,
-    bounds: Bounds<DevicePixels>,
-    bytes: Vec<u8>,
 }
 
 pub(crate) struct TestAtlas(Mutex<TestAtlasState>);
@@ -480,8 +503,6 @@ impl TestAtlas {
         TestAtlas(Mutex::new(TestAtlasState {
             next_id: 0,
             tiles: HashMap::default(),
-            updates: Vec::new(),
-            resource_generation: 0,
         }))
     }
 }
@@ -515,7 +536,7 @@ impl PlatformAtlas for TestAtlas {
             crate::AtlasTile {
                 texture_id: AtlasTextureId {
                     index: texture_id,
-                    kind: key.texture_kind(),
+                    kind: crate::AtlasTextureKind::Monochrome,
                 },
                 tile_id: TileId(tile_id),
                 padding: 0,
@@ -529,96 +550,12 @@ impl PlatformAtlas for TestAtlas {
         Ok(Some(state.tiles[key]))
     }
 
-    fn update(
-        &self,
-        key: &AtlasKey,
-        bounds: Bounds<DevicePixels>,
-        bytes: &[u8],
-    ) -> anyhow::Result<()> {
-        let mut state = self.0.lock();
-        if state.tiles.contains_key(key) {
-            state.updates.push(TestAtlasUpdate {
-                key: key.clone(),
-                bounds,
-                bytes: bytes.to_vec(),
-            });
-        }
-        Ok(())
-    }
-
-    fn resource_generation(&self) -> u64 {
-        self.0.lock().resource_generation
-    }
-
     fn remove(&self, key: &AtlasKey) {
         let mut state = self.0.lock();
         state.tiles.remove(key);
-        state.updates.retain(|update| &update.key != key);
     }
 
     fn contains(&self, key: &AtlasKey) -> bool {
         self.0.lock().tiles.contains_key(key)
-    }
-}
-
-#[cfg(test)]
-mod oxideterm_dynamic_texture_tests {
-    use super::*;
-    use std::borrow::Cow;
-
-    #[test]
-    fn test_atlas_records_dynamic_texture_updates_and_generation() {
-        let atlas = TestAtlas::new();
-        let key = AtlasKey::DynamicTexture(DynamicTextureParams {
-            texture_id: DynamicTextureId(11),
-        });
-        let texture_size = Size {
-            width: DevicePixels(4),
-            height: DevicePixels(3),
-        };
-        let mut build = || Ok(Some((texture_size, Cow::Owned(vec![0; 48]))));
-        let tile = atlas.get_or_insert_with(&key, &mut build).unwrap().unwrap();
-        let update_bounds = Bounds {
-            origin: Point {
-                x: DevicePixels(1),
-                y: DevicePixels(1),
-            },
-            size: Size {
-                width: DevicePixels(2),
-                height: DevicePixels(1),
-            },
-        };
-        let update_bytes = vec![7; 8];
-
-        atlas.update(&key, update_bounds, &update_bytes).unwrap();
-        atlas.0.lock().resource_generation = 3;
-
-        let state = atlas.0.lock();
-        assert_eq!(tile.texture_id.kind, crate::AtlasTextureKind::Polychrome);
-        assert_eq!(state.updates.len(), 1);
-        assert!(state.updates[0].key == key);
-        assert_eq!(state.updates[0].bounds, update_bounds);
-        assert_eq!(state.updates[0].bytes, update_bytes);
-        drop(state);
-        assert_eq!(atlas.resource_generation(), 3);
-    }
-
-    #[test]
-    fn test_atlas_ignores_updates_for_missing_entries() {
-        let atlas = TestAtlas::new();
-        let key = AtlasKey::DynamicTexture(DynamicTextureParams {
-            texture_id: DynamicTextureId(12),
-        });
-        let bounds = Bounds {
-            origin: Point::default(),
-            size: Size {
-                width: DevicePixels(1),
-                height: DevicePixels(1),
-            },
-        };
-
-        atlas.update(&key, bounds, &[0; 4]).unwrap();
-
-        assert!(atlas.0.lock().updates.is_empty());
     }
 }

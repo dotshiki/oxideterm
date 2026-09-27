@@ -1,5 +1,4 @@
 use anyhow::anyhow;
-use cocoa::appkit::CGFloat;
 use collections::{HashMap, HashSet};
 use core_foundation::{
     array::{CFArray, CFArrayRef},
@@ -8,6 +7,7 @@ use core_foundation::{
     number::CFNumber,
     string::CFString,
 };
+use core_graphics::base::CGFloat;
 use core_graphics::{
     base::{CGGlyph, kCGImageAlphaPremultipliedLast},
     color_space::CGColorSpace,
@@ -363,7 +363,7 @@ impl MacTextSystemState {
             // `font_ids_by_postscript_name` would skip every already-registered
             // font and leave the second call's `font_ids` empty.
             if !postscript_names_seen.insert(postscript_name.clone()) {
-                log::debug!(
+                log::warn!(
                     "skipping duplicate font {:?} with PostScript name {:?} \
                      in family {:?}",
                     font.full_name(),

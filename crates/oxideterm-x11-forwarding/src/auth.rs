@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRngCore, rngs::OsRng};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -52,7 +52,7 @@ impl X11AuthCookie {
         // infallible for callers that mirror OpenSSH's fake-cookie generation.
         let len = len.max(1);
         let mut bytes = vec![0u8; len];
-        OsRng.fill_bytes(&mut bytes);
+        OsRng.try_fill_bytes(&mut bytes).expect("OS CSPRNG must be available");
         Self {
             bytes: Zeroizing::new(bytes),
         }

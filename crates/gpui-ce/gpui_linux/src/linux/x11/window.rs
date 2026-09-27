@@ -1,4 +1,3 @@
-// OxideTerm modification: modal parent ownership is registered only after window setup succeeds.
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
@@ -10,7 +9,7 @@ use gpui::{
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRecoveryStatus, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
 use collections::FxHashSet;
 use gpui_util::{ResultExt, maybe};
@@ -276,6 +275,7 @@ pub struct X11WindowState {
     background_appearance: WindowBackgroundAppearance,
     maximized_vertical: bool,
     maximized_horizontal: bool,
+    visible: bool,
     hidden: bool,
     active: bool,
     hovered: bool,
@@ -637,6 +637,8 @@ impl X11WindowState {
             let parent = if params.kind == WindowKind::Dialog
                 && let Some(parent) = parent_window
             {
+                parent.add_child(x_window);
+
                 Some(parent)
             } else {
                 None
@@ -838,6 +840,7 @@ impl X11WindowState {
                 fullscreen: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
+                visible: params.show,
                 hidden: false,
                 appearance,
                 handle,
@@ -859,14 +862,6 @@ impl X11WindowState {
                 xcb.destroy_window(x_window),
             )?;
             xcb_flush(xcb);
-        }
-
-        if let Ok(state) = &setup_result
-            && let Some(parent) = state.parent.as_ref()
-        {
-            // Registration is deliberately last: setup failures must not leave the parent blocked
-            // by a child window that was already destroyed.
-            parent.add_child(x_window);
         }
 
         setup_result
@@ -1389,10 +1384,6 @@ impl PlatformWindow for X11Window {
         !state.hidden && state.maximized_vertical && state.maximized_horizontal
     }
 
-    fn is_minimized(&self) -> bool {
-        self.0.state.borrow().hidden
-    }
-
     fn window_bounds(&self) -> WindowBounds {
         let state = self.0.state.borrow();
         if self.is_maximized() {
@@ -1588,10 +1579,11 @@ impl PlatformWindow for X11Window {
     }
 
     fn set_app_id(&mut self, app_id: &str) {
-        let mut data = Vec::with_capacity(app_id.len() * 2 + 1);
+        let mut data = Vec::with_capacity(app_id.len() * 2 + 2);
         data.extend(app_id.bytes()); // instance https://unix.stackexchange.com/a/494170
         data.push(b'\0');
         data.extend(app_id.bytes()); // class
+        data.push(b'\0');
 
         check_reply(
             || "X11 ChangeProperty8 for WM_CLASS failed.",
@@ -1607,10 +1599,12 @@ impl PlatformWindow for X11Window {
     }
 
     fn map_window(&mut self) -> anyhow::Result<()> {
-        check_reply(
-            || "X11 MapWindow failed.",
-            self.0.xcb.map_window(self.0.x_window),
-        )?;
+        if self.0.state.borrow().visible {
+            check_reply(
+                || "X11 MapWindow failed.",
+                self.0.xcb.map_window(self.0.x_window),
+            )?;
+        }
         Ok(())
     }
 
@@ -1623,6 +1617,33 @@ impl PlatformWindow for X11Window {
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.0.state.borrow().background_appearance
+    }
+
+    fn set_visible(&self, visible: bool) {
+        let mut state = self.0.state.borrow_mut();
+        if state.visible == visible {
+            return;
+        }
+        state.visible = visible;
+        drop(state);
+
+        let result = if visible {
+            self.0.xcb.map_window(self.0.x_window)
+        } else {
+            self.0.xcb.unmap_window(self.0.x_window)
+        };
+        check_reply(
+            || {
+                if visible {
+                    "X11 MapWindow failed."
+                } else {
+                    "X11 UnmapWindow failed."
+                }
+            },
+            result,
+        )
+        .log_err();
+        xcb_flush(&self.0.xcb);
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -1745,18 +1766,14 @@ impl PlatformWindow for X11Window {
                 window_id: self.0.x_window,
                 visual_id: inner.visual_id,
             };
-            inner.force_render_after_recovery = match inner.renderer.recover(&raw_window) {
-                Ok(WgpuRecoveryStatus::Recovered | WgpuRecoveryStatus::Deferred) => true,
-                Ok(WgpuRecoveryStatus::Failed) => {
-                    // A terminal recovery result must not keep the X11 frame loop busy.
-                    log::error!("GPU recovery exhausted; restart OxideTerm to restore rendering");
-                    false
-                }
+            match inner.renderer.recover(&raw_window) {
+                Ok(()) => {}
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");
-                    true
                 }
-            };
+            }
+
+            inner.force_render_after_recovery = true;
             return;
         }
 
@@ -1964,6 +1981,15 @@ impl PlatformWindow for X11Window {
     fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
         let (device, queue) = self.0.state.borrow().renderer.gpu_context();
         Some(Box::new((device, queue)))
+    }
+
+    fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
+        self.0
+            .state
+            .borrow()
+            .renderer
+            .gpu_context_info()
+            .map(|context| Box::new(context) as Box<dyn std::any::Any>)
     }
 
     fn gpu_device_lost(&self) -> Option<bool> {

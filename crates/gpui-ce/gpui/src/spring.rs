@@ -431,9 +431,9 @@ impl Interpolate for Rems {
 impl Interpolate for Rgba {
     fn interpolate(from: Self, to: Self, phase: f32) -> Self {
         Self::new(
-            f32::interpolate(from.red, to.red, phase),
-            f32::interpolate(from.green, to.green, phase),
-            f32::interpolate(from.blue, to.blue, phase),
+            f32::interpolate(from.color.red, to.color.red, phase),
+            f32::interpolate(from.color.green, to.color.green, phase),
+            f32::interpolate(from.color.blue, to.color.blue, phase),
             f32::interpolate(from.alpha, to.alpha, phase),
         )
     }
@@ -441,13 +441,14 @@ impl Interpolate for Rgba {
 
 impl Interpolate for Hsla {
     fn interpolate(from: Self, to: Self, phase: f32) -> Self {
-        let from_hue = from.hue.into_degrees() / 360.0;
-        let to_hue = to.hue.into_degrees() / 360.0;
-        let hue_delta = (to_hue - from_hue + 0.5).rem_euclid(1.0) - 0.5;
-        crate::hsla(
-            (from_hue + hue_delta * phase).rem_euclid(1.0),
-            f32::interpolate(from.saturation, to.saturation, phase),
-            f32::interpolate(from.lightness, to.lightness, phase),
+        use palette::RgbHue;
+        let from_h = from.color.hue.into_degrees() / 360.0;
+        let to_h = to.color.hue.into_degrees() / 360.0;
+        let hue_delta = (to_h - from_h + 0.5).rem_euclid(1.0) - 0.5;
+        Self::new(
+            RgbHue::from_degrees((from_h + hue_delta * phase).rem_euclid(1.0) * 360.0),
+            f32::interpolate(from.color.saturation, to.color.saturation, phase),
+            f32::interpolate(from.color.lightness, to.color.lightness, phase),
             f32::interpolate(from.alpha, to.alpha, phase),
         )
     }
@@ -651,10 +652,10 @@ mod tests {
         let to = crate::hsla(0.1, 1.0, 0.75, 0.5);
         let result = AnimationPhase(0.5).interpolate(from, to);
 
-        let hue = result.hue.into_positive_degrees() / 360.0;
-        assert!(hue < EPSILON || (1.0 - hue) < EPSILON);
-        assert!((result.saturation - 0.75).abs() < EPSILON);
-        assert!((result.lightness - 0.625).abs() < EPSILON);
+        let h = result.color.hue.into_degrees() / 360.0;
+        assert!(h < EPSILON || (1.0 - h) < EPSILON);
+        assert!((result.color.saturation - 0.75).abs() < EPSILON);
+        assert!((result.color.lightness - 0.625).abs() < EPSILON);
         assert!((result.alpha - 0.75).abs() < EPSILON);
     }
 

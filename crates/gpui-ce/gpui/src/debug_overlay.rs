@@ -3,8 +3,8 @@
 //! infinitely triggering new frames).
 
 use crate::{
-    BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, IntoColor, Pixels, Quad, ScaledPixels,
-    Scene, Size, point, rgba, size, transparent_black,
+    BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Pixels, Quad, ScaledPixels, Scene,
+    Size, point, rgb_to_hsla, rgba, size, transparent_black,
 };
 use std::{collections::VecDeque, time::Duration};
 
@@ -44,11 +44,11 @@ const PANEL_MARGIN: f32 = 4.0;
 const CELL_SIZE: f32 = 2.0;
 
 fn text_color() -> Hsla {
-    rgba(0x33ff33ff).into_color()
+    rgb_to_hsla(rgba(0x33ff33ff))
 }
 
 fn panel_color() -> Hsla {
-    rgba(0x000000aa).into_color()
+    rgb_to_hsla(rgba(0x000000aa))
 }
 
 pub(crate) struct DebugFrameOverlay {

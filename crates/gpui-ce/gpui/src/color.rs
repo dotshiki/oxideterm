@@ -1,10 +1,10 @@
-use palette::{OklabHue, Oklcha, RgbHue};
+use palette::{IntoColor, OklabHue, Oklcha, RgbHue};
 use schemars::{JsonSchema, json_schema};
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 
 // Re-exported for api maintenance
-pub use palette::{Hsla, IntoColor, WithAlpha, rgb::Rgba};
+pub use palette::{Hsla, rgb::Rgba};
 
 /// Convert an RGB hex color code number to a color type
 pub fn rgb(hex: u32) -> Rgba {
@@ -19,6 +19,19 @@ pub fn rgb(hex: u32) -> Rgba {
 pub fn rgba(hex: u32) -> Rgba {
     let [r, g, b, a] = hex.to_be_bytes().map(|b| (b as f32) / 255.0);
     Rgba::new(r, g, b, a)
+}
+
+/// Convert an sRGB color to GPUI's HSL-with-alpha representation.
+///
+/// This is the explicit conversion boundary for APIs that store [`Hsla`]. It
+/// avoids exposing Palette's conversion traits to applications and examples.
+pub fn rgb_to_hsla(color: Rgba) -> Hsla {
+    color.into_color()
+}
+
+/// Convert GPUI's HSL-with-alpha representation to sRGB.
+pub fn hsla_to_rgba(color: Hsla) -> Rgba {
+    color.into_color()
 }
 
 /// Swap from RGBA with premultiplied alpha to BGRA
@@ -229,12 +242,17 @@ impl ColorExt for Hsla {
     }
 }
 
+/// The storage-buffer discriminant for a [`Background`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[repr(C)]
-pub(crate) enum BackgroundTag {
+#[repr(u32)]
+pub enum BackgroundTag {
+    /// A flat color.
     Solid = 0,
+    /// A two-stop linear gradient.
     LinearGradient = 1,
+    /// Diagonal color stripes over transparency.
     PatternSlash = 2,
+    /// Alternating colored and transparent squares.
     Checkerboard = 3,
 }
 
@@ -244,7 +262,7 @@ pub(crate) enum BackgroundTag {
 /// - <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>
 /// - <https://www.w3.org/TR/css-color-4/#typedef-color-space>
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
-#[repr(C)]
+#[repr(u32)]
 pub enum ColorSpace {
     #[default]
     /// The sRGB color space.
@@ -272,7 +290,7 @@ pub struct Background {
     pub(crate) gradient_angle_or_pattern_height: f32,
     pub(crate) colors: [LinearColorStop; 2],
     /// Padding for alignment for repr(C) layout.
-    pad: u32,
+    pub(crate) padding: u32,
 }
 
 impl std::fmt::Debug for Background {
@@ -307,16 +325,19 @@ impl Default for Background {
             color_space: ColorSpace::default(),
             gradient_angle_or_pattern_height: 0.0,
             colors: [LinearColorStop::default(), LinearColorStop::default()],
-            pad: 0,
+            padding: 0,
         }
     }
 }
 
 /// Creates a hash pattern background
 pub fn pattern_slash(color: impl IntoColor<Hsla>, width: f32, interval: f32) -> Background {
-    let width_scaled = (width * 255.0) as u32;
-    let interval_scaled = (interval * 255.0) as u32;
-    let height = ((width_scaled * 0xFFFF) + interval_scaled) as f32;
+    const PATTERN_COMPONENT_SCALE: f32 = u8::MAX as f32;
+    const PATTERN_PACKING_RADIX: u32 = u16::MAX as u32;
+
+    let width_scaled = (width * PATTERN_COMPONENT_SCALE) as u32;
+    let interval_scaled = (interval * PATTERN_COMPONENT_SCALE) as u32;
+    let height = (width_scaled * PATTERN_PACKING_RADIX + interval_scaled) as f32;
 
     Background {
         tag: BackgroundTag::PatternSlash,
@@ -360,6 +381,7 @@ pub fn linear_gradient(
         tag: BackgroundTag::LinearGradient,
         gradient_angle_or_pattern_height: angle,
         colors: [from.into(), to.into()],
+        color_space: ColorSpace::Oklab,
         ..Default::default()
     }
 }
@@ -428,28 +450,6 @@ pub enum BackgroundKind {
 }
 
 impl Background {
-    /// Returns the stable scalar fields consumed by renderer transfer structures.
-    #[doc(hidden)]
-    pub fn shader_components(&self) -> (u32, u32, crate::SceneHsla, f32, [LinearColorStop; 2]) {
-        let tag = match self.tag {
-            BackgroundTag::Solid => 0,
-            BackgroundTag::LinearGradient => 1,
-            BackgroundTag::PatternSlash => 2,
-            BackgroundTag::Checkerboard => 3,
-        };
-        let color_space = match self.color_space {
-            ColorSpace::Srgb => 0,
-            ColorSpace::Oklab => 1,
-        };
-        (
-            tag,
-            color_space,
-            self.solid,
-            self.gradient_angle_or_pattern_height,
-            self.colors,
-        )
-    }
-
     /// Returns the solid color if this is a solid background, None otherwise.
     pub fn as_solid(&self) -> Option<Hsla> {
         if self.tag == BackgroundTag::Solid {
@@ -468,14 +468,16 @@ impl Background {
                 stops: self.colors,
             },
             BackgroundTag::PatternSlash => {
-                // `pattern_slash` packs both values into one f32 as `(width * 255) * 0xFFFF + (interval * 255)`.
-                // floor + rem_euclid to invert it since that's the pairing that stays correct for negative inputs.
-                // truncation and `%` give the wrong entry.
+                const PATTERN_COMPONENT_SCALE: f32 = u8::MAX as f32;
+                const PATTERN_PACKING_RADIX: f32 = u16::MAX as f32;
+
+                // `pattern_slash` packs both values into one exactly representable f32;
+                // floor + rem_euclid inverts it, since truncation and `%` give the wrong entry.
                 let packed = self.gradient_angle_or_pattern_height;
                 BackgroundKind::PatternSlash {
                     color: self.solid.into(),
-                    width: (packed / 0xFFFF as f32).floor() / 255.0,
-                    interval: (packed.rem_euclid(0xFFFF as f32)) / 255.0,
+                    width: (packed / PATTERN_PACKING_RADIX).floor() / PATTERN_COMPONENT_SCALE,
+                    interval: (packed.rem_euclid(PATTERN_PACKING_RADIX)) / PATTERN_COMPONENT_SCALE,
                 }
             }
             BackgroundTag::Checkerboard => BackgroundKind::Checkerboard {

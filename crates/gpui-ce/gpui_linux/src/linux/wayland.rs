@@ -39,11 +39,5 @@ pub(super) fn to_shape(style: CursorStyle) -> Shape {
         CursorStyle::DragLink => Shape::Alias,
         CursorStyle::DragCopy => Shape::Copy,
         CursorStyle::ContextualMenu => Shape::ContextMenu,
-        CursorStyle::None => {
-            #[cfg(debug_assertions)]
-            panic!("CursorStyle::None must be handled by the Wayland client");
-            #[cfg(not(debug_assertions))]
-            Shape::Default
-        }
     }
 }

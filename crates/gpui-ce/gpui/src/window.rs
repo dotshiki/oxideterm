@@ -1,4 +1,3 @@
-// OxideTerm modification: window lifecycle changes cancel stale pointer capture and drag state.
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -9,28 +8,28 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
     BoxShadow, Capslock, ColorExt, Context, Corners, CursorHideMode, CursorStyle, Decorations,
-    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DynamicTexture,
-    DynamicTextureParams, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, Filter,
-    FilterBoundary, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, InputHandler, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
+    Entity, EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent,
+    KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
     ScaledFilter, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style,
     SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
-    ThermalState, TransformationMatrix, Transition, TransitionState, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Transition, TransitionState, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 
+use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
+use crate::interactive::TouchEvent;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-#[cfg(target_os = "macos")]
-use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -38,13 +37,14 @@ use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use palette::{Hsla, IntoColor};
+use palette::Hsla;
 use parking_lot::RwLock;
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
 use scheduler::Instant;
 use slotmap::SlotMap;
 use smallvec::SmallVec;
+use std::collections::HashMap;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
@@ -731,10 +731,102 @@ pub(crate) struct CursorStyleRequest {
     pub(crate) style: CursorStyle,
 }
 
+/// Contains information about an occlusion test through hitboxes at a mouse position.
 #[derive(Default, Eq, PartialEq)]
-pub(crate) struct HitTest {
-    pub(crate) ids: SmallVec<[HitboxId; 8]>,
-    pub(crate) hover_hitbox_count: usize,
+pub struct HitTest {
+    // HitboxIds which were included in the test's click path (the last of which will be the box that caused occlusion)
+    ordered_ids: SmallVec<[HitboxId; 8]>,
+    // metadata about all hitboxes, even those outside the test's path
+    entries: HashMap<HitboxId, HitTestEntry>,
+    // the number of hitbox ids in `ordered_ids` which support mouse. anything after this amount only support scroll.
+    hover_hitbox_count: usize,
+}
+
+impl HitTest {
+    /// Creates a new hit-test by iterating the provided hitboxes to find all those which are not occluded.
+    fn new<'a>(hitboxes: impl Iterator<Item = &'a Hitbox>, position: Point<Pixels>) -> Self {
+        let mut num_until_mouse_blocked = None::<usize>;
+        let mut ids_until_occlusion = SmallVec::default();
+        let mut entries = HashMap::default();
+        let mut found_hit_occlusion = false;
+        // index is 0=closest to viewer, n=farthest from viewer
+        for (index, hitbox) in hitboxes.enumerate() {
+            entries.insert(
+                hitbox.id,
+                HitTestEntry {
+                    depth: index,
+                    tags: hitbox.tags.clone(),
+                },
+            );
+
+            if found_hit_occlusion {
+                continue;
+            }
+
+            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+            if !bounds.contains(&position) {
+                continue;
+            }
+
+            ids_until_occlusion.push(hitbox.id);
+
+            // Identify the threshold at which mouse is blocked in any way (BlockMouseExceptScroll or BlockMouse)
+            if num_until_mouse_blocked.is_none() && hitbox.behavior.blocks_mouse() {
+                num_until_mouse_blocked = Some(ids_until_occlusion.len());
+            }
+
+            // Found a hitbox that fully occludes boxes behind it. Can now stop iterating.
+            if hitbox.behavior.occludes() {
+                found_hit_occlusion = true;
+            }
+        }
+        Self {
+            hover_hitbox_count: num_until_mouse_blocked.unwrap_or(ids_until_occlusion.len()),
+            ordered_ids: ids_until_occlusion,
+            entries,
+        }
+    }
+
+    /// Returns an iterator over all HitboxIds that were not occluded/blocked.
+    /// The last element in the list will be the element which blocked the mouse from hitboxes behind it.
+    pub fn iter_hovered(&self) -> impl Iterator<Item = &HitboxId> {
+        self.ordered_ids.iter().take(self.hover_hitbox_count)
+    }
+
+    /// Returns an iterator over all HitboxIds that were not blocking scroll (not `HitboxBehavior::BlockMouse`).
+    /// The last element in the list will be the element which blocked the mouse from hitboxes behind it.
+    pub fn iter_scrollable(&self) -> impl Iterator<Item = &HitboxId> {
+        self.ordered_ids.iter()
+    }
+
+    /// Returns metadata about a hitbox included in this hit-test.
+    pub fn entry(&self, id: &HitboxId) -> Option<&HitTestEntry> {
+        self.entries.get(id)
+    }
+}
+
+/// An entry in a [`HitTest`] which represents a [`Hitbox`]. Contains some metadata about the
+/// hitbox in the frame the HitTest was evaluated on.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HitTestEntry {
+    /// The depth of the hitbox in the ordered list from the Frame.
+    /// A smaller number is closer to the viewer, and a larger number is farther from the viewer.
+    depth: usize,
+    tags: Vec<SharedString>,
+}
+
+impl HitTestEntry {
+    /// Returns the depth of the [`Hitbox`] in the frame.
+    /// A smaller value (closer to 0) represents closer to the viewer.
+    /// A larger value represents a hitbox farther from the viewer.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Returns any tags assigned to the [`Hitbox`] in the frame.
+    pub fn tags(&self) -> &Vec<SharedString> {
+        &self.tags
+    }
 }
 
 /// A type of window control area that corresponds to the platform window.
@@ -796,13 +888,7 @@ impl HitboxId {
     }
 
     fn hit_test(self, window: &Window) -> bool {
-        let hit_test = &window.mouse_hit_test;
-        for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {
-            if self == *id {
-                return true;
-            }
-        }
-        false
+        window.mouse_hit_test().iter_hovered().contains(&self)
     }
 
     /// Checks if the hitbox with this ID contains the mouse and should handle scroll events.
@@ -810,7 +896,7 @@ impl HitboxId {
     /// `is_hovered` should be used. See the documentation of `Hitbox::is_hovered` for details about
     /// this distinction.
     pub fn should_handle_scroll(self, window: &Window) -> bool {
-        window.mouse_hit_test.ids.contains(&self)
+        window.mouse_hit_test().iter_scrollable().contains(&self)
     }
 
     fn next(mut self) -> HitboxId {
@@ -831,6 +917,8 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// Additional user-provided tags to extend behavior of the hitbox
+    pub tags: Vec<SharedString>,
 }
 
 impl Hitbox {
@@ -924,6 +1012,18 @@ pub enum HitboxBehavior {
     BlockMouseExceptScroll,
 }
 
+impl HitboxBehavior {
+    /// Returns true if this behavior should prevent hit-tests from marking hitboxes behind it as hovered (aka this is the last element that can be hovered).
+    pub fn blocks_mouse(&self) -> bool {
+        matches!(self, Self::BlockMouse | Self::BlockMouseExceptScroll)
+    }
+
+    /// Returns true if this behavior shops all hit-test behavior (both mouse and scroll).
+    pub fn occludes(&self) -> bool {
+        matches!(self, Self::BlockMouse)
+    }
+}
+
 /// An identifier for a tooltip.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct TooltipId(usize);
@@ -987,26 +1087,6 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct PreparedGlyphBatch {
-    pub(crate) monochrome: Vec<PreparedMonochromeGlyph>,
-    pub(crate) subpixel: Vec<PreparedMonochromeGlyph>,
-    pub(crate) polychrome: Vec<PreparedPolychromeGlyph>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PreparedMonochromeGlyph {
-    pub(crate) bounds: Bounds<ScaledPixels>,
-    pub(crate) color: Hsla,
-    pub(crate) tile: AtlasTile,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PreparedPolychromeGlyph {
-    pub(crate) bounds: Bounds<ScaledPixels>,
-    pub(crate) tile: AtlasTile,
 }
 
 #[derive(Clone, Default)]
@@ -1102,27 +1182,7 @@ impl Frame {
     }
 
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
-        let mut set_hover_hitbox_count = false;
-        let mut hit_test = HitTest::default();
-        for hitbox in self.hitboxes.iter().rev() {
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
-                hit_test.ids.push(hitbox.id);
-                if !set_hover_hitbox_count
-                    && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
-                {
-                    hit_test.hover_hitbox_count = hit_test.ids.len();
-                    set_hover_hitbox_count = true;
-                }
-                if hitbox.behavior == HitboxBehavior::BlockMouse {
-                    break;
-                }
-            }
-        }
-        if !set_hover_hitbox_count {
-            hit_test.hover_hitbox_count = hit_test.ids.len();
-        }
-        hit_test
+        HitTest::new(self.hitboxes.iter().rev(), position)
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -1161,8 +1221,6 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
-    // Cached scenes may only reference atlas tiles from this resource generation.
-    rendered_resource_generation: u64,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1178,9 +1236,17 @@ pub struct Window {
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+    /// Bounds of the parent `Div` currently prepainting this element as one of its children.
+    /// Inset transitions use these bounds to resolve `auto` from the child's rendered position.
+    style_transition_containing_bounds: Option<Bounds<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
+    /// The [`TextInputConfiguration`] most recently forwarded to the platform
+    /// window, so that only actual changes are forwarded (reconfiguring a live
+    /// input session can restart the IME connection).
+    last_text_input_configuration: Option<TextInputConfiguration>,
+    focused_text_input_active: bool,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
@@ -1202,7 +1268,6 @@ pub struct Window {
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
-    should_close_handler: RefCell<Option<Box<dyn FnMut(&mut Window, &mut App) -> bool>>>,
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
@@ -1212,6 +1277,10 @@ pub struct Window {
     #[cfg(feature = "profiler")]
     window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
+    touch_gestures: TouchGestureRecognizer,
+    touch_prediction_enabled: bool,
+    long_press_timer: Option<Task<()>>,
+    long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -1372,66 +1441,6 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
     window_bounds_ctor(Bounds::new(final_origin, base_size))
 }
 
-fn dynamic_texture_dimension(value: i32, label: &str) -> Result<usize> {
-    if value <= 0 {
-        return Err(anyhow!("dynamic texture {label} must be positive"));
-    }
-    usize::try_from(value).context("dynamic texture dimension does not fit usize")
-}
-
-fn dynamic_texture_byte_len(size: Size<DevicePixels>) -> Result<usize> {
-    let width = dynamic_texture_dimension(size.width.0, "width")?;
-    let height = dynamic_texture_dimension(size.height.0, "height")?;
-    width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .context("dynamic texture BGRA byte size overflow")
-}
-
-fn dynamic_texture_blank(size: Size<DevicePixels>) -> Result<Vec<u8>> {
-    Ok(vec![0; dynamic_texture_byte_len(size)?])
-}
-
-fn validate_dynamic_texture_update(
-    texture_size: Size<DevicePixels>,
-    bounds: Bounds<DevicePixels>,
-    bytes: &[u8],
-) -> Result<()> {
-    dynamic_texture_byte_len(texture_size)?;
-    let expected_len = dynamic_texture_byte_len(bounds.size)?;
-
-    if bounds.origin.x.0 < 0 || bounds.origin.y.0 < 0 {
-        return Err(anyhow!(
-            "dynamic texture update origin must not be negative"
-        ));
-    }
-
-    let right = bounds
-        .origin
-        .x
-        .0
-        .checked_add(bounds.size.width.0)
-        .context("dynamic texture update horizontal bounds overflow")?;
-    let bottom = bounds
-        .origin
-        .y
-        .0
-        .checked_add(bounds.size.height.0)
-        .context("dynamic texture update vertical bounds overflow")?;
-    if right > texture_size.width.0 || bottom > texture_size.height.0 {
-        return Err(anyhow!("dynamic texture update is outside texture bounds"));
-    }
-
-    if bytes.len() != expected_len {
-        return Err(anyhow!(
-            "dynamic texture update byte length mismatch: expected {expected_len}, got {}",
-            bytes.len()
-        ));
-    }
-
-    Ok(())
-}
-
 impl Window {
     pub(crate) fn new(
         handle: AnyWindowHandle,
@@ -1497,7 +1506,6 @@ impl Window {
 
         let display_id = platform_window.display().map(|display| display.id());
         let sprite_atlas = platform_window.sprite_atlas();
-        let rendered_resource_generation = sprite_atlas.resource_generation();
         let mouse_position = platform_window.mouse_position();
         let modifiers = platform_window.modifiers();
         let capslock = platform_window.capslock();
@@ -1524,6 +1532,7 @@ impl Window {
         }
 
         let accessibility_force_disabled = cx.accessibility_force_disabled;
+        let accessibility_forced = cx.accessibility_forced;
         let a11y_active_flag = Arc::new(AtomicBool::new(false));
 
         #[cfg(not(target_family = "wasm"))]
@@ -1802,9 +1811,6 @@ impl Window {
             move |active| {
                 handle
                     .update(&mut cx, |_, window, cx| {
-                        if !active {
-                            window.cancel_pointer_interaction(cx);
-                        }
                         window.active.set(active);
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
@@ -1825,10 +1831,7 @@ impl Window {
             let mut cx = cx.to_async();
             move |active| {
                 handle
-                    .update(&mut cx, |_, window, cx| {
-                        if !active {
-                            window.cancel_pointer_interaction(cx);
-                        }
+                    .update(&mut cx, |_, window, _| {
                         window.hovered.set(active);
                         window.refresh();
                     })
@@ -1850,7 +1853,8 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _cx| {
                         for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
+                            let mut scrollable_ids = window.mouse_hit_test().iter_scrollable();
+                            if scrollable_ids.contains(&hitbox.id) {
                                 return Some(*area);
                             }
                         }
@@ -1927,7 +1931,6 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
-            rendered_resource_generation,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -1939,9 +1942,12 @@ impl Window {
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
+            style_transition_containing_bounds: None,
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
+            last_text_input_configuration: None,
+            focused_text_input_active: false,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
@@ -1962,7 +1968,6 @@ impl Window {
             appearance,
             appearance_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
-            should_close_handler: RefCell::new(None),
             active,
             hovered,
             needs_present,
@@ -1970,6 +1975,14 @@ impl Window {
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
+            touch_gestures: TouchGestureRecognizer::new(
+                cx.platform
+                    .gestures()
+                    .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
+            ),
+            touch_prediction_enabled: true,
+            long_press_timer: None,
+            long_press_capture: None,
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -1989,6 +2002,7 @@ impl Window {
             a11y: A11y::new(
                 a11y_active_flag,
                 accessibility_force_disabled,
+                accessibility_forced,
                 initial_window_title,
             ),
         })
@@ -2124,22 +2138,6 @@ impl Window {
         self.removed = true;
     }
 
-    /// Requests a close through the same interruptible path as a native close event.
-    pub fn request_close(&mut self, cx: &mut App) {
-        if self.run_should_close(cx) {
-            self.remove_window();
-        }
-    }
-
-    fn run_should_close(&mut self, cx: &mut App) -> bool {
-        let Some(mut handler) = self.should_close_handler.borrow_mut().take() else {
-            return true;
-        };
-        let should_close = handler(self, cx);
-        self.should_close_handler.borrow_mut().replace(handler);
-        should_close
-    }
-
     /// Obtain the currently focused [`FocusHandle`]. If no elements are focused, returns `None`.
     pub fn focused(&self, cx: &App) -> Option<FocusHandle> {
         self.focus
@@ -2165,24 +2163,15 @@ impl Window {
 
         self.focus = Some(handle.id);
         self.focus_generation = self.focus_generation.wrapping_add(1);
-        self.clear_pending_keystrokes();
-
-        // Avoid re-entrant entity updates by deferring observer notifications to the end of the
-        // current effect cycle, and only for this window.
-        let window_handle = self.handle;
-        cx.defer(move |cx| {
-            window_handle
-                .update(cx, |_, window, cx| {
-                    window.pending_input_changed(cx);
-                })
-                .ok();
-        });
+        self.clear_pending_keystrokes(cx);
 
         self.refresh();
     }
 
     /// Remove focus from all elements within this context's window.
-    pub fn blur(&mut self) {
+    pub fn blur(&mut self, cx: &mut App) {
+        self.clear_pending_keystrokes(cx);
+
         if !self.focus_enabled {
             return;
         }
@@ -2195,8 +2184,8 @@ impl Window {
     }
 
     /// Blur the window and don't allow anything in it to be focused again.
-    pub fn disable_focus(&mut self) {
-        self.blur();
+    pub fn disable_focus(&mut self, cx: &mut App) {
+        self.blur(cx);
         self.focus_enabled = false;
     }
 
@@ -2243,11 +2232,6 @@ impl Window {
         self.platform_window.is_maximized()
     }
 
-    /// Returns whether the native window is minimized.
-    pub fn is_minimized(&self) -> bool {
-        self.platform_window.is_minimized()
-    }
-
     /// request a certain window decoration (Wayland)
     pub fn request_decorations(&self, decorations: WindowDecorations) {
         self.platform_window.request_decorations(decorations);
@@ -2266,7 +2250,7 @@ impl Window {
     /// This is only needed to disambiguate a corner-anchored surface; otherwise the
     /// edge is deduced from the anchor. The edge must be a single edge the surface
     /// is anchored to, or it is ignored. (Wayland layer-shell windows only)
-    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "wayland"))]
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
     pub fn set_exclusive_edge(&self, edge: crate::layer_shell::Anchor) {
         self.platform_window.set_exclusive_edge(edge);
     }
@@ -2948,11 +2932,18 @@ impl Window {
         self.captured_hitbox
     }
 
-    fn cancel_pointer_interaction(&mut self, cx: &mut App) {
-        // Platforms can revoke native capture without delivering MouseUp, for example on Alt-Tab
-        // or when the compositor transfers ownership. Do not leave the old hitbox globally hovered.
-        self.captured_hitbox = None;
-        cx.stop_active_drag(self);
+    /// Captures the current long press for the given entity.
+    ///
+    /// The capture is released when the gesture ends or is cancelled, or when
+    /// a replacement touch begins. A listener must also call
+    /// [`Self::prevent_default`] on the started event to claim the gesture.
+    pub fn capture_long_press<T: 'static>(&mut self, entity: &Entity<T>) {
+        self.long_press_capture = Some(entity.entity_id());
+    }
+
+    /// Returns whether the given entity has captured the current long press.
+    pub fn has_long_press_capture<T: 'static>(&self, entity: &Entity<T>) -> bool {
+        self.long_press_capture == Some(entity.entity_id())
     }
 
     /// The current state of the keyboard's modifiers
@@ -2964,6 +2955,10 @@ impl Window {
     /// This is used for focus-visible styling to show focus indicators only for keyboard navigation.
     pub fn last_input_was_keyboard(&self) -> bool {
         self.last_input_modality == InputModality::Keyboard
+    }
+
+    pub(crate) fn last_input_was_touch(&self) -> bool {
+        self.last_input_modality == InputModality::Touch
     }
 
     /// The current state of the keyboard's capslock
@@ -2985,11 +2980,6 @@ impl Window {
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
-        let frame_resource_generation = self.sprite_atlas.resource_generation();
-        if frame_resource_generation != self.rendered_resource_generation {
-            // A renderer reset invalidates every tile retained by the cached scene.
-            self.refreshing = true;
-        }
 
         self.invalidate_entities();
         cx.entities.clear_accessed();
@@ -3035,14 +3025,28 @@ impl Window {
         // paint_range indices remain valid for reuse_paint on the next frame.
         // Search backwards to find the last Some entry, since reuse_paint may
         // have copied None slots from the previous frame. (Fixes #50456)
-        if let Some(input_handler) = self
+        let focused_text_input_active = if let Some(mut input_handler) = self
             .next_frame
             .input_handlers
             .iter_mut()
             .rev()
             .find_map(|h| h.take())
         {
+            let accepts_text_input = input_handler.accepts_text_input(self, cx);
             self.platform_window.set_input_handler(input_handler);
+            accepts_text_input
+        } else {
+            false
+        };
+        self.apply_text_input_configuration(cx);
+        if focused_text_input_active != self.focused_text_input_active {
+            self.focused_text_input_active = focused_text_input_active;
+            self.platform_window
+                .text_input_state_changed(if focused_text_input_active {
+                    TextInputStateChange::FocusGained
+                } else {
+                    TextInputStateChange::FocusLost
+                });
         }
 
         self.layout_engine.as_mut().unwrap().clear();
@@ -3054,8 +3058,6 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
-        // If recovery races this draw, presentation rejects this generation and requests a clean frame.
-        self.rendered_resource_generation = frame_resource_generation;
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -3146,17 +3148,6 @@ impl Window {
     fn present(&mut self) {
         #[cfg(feature = "profiler")]
         let _foreground_turn = profiler::journal::foreground_turn();
-        let current_resource_generation = self.sprite_atlas.resource_generation();
-        if current_resource_generation != self.rendered_resource_generation {
-            // Never replay tile coordinates after a renderer reset because slots may now hold unrelated data.
-            log::debug!(
-                "skipping stale renderer frame at resource generation {}; current generation is {}",
-                self.rendered_resource_generation,
-                current_resource_generation
-            );
-            self.refresh();
-            return;
-        }
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
@@ -3176,7 +3167,7 @@ impl Window {
     /// Benchmarks drive drawing synchronously rather than through a platform
     /// frame-request loop, so they call this after each measured update to
     /// submit the frame like production presentation would.
-    #[cfg(any(feature = "bench", all(test, feature = "profiler")))]
+    #[cfg(any(feature = "bench-support", all(test, feature = "profiler")))]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
             self.present();
@@ -3438,13 +3429,22 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    priority,
+                    element,
+                    parent_node,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    prepaint_range,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
                     self.text_style_stack
                         .clone_from(&deferred_draw.text_style_stack);
                     (
+                        deferred_draw.priority,
                         deferred_draw.element.take(),
                         deferred_draw.parent_node,
                         deferred_draw.current_view,
@@ -3460,7 +3460,9 @@ impl Window {
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
+                                crate::DeferredPriorityStackCache::push(priority, cx);
                                 element.prepaint(window, cx);
+                                crate::DeferredPriorityStackCache::pop(cx);
                             });
                         });
                     });
@@ -3670,14 +3672,6 @@ impl Window {
         });
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    /// Returns the cursor resolved for the current mouse hit test.
-    pub fn cursor_style_for_test(&self) -> CursorStyle {
-        self.rendered_frame
-            .cursor_style(self)
-            .unwrap_or(CursorStyle::Arrow)
-    }
-
     /// Updates the cursor style for the entire window at the platform level. A cursor
     /// style using this method will have precedence over any cursor style set using
     /// `set_cursor_style`. This method should only be called during the paint
@@ -3738,6 +3732,22 @@ impl Window {
 
         let abs_offset = self.element_offset() + offset;
         self.with_absolute_element_offset(abs_offset, f)
+    }
+
+    pub(crate) fn with_style_transition_containing_bounds<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+        let previous_bounds = self.style_transition_containing_bounds.replace(bounds);
+        let result = f(self);
+        self.style_transition_containing_bounds = previous_bounds;
+        result
+    }
+
+    pub(crate) fn style_transition_containing_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.style_transition_containing_bounds
     }
 
     /// Updates the global element offset based on the given offset. This is used to implement
@@ -4064,12 +4074,15 @@ impl Window {
     pub fn use_transition<T: Lerp + Clone + PartialEq + 'static>(
         &mut self,
         cx: &mut App,
-        duration: Duration,
+        motion: impl Into<Motion>,
         init: impl Fn(&mut Window, &mut Context<TransitionState<T>>) -> T,
     ) -> Transition<T> {
-        let state = self.use_state(cx, |window, cx| TransitionState::new(init(window, cx)));
+        let motion = motion.into();
+        let state = self.use_state(cx, |window, cx| {
+            TransitionState::new(init(window, cx), motion.clone())
+        });
 
-        Transition::new(state, duration)
+        Transition::new(state, motion)
     }
 
     /// Creates a new keyed transition with persistent state.
@@ -4084,13 +4097,15 @@ impl Window {
         &mut self,
         key: impl Into<ElementId>,
         cx: &mut App,
-        duration: Duration,
+        motion: impl Into<Motion>,
         init: impl Fn(&mut Window, &mut Context<TransitionState<T>>) -> T,
     ) -> Transition<T> {
-        let state =
-            self.use_keyed_state(key, cx, |window, cx| TransitionState::new(init(window, cx)));
+        let motion = motion.into();
+        let state = self.use_keyed_state(key, cx, |window, cx| {
+            TransitionState::new(init(window, cx), motion.clone())
+        });
 
-        Transition::new(state, duration)
+        Transition::new(state, motion)
     }
 
     /// Executes the given closure within the context of a tab group.
@@ -4174,6 +4189,18 @@ impl Window {
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
     ) {
+        self.paint_drop_shadows_with_corner_smoothing(bounds, corner_radii, 0.0, shadows);
+    }
+
+    /// Paints drop shadows with smoothed element and shadow corners.
+    /// Inset shadows in `shadows` are ignored.
+    pub fn paint_drop_shadows_with_corner_smoothing(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+        shadows: &[BoxShadow],
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -4181,6 +4208,7 @@ impl Window {
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
+        let corner_smoothing = corner_smoothing.clamp(0.0, 1.0);
         for shadow in shadows {
             if shadow.inset {
                 continue;
@@ -4192,11 +4220,11 @@ impl Window {
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
                 corner_radii: corner_radii.scale(scale_factor),
-                color: shadow.color.opacity(opacity).into(),
+                color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
-                inset: 0,
-                pad: 0,
+                inset: false.into(),
+                corner_smoothing,
             });
         }
     }
@@ -4210,6 +4238,18 @@ impl Window {
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
     ) {
+        self.paint_inset_shadows_with_corner_smoothing(bounds, corner_radii, 0.0, shadows);
+    }
+
+    /// Paints inset shadows with smoothed element and shadow corners.
+    /// Drop shadows in `shadows` are ignored.
+    pub fn paint_inset_shadows_with_corner_smoothing(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+        shadows: &[BoxShadow],
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -4217,6 +4257,7 @@ impl Window {
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
+        let corner_smoothing = corner_smoothing.clamp(0.0, 1.0);
         for shadow in shadows {
             if !shadow.inset {
                 continue;
@@ -4237,11 +4278,11 @@ impl Window {
                 bounds: self.cover_bounds(hole),
                 content_mask,
                 corner_radii: hole_corner_radii.scale(scale_factor),
-                color: shadow.color.opacity(opacity).into(),
+                color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
-                inset: 1,
-                pad: 0,
+                inset: true.into(),
+                corner_smoothing,
             });
         }
     }
@@ -4261,6 +4302,17 @@ impl Window {
         corner_radii: Corners<Pixels>,
         filters: &[Filter],
     ) {
+        self.paint_backdrop_filter_with_corner_smoothing(bounds, corner_radii, 0.0, filters);
+    }
+
+    /// Paints a backdrop filter clipped to smoothed corners.
+    pub fn paint_backdrop_filter_with_corner_smoothing(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+        filters: &[Filter],
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -4278,6 +4330,7 @@ impl Window {
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
             corner_radii: corner_radii.scale(scale_factor),
+            corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
             filters,
             opacity: self.element_opacity(),
         });
@@ -4296,6 +4349,18 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
+        filters: &[Filter],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_filter_layer_with_corner_smoothing(bounds, corner_radii, 0.0, filters, f)
+    }
+
+    /// Runs `f` in a content-filter group clipped to smoothed corners.
+    pub fn with_filter_layer_with_corner_smoothing<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
         filters: &[Filter],
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
@@ -4323,6 +4388,7 @@ impl Window {
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
             corner_radii: corner_radii.scale(scale_factor),
+            corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
             filters,
             opacity: 1.0,
             is_start: true,
@@ -4341,11 +4407,12 @@ impl Window {
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
         let radii = &quad.corner_radii;
         let widths = &quad.border_widths;
-        let edge_radii = Edges {
-            top: radii.top_left.max(radii.top_right),
-            right: radii.top_right.max(radii.bottom_right),
-            bottom: radii.bottom_left.max(radii.bottom_right),
-            left: radii.top_left.max(radii.bottom_left),
+        let reach_factor = 1.0 + quad.corner_smoothing;
+        let edge_reaches = Edges {
+            top: radii.top_left.max(radii.top_right) * reach_factor,
+            right: radii.top_right.max(radii.bottom_right) * reach_factor,
+            bottom: radii.bottom_left.max(radii.bottom_right) * reach_factor,
+            left: radii.top_left.max(radii.bottom_left) * reach_factor,
         };
 
         let antialias_inset = point(ScaledPixels(1.0), ScaledPixels(1.0));
@@ -4359,12 +4426,12 @@ impl Window {
         // Rounded corners need only be excluded on one axis. Either candidate
         // is empty of border pixels, so use the larger interior.
         let horizontal_band = inset_bounds(
-            point(widths.left, widths.top.max(edge_radii.top)),
-            point(widths.right, widths.bottom.max(edge_radii.bottom)),
+            point(widths.left, widths.top.max(edge_reaches.top)),
+            point(widths.right, widths.bottom.max(edge_reaches.bottom)),
         );
         let vertical_band = inset_bounds(
-            point(widths.left.max(edge_radii.left), widths.top),
-            point(widths.right.max(edge_radii.right), widths.bottom),
+            point(widths.left.max(edge_reaches.left), widths.top),
+            point(widths.right.max(edge_reaches.right), widths.bottom),
         );
 
         let area = |bounds: &Bounds<ScaledPixels>| {
@@ -4376,6 +4443,7 @@ impl Window {
             vertical_band
         }
     }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
     /// see [`fill`], [`outline`], and [`quad`] to construct this type.
@@ -4386,6 +4454,11 @@ impl Window {
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
+        self.paint_quad_with_corner_smoothing(quad, 0.0);
+    }
+
+    /// Paints `quad` with smoothed corners.
+    pub fn paint_quad_with_corner_smoothing(&mut self, quad: PaintQuad, corner_smoothing: f32) {
         self.invalidator.debug_assert_paint();
 
         let opacity = self.element_opacity();
@@ -4396,10 +4469,14 @@ impl Window {
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
-            border_color: quad.border_color.opacity(opacity).into(),
+            border_color: quad.border_color.opacity(opacity),
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            border_dashed_length: quad.border_dashed_length,
+            border_dashed_gap: quad.border_dashed_gap,
+            corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
+            padding: 0,
         };
 
         if !quad.background.is_transparent() {
@@ -4496,7 +4573,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
-            pad: 0,
+            padding: 0,
             bounds,
             content_mask: self.snapped_content_mask(),
             color: style
@@ -4530,149 +4607,13 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
-            pad: 0,
+            padding: 0,
             bounds,
             content_mask: self.snapped_content_mask(),
             thickness: self.snap_stroke(style.thickness),
             color: style.color.unwrap_or_default().opacity(opacity).into(),
             wavy: false.into(),
         });
-    }
-
-    #[inline]
-    pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
-        self.text_system().glyph_dilation_for_color(color)
-    }
-
-    /// Resolves a monochrome glyph to an atlas tile and stores bounds relative to a batch origin.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_glyph_for_batch(
-        &mut self,
-        origin: Point<Pixels>,
-        font_id: FontId,
-        glyph_id: GlyphId,
-        font_size: Pixels,
-        color: Hsla,
-        subpixel_rendering: bool,
-        dilation: u8,
-        batch_origin: Point<ScaledPixels>,
-        batch: &mut PreparedGlyphBatch,
-    ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
-
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-        let quantized_origin = Point::new(
-            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
-                / SUBPIXEL_VARIANTS_X as f32,
-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
-                / SUBPIXEL_VARIANTS_Y as f32,
-        );
-        let subpixel_variant = Point::new(
-            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
-            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
-        );
-        let integer_origin = quantized_origin.map(|coordinate| ScaledPixels(coordinate.trunc()));
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant,
-            scale_factor,
-            is_emoji: false,
-            subpixel_rendering,
-            dilation,
-        };
-
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if raster_bounds.is_zero() {
-            return Ok(());
-        }
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(&params.clone().into(), &mut || {
-                let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                Ok(Some((size, Cow::Owned(bytes))))
-            })?
-            .expect("glyph rasterization returns an atlas tile");
-        let bounds = Bounds {
-            origin: integer_origin + raster_bounds.origin.map(Into::into),
-            size: tile.bounds.size.map(Into::into),
-        } - batch_origin;
-        let glyph = PreparedMonochromeGlyph {
-            bounds,
-            color,
-            tile,
-        };
-        if subpixel_rendering {
-            batch.subpixel.push(glyph);
-        } else {
-            batch.monochrome.push(glyph);
-        }
-        Ok(())
-    }
-
-    /// Resolves an emoji glyph to an atlas tile and stores bounds relative to a batch origin.
-    pub(crate) fn prepare_emoji_for_batch(
-        &mut self,
-        origin: Point<Pixels>,
-        font_id: FontId,
-        glyph_id: GlyphId,
-        font_size: Pixels,
-        batch_origin: Point<ScaledPixels>,
-        batch: &mut PreparedGlyphBatch,
-    ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
-
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-        let integer_origin =
-            glyph_origin.map(|coordinate| ScaledPixels(round_half_toward_zero(coordinate.0)));
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant: Default::default(),
-            scale_factor,
-            is_emoji: true,
-            subpixel_rendering: false,
-            dilation: 0,
-        };
-
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if raster_bounds.is_zero() {
-            return Ok(());
-        }
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(&params.clone().into(), &mut || {
-                let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                Ok(Some((size, Cow::Owned(bytes))))
-            })?
-            .expect("emoji rasterization returns an atlas tile");
-        let bounds = Bounds {
-            origin: integer_origin + raster_bounds.origin.map(Into::into),
-            size: tile.bounds.size.map(Into::into),
-        } - batch_origin;
-        batch
-            .polychrome
-            .push(PreparedPolychromeGlyph { bounds, tile });
-        Ok(())
-    }
-
-    /// Appends a prepared glyph batch without repeating atlas lookups.
-    pub(crate) fn paint_prepared_glyph_batch(
-        &mut self,
-        origin: Point<ScaledPixels>,
-        batch: Arc<PreparedGlyphBatch>,
-    ) {
-        self.invalidator.debug_assert_paint();
-
-        let content_mask = self.snapped_content_mask();
-        let opacity = self.element_opacity();
-        self.next_frame
-            .scene
-            .insert_prepared_glyph_batch(batch, origin, content_mask, opacity);
     }
 
     /// Paints a monochrome (non-emoji) glyph into the scene for the next frame at the current z-index.
@@ -4739,7 +4680,7 @@ impl Window {
             if subpixel_rendering {
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
                     order: 0,
-                    pad: 0,
+                    padding: 0,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity).into(),
@@ -4749,7 +4690,7 @@ impl Window {
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    pad: 0,
+                    padding: 0,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity).into(),
@@ -4761,7 +4702,7 @@ impl Window {
         Ok(())
     }
 
-    pub(crate) fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+    fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
@@ -4830,8 +4771,8 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
                 grayscale: false.into(),
+                corner_smoothing: 0.0,
                 bounds,
                 corner_radii: Default::default(),
                 content_mask,
@@ -4858,10 +4799,6 @@ impl Window {
 
         let element_opacity = self.element_opacity();
         let bounds = self.snap_bounds(bounds);
-        // Layout transitions can intentionally collapse an SVG to an empty snapped frame.
-        if bounds.is_zero() {
-            return Ok(());
-        }
 
         let params = RenderSvgParams {
             path,
@@ -4900,7 +4837,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
-            pad: 0,
+            padding: 0,
             bounds: final_bounds,
             content_mask,
             color: color.opacity(element_opacity).into(),
@@ -4924,6 +4861,28 @@ impl Window {
         bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+    ) -> Result<()> {
+        self.paint_image_with_corner_smoothing(
+            bounds,
+            image_bounds,
+            corner_radii,
+            0.0,
+            data,
+            frame_index,
+            grayscale,
+        )
+    }
+
+    /// Paints an image with smoothed corners.
+    pub fn paint_image_with_corner_smoothing(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
@@ -5006,8 +4965,8 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
             grayscale: grayscale.into(),
+            corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
             bounds: visible_bounds_snapped,
             content_mask,
             corner_radii,
@@ -5017,115 +4976,29 @@ impl Window {
         Ok(())
     }
 
-    /// Uploads a BGRA region into a dynamic texture without replacing its stable identity.
-    ///
-    /// The update bounds are relative to the top-left corner of the dynamic texture.
-    pub fn update_dynamic_texture(
-        &mut self,
-        data: &DynamicTexture,
-        bounds: Bounds<DevicePixels>,
-        bytes: &[u8],
-    ) -> Result<()> {
-        validate_dynamic_texture_update(data.size(), bounds, bytes)?;
-
-        let key = DynamicTextureParams {
-            texture_id: data.id,
-        }
-        .into();
-        let size = data.size();
-        self.sprite_atlas
-            .get_or_insert_with(&key, &mut || {
-                // Updates may arrive before the first paint, so create the stable atlas entry.
-                Ok(Some((size, Cow::Owned(dynamic_texture_blank(size)?))))
-            })?
-            .expect("dynamic texture creation always returns an atlas entry");
-        self.sprite_atlas.update(&key, bounds, bytes)
-    }
-
-    /// Paints a dynamic texture into the next frame as one polychrome sprite.
-    pub fn paint_dynamic_texture(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
-        data: Arc<DynamicTexture>,
-        grayscale: bool,
-    ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
-
-        let bounds = self.snap_bounds(bounds);
-        let key = DynamicTextureParams {
-            texture_id: data.id,
-        }
-        .into();
-        let size = data.size();
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(&key, &mut || {
-                Ok(Some((size, Cow::Owned(dynamic_texture_blank(size)?))))
-            })?
-            .expect("dynamic texture creation always returns an atlas entry");
-        let content_mask = self.snapped_content_mask();
-        let corner_radii = corner_radii
-            .clamp_radii_for_quad_size(bounds.size.map(|value| Pixels(value.0)))
-            .scale(self.scale_factor());
-        let opacity = self.element_opacity();
-
-        self.next_frame.scene.insert_primitive(PolychromeSprite {
-            order: 0,
-            pad: 0,
-            grayscale: grayscale.into(),
-            bounds,
-            content_mask,
-            corner_radii,
-            tile,
-            opacity,
-        });
-        Ok(())
-    }
-
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(target_os = "macos")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
-        use crate::PaintSurface;
-
-        self.invalidator.debug_assert_paint();
-
-        let bounds = self.snap_bounds(bounds);
-        let content_mask = self.snapped_content_mask();
-        self.next_frame.scene.insert_primitive(PaintSurface {
-            order: 0,
-            bounds,
-            content_mask,
-            image_buffer,
-        });
-    }
-
-    /// Paint a surface into the scene for the next frame at the current z-index.
-    ///
-    /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn paint_surface(
         &mut self,
         bounds: Bounds<Pixels>,
-        texture: std::sync::Arc<dyn std::any::Any + Send + Sync>,
-        texture_size: Size<DevicePixels>,
+        source: impl Into<crate::SurfaceSource>,
     ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
-        let content_mask = self.content_mask().scale(scale_factor);
-        self.next_frame.scene.insert_primitive(PaintSurface {
-            order: 0,
-            bounds,
-            content_mask,
-            texture,
-            texture_size,
-        });
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_surface(
+            PaintSurface {
+                order: 0,
+                bounds,
+                content_mask,
+                source: source.into(),
+            },
+            self.element_opacity(),
+        );
     }
 
     /// Removes an image from the sprite atlas.
@@ -5140,26 +5013,6 @@ impl Window {
         }
 
         Ok(())
-    }
-
-    /// Removes a dynamic texture from the platform atlas.
-    pub fn drop_dynamic_texture(&mut self, data: Arc<DynamicTexture>) -> Result<()> {
-        let key = DynamicTextureParams {
-            texture_id: data.id,
-        };
-        self.sprite_atlas.remove(&key.into());
-        Ok(())
-    }
-
-    /// Returns the generation of renderer resources backing dynamic textures.
-    pub fn renderer_resource_generation(&self) -> u64 {
-        self.sprite_atlas.resource_generation()
-    }
-
-    pub(crate) fn renderer_resource_identity(&self) -> usize {
-        // Generation counters are atlas-local, so the allocation identity prevents
-        // reusing tiles after a pane moves to a window backed by another atlas.
-        Arc::as_ptr(&self.sprite_atlas) as *const () as usize
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.
@@ -5264,12 +5117,25 @@ impl Window {
         bounds
     }
 
-    /// This method should be called during `prepaint`. You can use
-    /// the returned [Hitbox] during `paint` or in an event handler
-    /// to determine whether the inserted hitbox was the topmost.
+    /// This method should be called during `prepaint`. You can use the returned [Hitbox]
+    /// during `paint` or in an event handler to determine whether the inserted hitbox was the topmost.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
+        self.insert_hitbox_mut(bounds, behavior).clone()
+    }
+
+    /// This method should be called during `prepaint`. You can use the returned [Hitbox]
+    /// during `paint` or in an event handler to determine whether the inserted hitbox was the topmost.
+    ///
+    /// Returns a mutable reference to the hitbox inserted for the next frame.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn insert_hitbox_mut(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        behavior: HitboxBehavior,
+    ) -> &mut Hitbox {
         self.invalidator.debug_assert_prepaint();
 
         let content_mask = self.content_mask();
@@ -5280,9 +5146,9 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            tags: Vec::default(),
         };
-        self.next_frame.hitboxes.push(hitbox.clone());
-        hitbox
+        self.next_frame.hitboxes.push_mut(hitbox)
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
@@ -5378,6 +5244,26 @@ impl Window {
             self.next_frame
                 .input_handlers
                 .push(Some(PlatformInputHandler::new(cx, Box::new(input_handler))));
+        }
+    }
+
+    /// Forwards the focused input handler's [`TextInputConfiguration`] to the
+    /// platform window when it differs from the last forwarded value. With no
+    /// input handler the default configuration applies, so a field's
+    /// preferences don't outlive its focus.
+    fn apply_text_input_configuration(&mut self, cx: &mut App) {
+        let configuration = match self.platform_window.take_input_handler() {
+            Some(mut input_handler) => {
+                let configuration = input_handler.text_input_configuration(self, cx);
+                self.platform_window.set_input_handler(input_handler);
+                configuration
+            }
+            None => TextInputConfiguration::default(),
+        };
+        if self.last_text_input_configuration.as_ref() != Some(&configuration) {
+            self.platform_window
+                .set_text_input_configuration(configuration.clone());
+            self.last_text_input_configuration = Some(configuration);
         }
     }
 
@@ -5545,7 +5431,7 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
-    /// Dispatch a mouse or keyboard event on the window.
+    /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
         #[cfg(feature = "profiler")]
@@ -5663,6 +5549,21 @@ impl Window {
                 }
             },
             PlatformInput::Touch(touch) => PlatformInput::Touch(touch),
+            PlatformInput::LongPress(long_press) => {
+                self.mouse_position = if long_press.phase == crate::TouchPhase::Started {
+                    long_press.start_position
+                } else {
+                    long_press.position
+                };
+                if long_press.phase == crate::TouchPhase::Started {
+                    self.long_press_capture = None;
+                }
+                PlatformInput::LongPress(long_press)
+            }
+            PlatformInput::TouchDrag(touch_drag) => {
+                self.mouse_position = touch_drag.start_position;
+                PlatformInput::TouchDrag(touch_drag)
+            }
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 
@@ -5670,6 +5571,19 @@ impl Window {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
+        } else if let Some(touch_event) = event.touch_event() {
+            self.dispatch_touch_event(touch_event, cx);
+        }
+        if let PlatformInput::LongPress(long_press) = &event {
+            match long_press.phase {
+                crate::TouchPhase::Started if !self.default_prevented => {
+                    self.long_press_capture = None;
+                }
+                crate::TouchPhase::Ended | crate::TouchPhase::Cancelled => {
+                    self.long_press_capture = None;
+                }
+                crate::TouchPhase::Started | crate::TouchPhase::Moved => {}
+            }
         }
 
         // Must run after the move is dispatched: the platform owns the gesture afterwards, so this
@@ -5717,6 +5631,148 @@ impl Window {
         {
             self.refresh();
         }
+    }
+
+    /// Whether recognized touch pans may use the platform's predicted touch
+    /// positions ([`TouchEvent::predicted_position`]) to compensate for input
+    /// latency. Defaults to true.
+    pub fn touch_prediction_enabled(&self) -> bool {
+        self.touch_prediction_enabled
+    }
+
+    /// Sets whether recognized touch pans may use the platform's predicted
+    /// touch positions. Disabling drops [`TouchEvent::predicted_position`]
+    /// before gesture recognition, so pans track only raw touch positions.
+    pub fn set_touch_prediction_enabled(&mut self, enabled: bool) {
+        self.touch_prediction_enabled = enabled;
+    }
+
+    /// Runs the portable gesture recognizer over a raw touch event and
+    /// dispatches whatever it resolves (scroll steps, synthesized taps)
+    /// through the ordinary mouse-event path.
+    fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
+        let mut event = event.clone();
+        if !self.touch_prediction_enabled {
+            event.predicted_position = None;
+        }
+        let recognized_gestures = self.touch_gestures.handle_event(&event);
+        if event.phase == crate::TouchPhase::Started
+            && let Some(touch_drag) = self.touch_gestures.offer_touch_drag(event.id)
+        {
+            self.dispatch_recognized_touch_gesture(touch_drag, cx);
+        }
+        if event.phase == crate::TouchPhase::Started
+            && self.touch_gestures.pending_long_press().is_some()
+        {
+            self.long_press_capture = None;
+        }
+        let mut tapped = false;
+        for gesture in recognized_gestures {
+            tapped |= matches!(gesture, RecognizedTouchGesture::Tap { .. });
+            self.dispatch_recognized_touch_gesture(gesture, cx);
+        }
+        if event.phase == crate::TouchPhase::Started {
+            self.schedule_long_press_timer(cx);
+        } else if self.touch_gestures.pending_long_press().is_none() {
+            self.long_press_timer.take();
+        }
+        // The platform's touch-release handler may inspect the input handler
+        // as soon as this dispatch returns (the web platform decides virtual
+        // keyboard visibility there, inside the user gesture). Input handlers
+        // are registered during draw, so draw now to make them reflect any
+        // focus change the tap just caused.
+        if tapped && self.invalidator.is_dirty() {
+            self.draw(cx).clear(cx);
+        }
+        if self.touch_gestures.has_momentum() {
+            self.schedule_touch_momentum_tick();
+        }
+    }
+
+    fn dispatch_recognized_touch_gesture(&mut self, gesture: RecognizedTouchGesture, cx: &mut App) {
+        match gesture {
+            RecognizedTouchGesture::Scroll(scroll_wheel) => {
+                self.mouse_position = scroll_wheel.position;
+                cx.propagate_event = true;
+                self.dispatch_mouse_event(&scroll_wheel, cx);
+            }
+            RecognizedTouchGesture::Tap { down, up } => {
+                self.mouse_position = up.position;
+                cx.propagate_event = true;
+                self.dispatch_mouse_event(&down, cx);
+                cx.propagate_event = true;
+                self.dispatch_mouse_event(&up, cx);
+            }
+            RecognizedTouchGesture::TouchDrag(touch_drag) => {
+                self.mouse_position = touch_drag.start_position;
+                cx.propagate_event = true;
+                self.default_prevented = false;
+                let started = touch_drag.phase == crate::TouchPhase::Started;
+                self.dispatch_mouse_event(&touch_drag, cx);
+                if started {
+                    self.touch_gestures
+                        .resolve_touch_drag(self.default_prevented);
+                }
+            }
+            RecognizedTouchGesture::LongPress(long_press) => {
+                self.mouse_position = if long_press.phase == crate::TouchPhase::Started {
+                    long_press.start_position
+                } else {
+                    long_press.position
+                };
+                cx.propagate_event = true;
+                self.default_prevented = false;
+                let started = long_press.phase == crate::TouchPhase::Started;
+                let ended = matches!(
+                    long_press.phase,
+                    crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
+                );
+                self.dispatch_mouse_event(&long_press, cx);
+                if started {
+                    let claimed = self.default_prevented;
+                    self.touch_gestures.resolve_long_press(claimed);
+                    if !claimed {
+                        self.long_press_capture = None;
+                    }
+                }
+                if ended {
+                    self.long_press_capture = None;
+                }
+            }
+        }
+    }
+
+    fn schedule_long_press_timer(&mut self, cx: &mut App) {
+        self.long_press_timer.take();
+        let Some((touch_id, duration)) = self.touch_gestures.pending_long_press() else {
+            return;
+        };
+        self.long_press_timer = Some(self.spawn(cx, async move |cx| {
+            cx.background_executor.timer(duration).await;
+            cx.update(move |window, cx| {
+                window.long_press_timer.take();
+                if let Some(gesture) = window.touch_gestures.offer_long_press(touch_id) {
+                    window.dispatch_recognized_touch_gesture(gesture, cx);
+                }
+            })
+            .log_err();
+        }));
+    }
+
+    fn schedule_touch_momentum_tick(&mut self) {
+        self.on_next_frame(|window, cx| {
+            if let Some(gesture) = window.touch_gestures.tick_momentum() {
+                window.dispatch_recognized_touch_gesture(gesture, cx);
+            }
+            if window.touch_gestures.has_momentum() {
+                window.schedule_touch_momentum_tick();
+            }
+        });
+    }
+
+    /// Returns the hit-test that was most recently cached from a mouse event on the rendered frame.
+    pub fn mouse_hit_test(&self) -> &HitTest {
+        &self.mouse_hit_test
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
@@ -5973,6 +6029,19 @@ impl Window {
             .retain(&(), |callback| callback(self, cx));
     }
 
+    fn defer_pending_input_changed(&self, cx: &mut App) {
+        // Avoid re-entrant entity updates by deferring observer notifications to the end of the
+        // current effect cycle, and only for this window.
+        let window_handle = self.handle;
+        cx.defer(move |cx| {
+            window_handle
+                .update(cx, |_, window, cx| {
+                    window.pending_input_changed(cx);
+                })
+                .ok();
+        });
+    }
+
     fn dispatch_key_down_up_event(
         &mut self,
         event: &dyn Any,
@@ -6037,8 +6106,15 @@ impl Window {
         self.active_pending_input().is_some()
     }
 
-    pub(crate) fn clear_pending_keystrokes(&mut self) {
-        self.pending_input.take();
+    #[cfg(test)]
+    pub(crate) fn pending_input_is_none(&self) -> bool {
+        self.pending_input.is_none()
+    }
+
+    pub(crate) fn clear_pending_keystrokes(&mut self, cx: &mut App) {
+        if self.pending_input.take().is_some() {
+            self.defer_pending_input_changed(cx);
+        }
     }
 
     /// Returns the currently pending input keystrokes that might result in a multi-stroke key binding.
@@ -6259,6 +6335,14 @@ impl Window {
     /// Minimize the current window at the platform level.
     pub fn minimize_window(&self) {
         self.platform_window.minimize();
+    }
+
+    /// Show or hide the current window at the platform level.
+    ///
+    /// Call [`Window::activate_window`] separately when the window should also receive focus.
+    /// The window manager may still focus a window when it is shown.
+    pub fn set_visible(&self, visible: bool) {
+        self.platform_window.set_visible(visible);
     }
 
     /// Toggle full screen status on the current window at the platform level.
@@ -6497,11 +6581,9 @@ impl Window {
         cx: &App,
         f: impl Fn(&mut Window, &mut App) -> bool + 'static,
     ) {
-        self.should_close_handler.borrow_mut().replace(Box::new(f));
         let mut cx = self.to_async(cx);
         self.platform_window.on_should_close(Box::new(move || {
-            cx.update(|window, cx| window.run_should_close(cx))
-                .unwrap_or(true)
+            cx.update(|window, cx| f(window, cx)).unwrap_or(true)
         }))
     }
 
@@ -6556,9 +6638,17 @@ impl Window {
 
     /// Returns the GPU context (device + queue) if available.
     /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
     pub fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
         self.platform_window.gpu_context()
+    }
+
+    /// Returns backend-specific typed GPU context information for custom
+    /// controls. Use the rendering backend's context type to downcast the
+    /// returned value.
+    #[cfg(any(target_family = "wasm", target_os = "linux", target_os = "freebsd"))]
+    pub fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
+        self.platform_window.gpu_context_info()
     }
 
     /// Whether the GPU device backing this window has been lost (recovery
@@ -6566,7 +6656,7 @@ impl Window {
     /// cannot know. Embedders that captured the device from
     /// [`Self::gpu_context`] should stop submitting while this is
     /// `Some(true)` and re-acquire the device once it reads `Some(false)`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
     pub fn gpu_device_lost(&self) -> Option<bool> {
         self.platform_window.gpu_device_lost()
     }
@@ -6639,6 +6729,16 @@ impl Window {
     /// See the [accessibility guide](crate::_accessibility) for an overview.
     pub fn is_a11y_active(&self) -> bool {
         self.a11y.is_active()
+    }
+
+    /// Build this window's accessibility tree every frame, even with no
+    /// assistive technology connected, so [`Self::debug_a11y_tree_json`] and
+    /// the accessibility actions work for automation. Forces a redraw, since
+    /// the tree is built during prepaint. [`crate::Application::new_inaccessible`]
+    /// still wins.
+    pub fn set_a11y_forced(&mut self, forced: bool) {
+        self.a11y.set_forced(forced);
+        self.refresh();
     }
 
     /// Debug representation of the last frame's accessibility information.
@@ -6715,7 +6815,7 @@ impl Window {
                 }
             }
             accesskit::Action::Blur => {
-                self.blur();
+                self.blur(cx);
             }
             _ => {
                 log::debug!(
@@ -6880,7 +6980,7 @@ impl Window {
                 inspector.update(cx, |inspector, _cx| {
                     if let Some(depth) = inspector.pick_depth.as_mut() {
                         *depth += f32::from(delta_y) / SCROLL_PIXELS_PER_LAYER;
-                        let max_depth = self.mouse_hit_test.ids.len() as f32 - 0.5;
+                        let max_depth = self.mouse_hit_test.entries.len() as f32 - 0.5;
                         if *depth < 0.0 {
                             *depth = 0.0;
                         } else if *depth > max_depth {
@@ -6905,9 +7005,9 @@ impl Window {
     ) -> Option<(HitboxId, crate::InspectorElementId)> {
         if let Some(pick_depth) = inspector.pick_depth {
             let depth = (pick_depth as i64).try_into().unwrap_or(0);
-            let max_skipped = self.mouse_hit_test.ids.len().saturating_sub(1);
+            let max_skipped = self.mouse_hit_test.entries.len().saturating_sub(1);
             let skip_count = (depth as usize).min(max_skipped);
-            for hitbox_id in self.mouse_hit_test.ids.iter().skip(skip_count) {
+            for hitbox_id in self.mouse_hit_test.ordered_ids.iter().skip(skip_count) {
                 if let Some(inspector_id) = frame.inspector_hitboxes.get(hitbox_id) {
                     return Some((*hitbox_id, inspector_id.clone()));
                 }
@@ -6982,6 +7082,7 @@ impl<V: 'static + Render> WindowHandle<V> {
             any_handle: AnyWindowHandle {
                 id,
                 state_type: TypeId::of::<V>(),
+                root_entity_type_name: std::any::type_name::<V>(),
             },
             state_type: PhantomData,
         }
@@ -7104,12 +7205,18 @@ impl<V: 'static> From<WindowHandle<V>> for AnyWindowHandle {
 pub struct AnyWindowHandle {
     pub(crate) id: WindowId,
     state_type: TypeId,
+    root_entity_type_name: &'static str,
 }
 
 impl AnyWindowHandle {
     /// Get the ID of this window.
     pub fn window_id(&self) -> WindowId {
         self.id
+    }
+
+    /// Returns the name of the window's declared root entity type.
+    pub fn root_entity_type_name(&self) -> &'static str {
+        self.root_entity_type_name
     }
 
     /// Attempt to convert this handle to a window handle with a specific root view type.
@@ -7349,10 +7456,14 @@ pub struct PaintQuad {
     pub background: Background,
     /// The widths of the quad's borders.
     pub border_widths: Edges<Pixels>,
-    /// The color of the quad's borders.
-    pub border_color: Hsla,
+    /// The background painted into the quad's borders.
+    pub border_color: Background,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// The length of each border dash, as a multiple of the border width.
+    pub border_dashed_length: f32,
+    /// The gap between border dashes, as a multiple of the border width.
+    pub border_dashed_gap: f32,
 }
 
 impl PaintQuad {
@@ -7372,10 +7483,10 @@ impl PaintQuad {
         }
     }
 
-    /// Sets the border color of the quad.
-    pub fn border_color(self, border_color: impl IntoColor<Hsla>) -> Self {
+    /// Sets the background painted into the quad's borders.
+    pub fn border_color(self, border_color: impl Into<Background>) -> Self {
         PaintQuad {
-            border_color: border_color.into_color(),
+            border_color: border_color.into(),
             ..self
         }
     }
@@ -7387,6 +7498,22 @@ impl PaintQuad {
             ..self
         }
     }
+
+    /// Sets the length of each border dash as a multiple of the border width.
+    pub fn border_dashed_length(self, length_per_border_width: f32) -> Self {
+        PaintQuad {
+            border_dashed_length: length_per_border_width.max(0.0),
+            ..self
+        }
+    }
+
+    /// Sets the gap between border dashes as a multiple of the border width.
+    pub fn border_dashed_gap(self, gap_per_border_width: f32) -> Self {
+        PaintQuad {
+            border_dashed_gap: gap_per_border_width.max(0.0),
+            ..self
+        }
+    }
 }
 
 /// Creates a quad with the given parameters.
@@ -7395,7 +7522,7 @@ pub fn quad(
     corner_radii: impl Into<Corners<Pixels>>,
     background: impl Into<Background>,
     border_widths: impl Into<Edges<Pixels>>,
-    border_color: impl IntoColor<Hsla>,
+    border_color: impl Into<Background>,
     border_style: BorderStyle,
 ) -> PaintQuad {
     PaintQuad {
@@ -7403,8 +7530,10 @@ pub fn quad(
         corner_radii: corner_radii.into(),
         background: background.into(),
         border_widths: border_widths.into(),
-        border_color: border_color.into_color(),
+        border_color: border_color.into(),
         border_style,
+        border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
+        border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
     }
 }
 
@@ -7415,15 +7544,17 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         corner_radii: (0.).into(),
         background: background.into(),
         border_widths: (0.).into(),
-        border_color: transparent_black(),
+        border_color: transparent_black().into(),
         border_style: BorderStyle::default(),
+        border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
+        border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
     }
 }
 
 /// Creates a rectangle outline with the given bounds, border color, and a 1px border width
 pub fn outline(
     bounds: impl Into<Bounds<Pixels>>,
-    border_color: impl IntoColor<Hsla>,
+    border_color: impl Into<Background>,
     border_style: BorderStyle,
 ) -> PaintQuad {
     PaintQuad {
@@ -7431,8 +7562,10 @@ pub fn outline(
         corner_radii: (0.).into(),
         background: transparent_black().into(),
         border_widths: (1.).into(),
-        border_color: border_color.into_color(),
+        border_color: border_color.into(),
         border_style,
+        border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
+        border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
     }
 }
 
@@ -7442,16 +7575,22 @@ mod tests {
         cell::{Cell, RefCell},
         path::PathBuf,
         rc::Rc,
+        sync::Arc,
+        time::Duration,
     };
 
     use crate::{
-        AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
-        ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-        MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
-        WindowOptions, canvas, div, point, px, size,
+        AnyWindowHandle, AppContext as _, Background, Bounds, BoxShadow, ColorExt as _, Context,
+        DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
+        FileDropEvent, FocusHandle, ImageSource, InputEvent as _, InteractiveElement as _,
+        IntoElement, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
+        Pixels, Point, Render, RenderImage, RequestFrameOptions, ShaderBool,
+        StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
+        TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, hsla, img,
+        linear_color_stop, linear_gradient, point, px, size, white,
     };
+    use image::{Frame as ImageFrame, ImageBuffer, Rgba};
+    use smallvec::smallvec;
 
     struct EmptyView;
 
@@ -7459,6 +7598,186 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
         }
+    }
+
+    fn shadow_gradient() -> Background {
+        linear_gradient(
+            90.,
+            linear_color_stop(hsla(0., 1., 0.5, 0.8), 0.),
+            linear_color_stop(hsla(2. / 3., 1., 0.5, 0.6), 1.),
+        )
+    }
+
+    struct ShadowBackgroundView;
+
+    impl Render for ShadowBackgroundView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .m(px(40.))
+                .w(px(80.))
+                .h(px(60.))
+                .rounded(px(8.))
+                .bg(white())
+                .opacity(0.5)
+                .shadow(vec![
+                    BoxShadow::new(px(4.), px(2.), shadow_gradient())
+                        .blur_radius(px(6.))
+                        .spread_radius(px(2.)),
+                    BoxShadow::new(px(-3.), px(1.), hsla(0.3, 0.7, 0.4, 0.4)),
+                    BoxShadow::new(px(0.), px(2.), shadow_gradient())
+                        .blur_radius(px(4.))
+                        .spread_radius(px(3.))
+                        .inset(),
+                ])
+        }
+    }
+
+    struct CornerSmoothingSceneView {
+        image: Arc<RenderImage>,
+    }
+
+    fn assert_smoothing(name: &str, minimum_count: usize, values: impl IntoIterator<Item = f32>) {
+        let values = values.into_iter().collect::<Vec<_>>();
+        assert!(values.len() >= minimum_count, "missing {name}");
+        assert!(
+            values.iter().all(|&value| value == 1.0),
+            "{name}: {values:?}"
+        );
+    }
+
+    impl Render for CornerSmoothingSceneView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut image = img(ImageSource::Render(self.image.clone()))
+                .size(px(24.))
+                .rounded(px(8.));
+            image.style().corner_smoothing = Some(1.5);
+
+            let mut root = div()
+                .size(px(80.))
+                .rounded(px(24.))
+                .bg(crate::blue())
+                .border_t(px(2.))
+                .border_r(px(4.))
+                .border_b(px(6.))
+                .border_l(px(8.))
+                .border_color(crate::white())
+                .shadow(vec![
+                    BoxShadow::new(px(2.), px(3.), crate::black().opacity(0.5))
+                        .blur_radius(px(5.))
+                        .spread_radius(px(1.)),
+                    BoxShadow::new(px(1.), px(1.), crate::white().opacity(0.4))
+                        .blur_radius(px(3.))
+                        .inset(),
+                ])
+                .backdrop_blur(px(4.))
+                .blur(px(2.))
+                .child(image);
+            root.style().corner_smoothing = Some(1.5);
+            root
+        }
+    }
+
+    #[gpui::test]
+    fn shadow_backgrounds_survive_painting_with_geometry_and_opacity(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| ShadowBackgroundView);
+        let shadows = window
+            .update(cx, |_, window, _| {
+                window.rendered_frame.scene.shadows.clone()
+            })
+            .unwrap();
+
+        assert_eq!(shadows.len(), 3);
+        let gradient = shadow_gradient().opacity(0.5);
+        let drop_gradient = shadows
+            .iter()
+            .find(|shadow| shadow.inset == ShaderBool::Disabled && shadow.color == gradient)
+            .expect("gradient drop shadow should be painted");
+        let inset_gradient = shadows
+            .iter()
+            .find(|shadow| shadow.inset == ShaderBool::Enabled && shadow.color == gradient)
+            .expect("gradient inset shadow should be painted");
+        let solid = shadows
+            .iter()
+            .find(|shadow| shadow.color.as_solid().is_some())
+            .expect("solid shadows should remain supported");
+
+        assert_eq!(
+            solid.color.as_solid(),
+            Some(hsla(0.3, 0.7, 0.4, 0.2)),
+            "element opacity should apply to solid shadow paint"
+        );
+        assert_eq!(drop_gradient.element_bounds, inset_gradient.element_bounds);
+        assert!(drop_gradient.bounds.size.width > drop_gradient.element_bounds.size.width);
+        assert!(drop_gradient.bounds.size.height > drop_gradient.element_bounds.size.height);
+        assert!(inset_gradient.bounds.size.width < inset_gradient.element_bounds.size.width);
+        assert!(inset_gradient.bounds.size.height < inset_gradient.element_bounds.size.height);
+        assert!(drop_gradient.order < inset_gradient.order);
+    }
+
+    #[gpui::test]
+    fn corner_smoothing_reaches_every_styled_scene_primitive(cx: &mut TestAppContext) {
+        let frame = ImageFrame::new(ImageBuffer::from_pixel(2, 2, Rgba([255, 255, 255, 255])));
+        let image = Arc::new(RenderImage::new(smallvec![frame]));
+        let window = cx.add_window(move |_, _| CornerSmoothingSceneView { image });
+
+        window
+            .update(cx, |_, window, _| {
+                let scene = &window.rendered_frame.scene;
+                assert_smoothing(
+                    "quads",
+                    2,
+                    scene.quads.iter().map(|quad| quad.corner_smoothing),
+                );
+                assert_smoothing(
+                    "shadows",
+                    2,
+                    scene.shadows.iter().map(|shadow| shadow.corner_smoothing),
+                );
+                assert_smoothing(
+                    "backdrop filters",
+                    1,
+                    scene
+                        .backdrop_filters
+                        .iter()
+                        .map(|filter| filter.corner_smoothing),
+                );
+                assert_smoothing(
+                    "filter boundaries",
+                    2,
+                    scene
+                        .filter_boundaries
+                        .iter()
+                        .map(|boundary| boundary.corner_smoothing),
+                );
+                assert_smoothing(
+                    "images",
+                    1,
+                    scene
+                        .polychrome_sprites
+                        .iter()
+                        .map(|image| image.corner_smoothing),
+                );
+                for inset in [ShaderBool::Disabled, ShaderBool::Enabled] {
+                    assert!(scene.shadows.iter().any(|shadow| shadow.inset == inset));
+                }
+
+                let border = scene
+                    .quads
+                    .iter()
+                    .find(|quad| quad.border_widths.top.0 > 0.0)
+                    .expect("border quad");
+                let scale = window.scale_factor();
+                assert_eq!(
+                    [
+                        border.border_widths.top.0,
+                        border.border_widths.right.0,
+                        border.border_widths.bottom.0,
+                        border.border_widths.left.0,
+                    ],
+                    [2.0, 4.0, 6.0, 8.0].map(|width| width * scale)
+                );
+            })
+            .unwrap();
     }
 
     struct OpensWindowOnPaint {
@@ -7622,6 +7941,31 @@ mod tests {
                 ));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_window_visibility_can_be_changed(cx: &mut TestAppContext) {
+        for show in [false, true] {
+            let window = cx.update(|cx| {
+                cx.open_window(
+                    WindowOptions {
+                        show,
+                        ..Default::default()
+                    },
+                    |_, cx| cx.new(|_| EmptyView),
+                )
+                .unwrap()
+            });
+            let platform_window = cx.test_window(window.into());
+            assert_eq!(platform_window.is_visible(), show);
+
+            for visible in [false, false, true, true, false, true] {
+                window
+                    .update(cx, |_, window, _| window.set_visible(visible))
+                    .unwrap();
+                assert_eq!(platform_window.is_visible(), visible);
+            }
+        }
     }
 
     #[gpui::test]
@@ -8094,53 +8438,6 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn platform_ownership_loss_releases_pointer_capture(cx: &mut TestAppContext) {
-        let window = cx.add_window(|_, _| EmptyView);
-
-        window
-            .update(cx, |_, window, cx| {
-                window.capture_pointer(super::HitboxId(42));
-                assert!(window.captured_hitbox().is_some());
-
-                window.cancel_pointer_interaction(cx);
-
-                assert!(window.captured_hitbox().is_none());
-            })
-            .expect("test window should remain open");
-    }
-
-    #[gpui::test]
-    fn programmatic_close_uses_native_should_close_handler(cx: &mut TestAppContext) {
-        let allow_close = Rc::new(Cell::new(false));
-        let close_requests = Rc::new(Cell::new(0));
-        let window = cx.add_window(|_, _| EmptyView);
-
-        window
-            .update(cx, |_, window, cx| {
-                let allow_close = allow_close.clone();
-                let close_requests = close_requests.clone();
-                window.on_window_should_close(cx, move |_, _| {
-                    close_requests.set(close_requests.get() + 1);
-                    allow_close.get()
-                });
-
-                window.request_close(cx);
-                assert!(!window.removed);
-            })
-            .expect("rejected close should keep the window open");
-        assert_eq!(close_requests.get(), 1);
-
-        allow_close.set(true);
-        window
-            .update(cx, |_, window, cx| {
-                window.request_close(cx);
-                assert!(window.removed);
-            })
-            .expect("accepted close should mark the window for removal");
-        assert_eq!(close_requests.get(), 2);
-    }
-
     struct FocusForwarder {
         a: FocusHandle,
         b: FocusHandle,
@@ -8198,5 +8495,231 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    #[gpui::test]
+    fn claimed_touch_drag_receives_movement_and_release(cx: &mut TestAppContext) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let events = events.clone();
+            move |_, _| TouchDragListener { events }
+        });
+        let touch = TouchId(1);
+
+        dispatch_touch(window, cx, touch, TouchPhase::Started, 10.);
+        dispatch_touch(window, cx, touch, TouchPhase::Moved, 30.);
+        dispatch_touch(window, cx, touch, TouchPhase::Ended, 40.);
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                (TouchPhase::Started, px(10.)),
+                (TouchPhase::Moved, px(30.)),
+                (TouchPhase::Ended, px(40.)),
+            ]
+        );
+    }
+
+    struct TouchDragListener {
+        events: Rc<RefCell<Vec<(TouchPhase, Pixels)>>>,
+    }
+
+    impl Render for TouchDragListener {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let events = self.events.clone();
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    window.on_mouse_event(move |event: &TouchDragEvent, phase, window, _cx| {
+                        if phase != DispatchPhase::Bubble {
+                            return;
+                        }
+                        events.borrow_mut().push((event.phase, event.position.x));
+                        if event.phase == TouchPhase::Started {
+                            window.prevent_default();
+                        }
+                    });
+                },
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn long_press_is_claimed_only_when_started_prevents_default(cx: &mut TestAppContext) {
+        for response in [
+            LongPressResponse::PreventDefault,
+            LongPressResponse::StopPropagation,
+            LongPressResponse::None,
+        ] {
+            let phases = Rc::new(RefCell::new(Vec::new()));
+            let window = cx.add_window({
+                let phases = phases.clone();
+                move |_, _| LongPressListener { phases, response }
+            });
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 0.);
+            cx.executor().advance_clock(Duration::from_millis(501));
+            cx.executor().run_until_parked();
+            window
+                .update(cx, |_, window, _| {
+                    assert_eq!(
+                        window.long_press_capture.is_some(),
+                        response == LongPressResponse::PreventDefault
+                    );
+                })
+                .unwrap();
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 2.);
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 2.);
+            window
+                .update(cx, |_, window, _| {
+                    assert!(window.long_press_capture.is_none());
+                })
+                .unwrap();
+
+            let phases = phases.borrow();
+            if response == LongPressResponse::PreventDefault {
+                assert_eq!(
+                    phases.as_slice(),
+                    [TouchPhase::Started, TouchPhase::Moved, TouchPhase::Ended]
+                );
+            } else {
+                assert_eq!(phases.as_slice(), [TouchPhase::Started]);
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn stale_default_prevention_does_not_claim_long_press(cx: &mut TestAppContext) {
+        let phases = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let phases = phases.clone();
+            move |_, _| LongPressListener {
+                phases,
+                response: LongPressResponse::None,
+            }
+        });
+        window
+            .update(cx, |_, window, _| {
+                window.prevent_default();
+            })
+            .unwrap();
+
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 0.);
+        cx.executor().advance_clock(Duration::from_millis(501));
+        cx.executor().run_until_parked();
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 2.);
+
+        assert_eq!(phases.borrow().as_slice(), [TouchPhase::Started]);
+    }
+
+    #[gpui::test]
+    fn resolved_touch_cancels_scheduled_long_press(cx: &mut TestAppContext) {
+        for (phase, position) in [
+            (TouchPhase::Ended, 0.),
+            (TouchPhase::Cancelled, 0.),
+            (TouchPhase::Moved, 20.),
+        ] {
+            let phases = Rc::new(RefCell::new(Vec::new()));
+            let window = cx.add_window({
+                let phases = phases.clone();
+                move |_, _| LongPressListener {
+                    phases,
+                    response: LongPressResponse::PreventDefault,
+                }
+            });
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 0.);
+            dispatch_touch(window, cx, TouchId(1), phase, position);
+            cx.executor().advance_clock(Duration::from_millis(501));
+            cx.executor().run_until_parked();
+
+            assert!(phases.borrow().is_empty(), "{phase:?} allowed long press");
+        }
+    }
+
+    #[gpui::test]
+    fn stale_long_press_timer_cannot_affect_replacement_touch(cx: &mut TestAppContext) {
+        let phases = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let phases = phases.clone();
+            move |_, _| LongPressListener {
+                phases,
+                response: LongPressResponse::PreventDefault,
+            }
+        });
+        let first_touch = TouchId(1);
+        dispatch_touch(window, cx, first_touch, TouchPhase::Started, 0.);
+        cx.executor().advance_clock(Duration::from_millis(250));
+        dispatch_touch(window, cx, first_touch, TouchPhase::Cancelled, 0.);
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Started, 10.);
+
+        cx.executor().advance_clock(Duration::from_millis(251));
+        cx.executor().run_until_parked();
+        assert!(phases.borrow().is_empty());
+
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.executor().run_until_parked();
+        assert_eq!(phases.borrow().as_slice(), [TouchPhase::Started]);
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum LongPressResponse {
+        PreventDefault,
+        StopPropagation,
+        None,
+    }
+
+    struct LongPressListener {
+        phases: Rc<RefCell<Vec<TouchPhase>>>,
+        response: LongPressResponse,
+    }
+
+    impl Render for LongPressListener {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity();
+            let phases = self.phases.clone();
+            let response = self.response;
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble {
+                            return;
+                        }
+                        phases.borrow_mut().push(event.phase);
+                        match response {
+                            LongPressResponse::PreventDefault => {
+                                window.capture_long_press(&entity);
+                                window.prevent_default();
+                            }
+                            LongPressResponse::StopPropagation => cx.stop_propagation(),
+                            LongPressResponse::None => {}
+                        }
+                    });
+                },
+            )
+        }
+    }
+
+    fn dispatch_touch<T: 'static>(
+        window: crate::WindowHandle<T>,
+        cx: &mut TestAppContext,
+        id: TouchId,
+        phase: TouchPhase,
+        x: f32,
+    ) {
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_event(
+                    TouchEvent {
+                        id,
+                        phase,
+                        position: point(px(x), px(0.)),
+                        predicted_position: None,
+                        force: None,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
     }
 }

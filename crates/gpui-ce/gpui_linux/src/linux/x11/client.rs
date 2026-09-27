@@ -526,7 +526,7 @@ impl X11Client {
             last_location: Point::new(px(0.0), px(0.0)),
             current_count: 0,
             pinch_scale: 1.0,
-            gpu_context: GpuContext::new(),
+            gpu_context: Rc::new(RefCell::new(None)),
             compositor_gpu,
             gpu_requirements: None,
             scale_factor,
@@ -1554,37 +1554,41 @@ impl LinuxClient for X11Client {
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         let state = self.0.borrow();
-        X11Display::all(&state.xcb_connection, state.scale_factor)
-            .into_iter()
-            .map(|display| Rc::new(display) as Rc<dyn PlatformDisplay>)
+        let setup = state.xcb_connection.setup();
+        setup
+            .roots
+            .iter()
+            .enumerate()
+            .filter_map(|(root_id, _)| {
+                Some(Rc::new(
+                    X11Display::new(&state.xcb_connection, state.scale_factor, root_id).ok()?,
+                ) as Rc<dyn PlatformDisplay>)
+            })
             .collect()
     }
 
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         let state = self.0.borrow();
-        X11Display::primary(&state.xcb_connection, state.scale_factor)
-            .map(|display| Rc::new(display) as Rc<dyn PlatformDisplay>)
+        X11Display::new(
+            &state.xcb_connection,
+            state.scale_factor,
+            state.x_root_index,
+        )
+        .log_err()
+        .map(|display| Rc::new(display) as Rc<dyn PlatformDisplay>)
     }
 
     fn display(&self, id: DisplayId) -> Option<Rc<dyn PlatformDisplay>> {
         let state = self.0.borrow();
-        X11Display::all(&state.xcb_connection, state.scale_factor)
-            .into_iter()
-            .find(|display| display.id() == id)
-            .map(|display| Rc::new(display) as Rc<dyn PlatformDisplay>)
-    }
 
-    #[cfg(feature = "screen-capture")]
-    fn is_screen_capture_supported(&self) -> bool {
-        true
-    }
-
-    #[cfg(feature = "screen-capture")]
-    fn screen_capture_sources(
-        &self,
-    ) -> futures::channel::oneshot::Receiver<anyhow::Result<Vec<Rc<dyn gpui::ScreenCaptureSource>>>>
-    {
-        gpui::scap_screen_capture::scap_screen_sources(&self.0.borrow().common.foreground_executor)
+        Some(Rc::new(
+            X11Display::new(
+                &state.xcb_connection,
+                state.scale_factor,
+                u64::from(id) as usize,
+            )
+            .ok()?,
+        ))
     }
 
     fn set_gpu_requirements(&self, requirements: Box<dyn std::any::Any>) {

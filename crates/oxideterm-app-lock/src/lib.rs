@@ -8,7 +8,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use oxideterm_portable_runtime::keystore::{self as portable_keystore, PortableKeystoreError};
 use oxideterm_secret_store::NativeSecretStore;
-use rand::RngCore;
+use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -155,7 +155,7 @@ struct PasswordVerifier {
 impl PasswordVerifier {
     fn create(password: &str) -> Result<Self> {
         let mut salt = [0_u8; SALT_LENGTH];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rngs::OsRng.try_fill_bytes(&mut salt).expect("OS CSPRNG must be available");
         let digest = derive_digest(password, &salt)?;
         Ok(Self {
             version: VERIFIER_VERSION,

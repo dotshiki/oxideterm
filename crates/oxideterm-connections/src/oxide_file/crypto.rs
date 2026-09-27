@@ -1,6 +1,6 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
-use rand::RngCore;
+use rand::TryRngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -48,7 +48,7 @@ impl OxideBatchEncryptionContext {
             return Err(OxideFileError::PasswordTooShort);
         }
         let mut salt = [0u8; SALT_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rngs::OsRng.try_fill_bytes(&mut salt).expect("OS CSPRNG must be available");
         let kdf_version = kdf_flags::CURRENT_KDF;
         let key = derive_key(password, &salt, kdf_version)?;
         Ok(Self {
@@ -124,8 +124,8 @@ where
 {
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::rngs::OsRng.try_fill_bytes(&mut salt).expect("OS CSPRNG must be available");
+    rand::rngs::OsRng.try_fill_bytes(&mut nonce).expect("OS CSPRNG must be available");
     on_progress("generating_salt_nonce");
 
     let key = derive_key(password, &salt, kdf_flags::CURRENT_KDF)?;
@@ -152,7 +152,7 @@ where
     F: FnMut(&'static str),
 {
     let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::rngs::OsRng.try_fill_bytes(&mut nonce).expect("OS CSPRNG must be available");
     on_progress("generating_nonce");
     on_progress("reusing_derived_key");
     encrypt_oxide_payload(

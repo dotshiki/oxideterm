@@ -4,7 +4,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use rand::{RngCore as _, rngs::OsRng};
+use rand::{TryRngCore as _, rngs::OsRng};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -353,7 +353,7 @@ fn random_control_identifier(prefix: &str) -> String {
     // Use all 128 random bits. UUID v4 text would reserve version and variant
     // bits, which is below the capability-token entropy required by this boundary.
     let mut random = [0_u8; 16];
-    OsRng.fill_bytes(&mut random);
+    OsRng.try_fill_bytes(&mut random).expect("OS CSPRNG must be available");
     let mut identifier = String::with_capacity(prefix.len() + 32);
     identifier.push_str(prefix);
     for byte in random {

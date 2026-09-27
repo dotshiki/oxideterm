@@ -2,53 +2,58 @@ mod app_menu;
 mod keyboard;
 mod keystroke;
 
-#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "wayland"))]
+#[cfg(all(target_os = "linux", feature = "wayland"))]
 #[expect(missing_docs)]
 pub mod layer_shell;
 
 /// Types for configuring parent-anchored popup windows such as menus, dropdowns and tooltips.
 pub mod popup;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 mod threaded_dispatcher;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 mod test;
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 mod visual_test;
 
-#[cfg(all(
-    feature = "screen-capture",
-    any(target_os = "windows", target_os = "linux", target_os = "freebsd",)
-))]
-pub mod scap_screen_capture;
+#[cfg(all(feature = "screen-capture", target_os = "windows"))]
+pub mod screen_capture;
+#[cfg(target_os = "windows")]
+mod windows_screen_capture;
+#[cfg(target_os = "windows")]
+pub use windows_screen_capture::WindowsScreenCaptureFrame;
 
-#[cfg(all(
-    any(target_os = "windows", target_os = "linux"),
-    feature = "screen-capture"
-))]
-pub(crate) type PlatformScreenCaptureFrame = scap::frame::Frame;
+#[cfg(all(target_os = "windows", feature = "screen-capture"))]
+pub(crate) type PlatformScreenCaptureFrame = WindowsScreenCaptureFrame;
 #[cfg(not(feature = "screen-capture"))]
 pub(crate) type PlatformScreenCaptureFrame = ();
 #[cfg(all(target_os = "macos", feature = "screen-capture"))]
 pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBuffer;
+#[cfg(all(
+    feature = "screen-capture",
+    not(any(target_os = "macos", target_os = "windows"))
+))]
+// Screen capture currently has native frame representations only on macOS and Windows. Keep the
+// cross-platform API well-formed for enabled-but-unsupported targets; source enumeration simply
+// yields no platform sources there.
+pub(crate) type PlatformScreenCaptureFrame = ();
 
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
-    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, DynamicTextureParams, Edges,
-    ExternalDragPayload, Font, FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs,
-    ImageSource, Keymap, LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
-    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
-    hash, point, px, size,
+    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
+    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap,
+    LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
+    Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
 use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, DynamicImage, Frame};
@@ -79,13 +84,13 @@ pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub use threaded_dispatcher::ThreadedDispatcher;
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
@@ -356,7 +361,6 @@ pub trait Platform: 'static {
     /// Register additional GPU device requirements (features, limits) before
     /// the first window is opened.  The concrete type inside the `Box` must be
     /// `gpui_wgpu::WgpuDeviceRequirements`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn set_gpu_requirements(&self, _requirements: Box<dyn std::any::Any>) {}
 
     /// Sets the label applied to credentials stored in the system keyring.
@@ -385,16 +389,6 @@ pub trait PlatformDisplay: Debug {
 
     /// Get the bounds for this display
     fn bounds(&self) -> Bounds<Pixels>;
-
-    /// Returns display bounds in the platform's physical pixel coordinate space.
-    fn physical_bounds(&self) -> Bounds<DevicePixels> {
-        self.bounds().to_device_pixels(self.scale_factor())
-    }
-
-    /// Returns the scale used to map logical coordinates to physical pixels.
-    fn scale_factor(&self) -> f32 {
-        1.0
-    }
 
     /// Get the visible bounds for this display, excluding taskbar/dock areas.
     /// This is the usable area where windows can be placed without being obscured.
@@ -875,9 +869,6 @@ pub enum TextInputStateChange {
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
-    fn is_minimized(&self) -> bool {
-        false
-    }
     fn window_bounds(&self) -> WindowBounds;
     fn content_size(&self) -> Size<Pixels>;
     fn resize(&mut self, size: Size<Pixels>);
@@ -889,6 +880,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
+    /// Apply the focused text region's [`TextInputConfiguration`] to the
+    /// platform's text input session (e.g. attributes of the hidden editable
+    /// element on web). Called only when the configuration changes, because
+    /// reconfiguring a live input session can restart the IME connection.
+    fn set_text_input_configuration(&mut self, _configuration: TextInputConfiguration) {}
     fn prompt(
         &self,
         level: PromptLevel,
@@ -904,6 +900,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Show or hide the window without explicitly requesting focus.
+    ///
+    /// The default implementation does nothing for platforms that do not support
+    /// changing window visibility at runtime.
+    fn set_visible(&self, _visible: bool) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -975,7 +976,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn start_window_resize(&self, _edge: ResizeEdge) {}
     fn set_exclusive_zone(&self, _zone: Pixels) {}
-    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "wayland"))]
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
     fn set_exclusive_edge(&self, _edge: layer_shell::Anchor) {}
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn window_decorations(&self) -> Decorations {
@@ -993,8 +994,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     /// Returns the GPU context for this window's renderer.
     /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
     fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    /// Returns typed backend-specific GPU context information for custom
+    /// controls. The value is intentionally type-erased in this crate so the
+    /// core UI crate does not depend on a rendering backend.
+    #[cfg(any(target_family = "wasm", target_os = "linux", target_os = "freebsd"))]
+    fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
         None
     }
 
@@ -1004,7 +1013,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// captured the device from `gpu_context` should stop submitting while
     /// this is `Some(true)` and re-acquire the device once it reads
     /// `Some(false)` again.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
     fn gpu_device_lost(&self) -> Option<bool> {
         None
     }
@@ -1054,7 +1063,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Inform the adapter of updated window bounds.
     fn a11y_update_window_bounds(&self) {}
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None
     }
@@ -1069,7 +1078,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 }
 
 /// A renderer for headless windows that can produce real rendered output.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub trait PlatformHeadlessRenderer {
     /// Render a scene and return the result as an RGBA image.
     fn render_scene_to_image(
@@ -1135,14 +1144,14 @@ pub trait PlatformDispatcher: Send + Sync {
         gpui_util::defer(Box::new(|| {}))
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn as_test(&self) -> Option<&TestDispatcher> {
         None
     }
 
     // This cfg must match the `threaded_dispatcher` module's, which implements
     // this method whenever it compiles.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn as_threaded(&self) -> Option<&ThreadedDispatcher> {
         None
     }
@@ -1370,7 +1379,6 @@ pub enum AtlasKey {
     Glyph(RenderGlyphParams),
     Svg(RenderSvgParams),
     Image(RenderImageParams),
-    DynamicTexture(DynamicTextureParams),
 }
 
 impl AtlasKey {
@@ -1395,7 +1403,6 @@ impl AtlasKey {
             }
             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
             AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
-            AtlasKey::DynamicTexture(_) => AtlasTextureKind::Polychrome,
         }
     }
 }
@@ -1418,12 +1425,6 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
-impl From<DynamicTextureParams> for AtlasKey {
-    fn from(params: DynamicTextureParams) -> Self {
-        Self::DynamicTexture(params)
-    }
-}
-
 #[expect(missing_docs)]
 pub trait PlatformAtlas {
     fn get_or_insert_with<'a>(
@@ -1431,20 +1432,9 @@ pub trait PlatformAtlas {
         key: &AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
-
-    /// Updates a device-pixel region relative to the top-left of an existing atlas entry.
-    fn update(&self, _key: &AtlasKey, _bounds: Bounds<DevicePixels>, _bytes: &[u8]) -> Result<()> {
-        anyhow::bail!("dynamic texture updates are not supported by this platform atlas")
-    }
-
-    /// Returns the generation of the GPU resources backing this atlas.
-    fn resource_generation(&self) -> u64 {
-        0
-    }
-
     fn remove(&self, key: &AtlasKey);
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
     }
@@ -1525,6 +1515,31 @@ pub enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
     Subpixel = 2,
+}
+
+impl AtlasTextureKind {
+    /// Validates a tightly packed bitmap before an atlas allocates or caches its tile.
+    /// Monochrome tiles contain one coverage byte; color and LCD tiles contain four bytes.
+    pub fn validate_upload(self, size: Size<DevicePixels>, bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            size.width.0 > 0 && size.height.0 > 0,
+            "{self:?} atlas upload requires positive dimensions, got {size:?}"
+        );
+        let channels = match self {
+            Self::Monochrome => 1,
+            Self::Polychrome | Self::Subpixel => 4,
+        };
+        let expected = (size.width.0 as usize)
+            .checked_mul(size.height.0 as usize)
+            .and_then(|pixels| pixels.checked_mul(channels))
+            .ok_or_else(|| anyhow::anyhow!("atlas upload byte count overflow for {size:?}"))?;
+        anyhow::ensure!(
+            bytes.len() == expected,
+            "{self:?} atlas upload for {size:?} requires {expected} bytes, got {}",
+            bytes.len()
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1767,6 +1782,23 @@ impl PlatformInputHandler {
             })
             .unwrap_or(false)
     }
+
+    /// See [`InputHandler::text_input_configuration`].
+    pub fn text_input_configuration(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> TextInputConfiguration {
+        self.handler.text_input_configuration(window, cx)
+    }
+
+    /// See [`InputHandler::text_input_editable_range`].
+    pub fn text_input_editable_range(&mut self) -> Option<Range<usize>> {
+        self.cx
+            .update(|window, cx| self.handler.text_input_editable_range(window, cx))
+            .ok()
+            .flatten()
+    }
 }
 
 /// A struct representing a selection in a text buffer, in UTF16 characters.
@@ -1925,6 +1957,24 @@ pub trait InputHandler: 'static {
         true
     }
 
+    /// The contiguous range of text, in UTF-16 code units, that platform text
+    /// input may read and edit around the current selection.
+    ///
+    /// Platforms that mirror document text into an IME-editable buffer clamp
+    /// the mirrored window to this range, so multi-step IME edit gestures
+    /// (word deletion, autocorrect rewrites, suggestion picks) cannot reach
+    /// content outside it. The range should contain the current selection;
+    /// when it cannot (a selection spanning a region boundary), platforms
+    /// degrade the mirrored IME context rather than widening the range.
+    /// `None` places no bound.
+    fn text_input_editable_range(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Range<usize>> {
+        None
+    }
+
     /// Returns whether printable keys should be routed to the IME before keybinding
     /// matching when a non-ASCII input source (e.g. Japanese, Korean, Chinese IME)
     /// is active. This prevents multi-stroke keybindings like `jj` from intercepting
@@ -1936,6 +1986,84 @@ pub trait InputHandler: 'static {
     fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         false
     }
+
+    /// Get this handler's preferences for platform text assistance.
+    ///
+    /// GPUI re-queries this every frame and forwards it to the platform window
+    /// only when it changes, so implementations must be cheap and may vary the
+    /// result with application state (e.g. with the cursor's position).
+    fn text_input_configuration(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> TextInputConfiguration {
+        TextInputConfiguration::default()
+    }
+}
+
+/// Platform text-assistance preferences for the focused text region.
+///
+/// Returned by [`InputHandler::text_input_configuration`] and forwarded to the
+/// platform whenever it changes; the platform maps the fields onto its native
+/// input-session attributes (on web, DOM attributes of the hidden editable
+/// element such as `autocorrect` and `enterkeyhint`).
+///
+/// The default disables all text assistance and requests no particular action
+/// key presentation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextInputConfiguration {
+    /// Whether the platform may automatically correct entered text.
+    pub autocorrect: bool,
+    /// How software keyboards automatically capitalize entered text.
+    pub autocapitalize: Autocapitalize,
+    /// Whether software keyboards may offer word suggestions and spellcheck.
+    pub suggestions: bool,
+    /// The action advertised on a software keyboard's confirm ("enter") key.
+    pub input_action: TextInputAction,
+}
+
+/// Automatic capitalization applied by software keyboards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Autocapitalize {
+    /// No automatic capitalization.
+    #[default]
+    None,
+    /// Capitalize the first letter of each word.
+    Words,
+    /// Capitalize the first letter of each sentence.
+    Sentences,
+    /// Capitalize every letter.
+    Characters,
+}
+
+/// The action a software keyboard advertises on its confirm ("enter") key.
+///
+/// This affects only how the key is presented (icon or label); pressing it is
+/// still delivered as ordinary input.
+///
+/// The variants are the HTML `enterkeyhint` attribute's value set
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-enterkeyhint-attribute>),
+/// which also maps onto Android's `IME_ACTION_*` constants and iOS's
+/// `UIReturnKeyType`; [`TextInputAction::Unspecified`] means "emit no hint".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextInputAction {
+    /// Let the platform choose its default presentation.
+    #[default]
+    Unspecified,
+    /// Inserting a line break.
+    Enter,
+    /// Committing the field's value.
+    Done,
+    /// Navigating to the typed target.
+    Go,
+    /// Moving to the next field.
+    Next,
+    /// Moving to the previous field.
+    Previous,
+    /// Executing a search.
+    Search,
+    /// Sending a message.
+    Send,
 }
 
 /// The variables that can be configured when creating a new window
@@ -2060,7 +2188,8 @@ pub struct WindowParams {
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub show: bool,
 
-    /// An image to set as the window icon (x11 only)
+    /// An image to set as the window icon (X11 and Wayland only)
+    /// Wayland requires the xdg-toplevel-icon protocol to be available
     #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub icon: Option<Arc<image::RgbaImage>>,
 
@@ -2176,7 +2305,7 @@ pub enum WindowKind {
 
     /// A Wayland LayerShell window, used to draw overlays or backgrounds for applications such as
     /// docks, notifications or wallpapers.
-    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "wayland"))]
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
     LayerShell(layer_shell::LayerShellOptions),
 
     /// A window that appears on top of its parent window and blocks interaction with it
@@ -2414,9 +2543,6 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
-
-    /// Hide the system cursor.
-    None,
 }
 
 /// A clipboard item that should be copied to the clipboard
@@ -2890,6 +3016,8 @@ impl From<String> for ClipboardString {
 
 #[cfg(test)]
 mod image_tests {
+    use crate::AssetRegistry;
+
     use super::*;
     use std::sync::Arc;
 
@@ -2900,7 +3028,9 @@ mod image_tests {
             include_bytes!("../examples/legacy/image/exif-orientation-rotate-180.jpg").to_vec(),
         );
 
-        let render_image = image.to_image_data(SvgRenderer::new(Arc::new(()))).unwrap();
+        let render_image = image
+            .to_image_data(SvgRenderer::new(Arc::new(AssetRegistry::default())))
+            .unwrap();
 
         assert_eq!(render_image.size(0), size(16.into(), 32.into()));
 
@@ -2919,7 +3049,9 @@ mod image_tests {
                 .to_vec(),
         );
 
-        let render_image = image.to_image_data(SvgRenderer::new(Arc::new(()))).unwrap();
+        let render_image = image
+            .to_image_data(SvgRenderer::new(Arc::new(AssetRegistry::default())))
+            .unwrap();
         let bytes = render_image.as_bytes(0).unwrap();
 
         for pixel in bytes.chunks_exact(4) {

@@ -2,9 +2,9 @@ use scheduler::Instant;
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use crate::{
-    AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
-    ParentElement, SpringAnimation, SpringConfig, SpringPlayback, SpringState, SpringTarget,
-    Window,
+    AnyElement, App, AppContext, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, ParentElement, SpringAnimation, SpringConfig, SpringPlayback, SpringState,
+    SpringTarget, Window,
 };
 
 pub use easing::*;
@@ -108,6 +108,8 @@ pub trait AnimationExt {
     where
         Self: Sized,
     {
+        debug_assert!(!animations.is_empty(), "animations must not be empty");
+
         AnimationElement {
             id: id.into(),
             element: Some(self),
@@ -268,7 +270,8 @@ impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
-            // The platform clock keeps animation time aligned with scheduler timers and tests.
+            // Use the executor clock so spring progression is deterministic in
+            // tests and remains consistent with scheduled animation work.
             let now = cx.background_executor().now();
             let initial = self.initial.unwrap_or(self.target);
             let mut state = state.unwrap_or_else(|| SpringElementState {
@@ -400,10 +403,8 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
-            // The platform clock keeps animation time aligned with scheduler timers and tests.
-            let now = cx.background_executor().now();
             let mut state = state.unwrap_or_else(|| AnimationState {
-                start: now,
+                start: Instant::now(),
                 animation_ix: 0,
                 delayed_frame_pending: Rc::new(Cell::new(false)),
             });
@@ -420,11 +421,11 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                 let duration = self.animations[animation_ix].duration;
 
                 let elapsed = if self.animations[animation_ix].synced && !duration.is_zero() {
-                    let elapsed = now - cx.synced_animation_epoch;
+                    let elapsed = cx.background_executor().now() - cx.synced_animation_epoch;
                     // Reduce modulo the duration before f32 conversion, which loses sub-second precision at scale.
                     Duration::from_nanos((elapsed.as_nanos() % duration.as_nanos()) as u64)
                 } else {
-                    now.duration_since(state.start)
+                    state.start.elapsed()
                 };
                 let mut delta = elapsed.as_secs_f32() / duration.as_secs_f32();
 
@@ -434,7 +435,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                         if animation_ix >= self.animations.len() - 1 {
                             done = true;
                         } else {
-                            state.start = now;
+                            state.start = Instant::now();
                             state.animation_ix += 1;
                         }
                         delta = 1.0;
@@ -741,6 +742,11 @@ mod tests {
 
         cx.executor().advance_clock(Duration::from_millis(50));
         assert!(simulate_next_frame(&window, cx) > 0);
+        // Delivering the frame callback only notifies the view. Explicitly
+        // flush that invalidation so randomized test-scheduler ordering cannot
+        // leave the assertion observing the pre-frame value.
+        cx.refresh().unwrap();
+        cx.run_until_parked();
         let value_before_retargeting = *rendered_values.borrow().last().unwrap();
         assert!(value_before_retargeting > px(0.0));
         assert!(value_before_retargeting < px(100.0));
@@ -755,6 +761,8 @@ mod tests {
 
         cx.executor().advance_clock(Duration::from_millis(5));
         assert!(simulate_next_frame(&window, cx) > 0);
+        cx.refresh().unwrap();
+        cx.run_until_parked();
         let value_after_retargeting = *rendered_values.borrow().last().unwrap();
         assert!(value_after_retargeting > value_before_retargeting);
     }
