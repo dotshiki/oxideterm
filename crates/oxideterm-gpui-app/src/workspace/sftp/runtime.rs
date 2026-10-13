@@ -353,7 +353,7 @@ impl SftpWorkspaceEntity {
     ) {
         let delay = Duration::from_secs(2_u64.saturating_pow(attempt as u32));
         self.remote_load_retry_task = Some(cx.spawn(async move |entity, cx| {
-            gpui::Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |sftp, cx| {
                 sftp.remote_load_retry_task = None;
                 if sftp.current_surface_id == Some(surface_id)

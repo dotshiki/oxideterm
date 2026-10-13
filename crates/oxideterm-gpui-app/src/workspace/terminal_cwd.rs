@@ -298,7 +298,9 @@ impl WorkspaceTerminalEntity {
     ) {
         cx.spawn(async move |terminal, cx| {
             for _ in 0..TERMINAL_CWD_REPORT_POLL_ATTEMPTS {
-                gpui::Timer::after(TERMINAL_CWD_REPORT_POLL_INTERVAL).await;
+                cx.background_executor()
+                    .timer(TERMINAL_CWD_REPORT_POLL_INTERVAL)
+                    .await;
                 match terminal.update(cx, |terminal, cx| {
                     terminal.apply_cwd_report_if_ready(generation, &pane, cx)
                 }) {

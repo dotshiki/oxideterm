@@ -2637,12 +2637,12 @@ impl WorkspaceApp {
         // their established button alignment; both mount at the window root.
         deferred(
             anchored()
-                .anchor(Corner::TopLeft)
+                .anchor(Anchor::TopLeft)
                 .position(gpui::point(px(placement.x), px(placement.y)))
                 .position_mode(AnchoredPositionMode::Window)
                 .child(overlay_content_boundary(popup)),
         )
-        .with_priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
+        .priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
         .into_any_element()
     }
 

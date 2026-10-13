@@ -303,7 +303,7 @@ impl IdeSurface {
                         .position_mode(AnchoredPositionMode::Window)
                         .child(popup),
                 )
-                .with_priority(IDE_TAB_CONTEXT_MENU_Z),
+                .priority(IDE_TAB_CONTEXT_MENU_Z),
             )
             .into_any_element()
     }
@@ -570,7 +570,7 @@ impl IdeSurface {
                         .position_mode(AnchoredPositionMode::Window)
                         .child(popup),
                 )
-                .with_priority(IDE_TREE_CONTEXT_MENU_Z),
+                .priority(IDE_TREE_CONTEXT_MENU_Z),
             )
             .into_any_element()
     }

@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Bounds, Context, CursorStyle, DispatchPhase, ElementId, Entity,
-    HitboxBehavior, Hsla, InteractiveElement, IntoColor, IntoElement, MouseButton, ParentElement,
-    Pixels, Point, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledText,
-    TextAlign, TextLayout, TextRun, Timer, Window, canvas, div, font, point,
-    prelude::FluentBuilder, px, rgb, size,
+    HitboxBehavior, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    Point, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledText, TextAlign,
+    TextLayout, TextRun, Window, canvas, div, font, point, prelude::FluentBuilder, px, rgb,
+    rgb_to_hsla, size,
 };
 use oxideterm_gpui_ui::{
     scroll::{ScrollableElement, vertical_scrollbar_layer},
@@ -188,7 +188,9 @@ impl WorkspaceApp {
         }
         self.selectable_text_autoscroll_scheduled = true;
         cx.spawn(async move |weak, cx| {
-            Timer::after(Duration::from_millis(16)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
             let _ = weak.update(cx, |this, cx| {
                 this.selectable_text_autoscroll_scheduled = false;
                 let Some(position) = this.selectable_text_autoscroll_position else {
@@ -641,7 +643,7 @@ impl WorkspaceApp {
         font_family: Option<SharedString>,
         alpha: f32,
     ) -> TextRun {
-        let mut color: Hsla = rgb(color).into_color();
+        let mut color: Hsla = rgb_to_hsla(rgb(color));
         color.alpha = alpha.clamp(0.0, 1.0);
         TextRun {
             len: value.len(),
@@ -1122,7 +1124,7 @@ impl SelectableTextRenderState {
         let run = TextRun {
             len: text.len(),
             font: font(self.ui_font_family.clone()),
-            color: rgb(color).into_color(),
+            color: rgb_to_hsla(rgb(color)),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -1327,7 +1329,7 @@ impl SelectableTextRenderState {
 }
 
 fn selection_bg(accent: u32) -> Hsla {
-    let mut color: Hsla = rgb(accent).into_color();
+    let mut color: Hsla = rgb_to_hsla(rgb(accent));
     color.alpha = 0.25;
     color
 }

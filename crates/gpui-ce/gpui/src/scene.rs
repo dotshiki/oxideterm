@@ -4,9 +4,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::window::PreparedGlyphBatch;
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Pixels, Point,
-    Radians, ScaledFilter, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ColorExt, ContentMask, Corners, Edges, Pixels,
+    Point, Radians, ScaledFilter, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use smallvec::SmallVec;
 use std::{
@@ -14,6 +15,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 mod plan;
@@ -135,6 +137,80 @@ impl Scene {
         self.insert_primitive_with_surface_opacity(Primitive::Surface(surface), Some(opacity));
     }
 
+    /// Expands a cached glyph batch into sprites while retaining one replay operation.
+    pub(crate) fn insert_prepared_glyph_batch(
+        &mut self,
+        batch: Arc<PreparedGlyphBatch>,
+        origin: Point<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+        opacity: f32,
+    ) {
+        self.is_finished = false;
+        let layer_order = self.layer_stack.last().copied();
+        for glyph in &batch.monochrome {
+            let mut sprite = MonochromeSprite {
+                order: 0,
+                padding: 0,
+                bounds: glyph.bounds + origin,
+                content_mask,
+                color: SceneHsla::from(glyph.color.opacity(opacity)),
+                tile: glyph.tile,
+                transformation: TransformationMatrix::unit(),
+            };
+            let clipped_bounds = sprite.bounds.intersect(&sprite.content_mask.bounds);
+            if clipped_bounds.is_empty() {
+                continue;
+            }
+            sprite.order =
+                layer_order.unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            self.monochrome_sprites.push(sprite);
+        }
+        for glyph in &batch.subpixel {
+            let mut sprite = SubpixelSprite {
+                order: 0,
+                padding: 0,
+                bounds: glyph.bounds + origin,
+                content_mask,
+                color: SceneHsla::from(glyph.color.opacity(opacity)),
+                tile: glyph.tile,
+                transformation: TransformationMatrix::unit(),
+            };
+            let clipped_bounds = sprite.bounds.intersect(&sprite.content_mask.bounds);
+            if clipped_bounds.is_empty() {
+                continue;
+            }
+            sprite.order =
+                layer_order.unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            self.subpixel_sprites.push(sprite);
+        }
+        for glyph in &batch.polychrome {
+            let mut sprite = PolychromeSprite {
+                order: 0,
+                grayscale: false.into(),
+                opacity,
+                corner_smoothing: 0.0,
+                bounds: glyph.bounds + origin,
+                content_mask,
+                corner_radii: Default::default(),
+                tile: glyph.tile,
+            };
+            let clipped_bounds = sprite.bounds.intersect(&sprite.content_mask.bounds);
+            if clipped_bounds.is_empty() {
+                continue;
+            }
+            sprite.order =
+                layer_order.unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            self.polychrome_sprites.push(sprite);
+        }
+        self.paint_operations
+            .push(PaintOperation::PreparedGlyphBatch {
+                batch,
+                origin,
+                content_mask,
+                opacity,
+            });
+    }
+
     fn insert_primitive_with_surface_opacity(
         &mut self,
         mut primitive: Primitive,
@@ -244,6 +320,13 @@ impl Scene {
                 PaintOperation::Surface { surface, opacity } => {
                     self.insert_surface(surface.clone(), *opacity)
                 }
+                PaintOperation::PreparedGlyphBatch {
+                    batch,
+                    origin,
+                    content_mask,
+                    opacity,
+                } => self
+                    .insert_prepared_glyph_batch(batch.clone(), *origin, *content_mask, *opacity),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -397,6 +480,12 @@ pub(crate) enum PrimitiveKind {
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     Surface { surface: PaintSurface, opacity: f32 },
+    PreparedGlyphBatch {
+        batch: Arc<PreparedGlyphBatch>,
+        origin: Point<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+        opacity: f32,
+    },
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }

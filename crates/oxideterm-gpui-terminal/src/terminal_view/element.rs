@@ -8,8 +8,8 @@ use std::{
 
 use gpui::{
     App, Bounds, ContentMask, CursorStyle, Element, ElementId, Entity, FocusHandle,
-    GlobalElementId, Hsla, InspectorElementId, IntoColor, IntoElement, LayoutId, LineLayout,
-    LinePaintCache, Pixels, SharedString, Style, TextRun, Window, fill, point, px, relative, rgb,
+    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, LineLayout, LinePaintCache,
+    Pixels, SharedString, Style, TextRun, Window, fill, point, px, relative, rgb, rgb_to_hsla,
     rgba, size,
 };
 use oxideterm_terminal::{
@@ -789,8 +789,9 @@ impl TerminalElement {
                     .as_ref()
                     .map(|query| query.as_str()),
                 visible_rows.clone(),
-                rgba((self.theme.tokens.ui.warning << 8) | TRANSIENT_COMMAND_HIGHLIGHT_ALPHA)
-                    .into_color(),
+                rgb_to_hsla(rgba(
+                    (self.theme.tokens.ui.warning << 8) | TRANSIENT_COMMAND_HIGHLIGHT_ALPHA,
+                )),
             ),
         );
         let command_mark_overlays = command_mark_overlays_for_rows(
@@ -1015,8 +1016,9 @@ impl TerminalElement {
         let transient = self.transient_command_highlight.as_ref().map(|highlight| {
             (
                 highlight,
-                rgba((self.theme.tokens.ui.warning << 8) | TRANSIENT_COMMAND_HIGHLIGHT_ALPHA)
-                    .into_color(),
+                rgb_to_hsla(rgba(
+                    (self.theme.tokens.ui.warning << 8) | TRANSIENT_COMMAND_HIGHLIGHT_ALPHA,
+                )),
             )
         });
         let mut layout = terminal_highlights_for_rows(

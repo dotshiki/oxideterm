@@ -99,7 +99,7 @@ impl WorkspaceApp {
         );
         // Keep the panel mounted until its closing transition completes.
         cx.spawn(async move |weak, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = weak.update(cx, |this, cx| {
                 if this.sidebar_collapsed && this.sidebar_motion_generation == generation {
                     this.sidebar_rendered = false;
@@ -134,7 +134,7 @@ impl WorkspaceApp {
         );
         // Delayed unmount makes the right sidebar's collapse animation observable.
         cx.spawn(async move |weak, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = weak.update(cx, |this, cx| {
                 if !this.context_sidebar_visible()
                     && this.context_sidebar_motion_generation == generation

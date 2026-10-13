@@ -213,7 +213,7 @@ fn terminal_element_preserves_explicit_foreground_for_detected_urls() {
         .find(|run| run.text.contains("https"))
         .expect("suggestion URL run");
 
-    assert_eq!(suggestion_run.style.color, rgb(0x687078).into_color());
+    assert_eq!(suggestion_run.style.color, rgb_to_hsla(rgb(0x687078)));
     assert!(suggestion_run.style.underline.is_none());
 }
 
@@ -286,7 +286,7 @@ fn terminal_element_does_not_recolor_path_like_prompt_segments() {
             .iter()
             .filter(|run| run.text.contains("Documents") || run.text.contains("OxideTerm"))
             .all(|run| {
-                run.style.underline.is_none() && run.style.color == rgb(0xffffff).into_color()
+                run.style.underline.is_none() && run.style.color == rgb_to_hsla(rgb(0xffffff))
             })
     );
 }

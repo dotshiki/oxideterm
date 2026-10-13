@@ -449,7 +449,7 @@ impl WorkspaceOverlayEntity {
             return (true, effect);
         }
         self.confirm_exit_task = Some(cx.spawn(async move |overlay, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = overlay.update(cx, |overlay, cx| {
                 overlay.finish_confirm_exit(generation, cx);
             });
@@ -805,7 +805,7 @@ impl WorkspaceOverlayEntity {
         let generation = self.deadline_generation;
         let delay = deadline.saturating_duration_since(Instant::now());
         self.deadline_task = Some(cx.spawn(async move |overlay, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = overlay.update(cx, |overlay, cx| {
                 overlay.handle_deadline_generation(generation, Instant::now(), cx);
             });
@@ -1142,7 +1142,7 @@ impl WorkspaceOverlayEntity {
                     .max_w(px(tokens.metrics.ui_toast_width))
                     .children(cards),
             )
-            .with_priority(CONNECTION_CARD_LAYER_PRIORITY)
+            .priority(CONNECTION_CARD_LAYER_PRIORITY)
             .into_any_element(),
         )
     }
@@ -1600,12 +1600,12 @@ fn render_tooltip(
     };
     deferred(
         anchored()
-            .anchor(Corner::TopLeft)
+            .anchor(Anchor::TopLeft)
             .position(gpui::point(px(tooltip.x), px(tooltip.y)))
             .position_mode(AnchoredPositionMode::Window)
             .child(surface),
     )
-    .with_priority(oxideterm_gpui_ui::modal::TAURI_TOOLTIP_LAYER_PRIORITY)
+    .priority(oxideterm_gpui_ui::modal::TAURI_TOOLTIP_LAYER_PRIORITY)
     .into_any_element()
 }
 
@@ -1688,7 +1688,7 @@ fn render_terminal_font_size_hud(
         layer,
         oxideterm_gpui_ui::motion::MotionDuration::Control,
     ))
-    .with_priority(oxideterm_gpui_ui::modal::TAURI_TOOLTIP_LAYER_PRIORITY)
+    .priority(oxideterm_gpui_ui::modal::TAURI_TOOLTIP_LAYER_PRIORITY)
     .into_any_element()
 }
 

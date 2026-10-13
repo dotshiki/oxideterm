@@ -2039,7 +2039,7 @@ impl WorkspaceApp {
                 .child(
                     deferred(
                         anchored()
-                            .anchor(Corner::TopLeft)
+                            .anchor(Anchor::TopLeft)
                             .position(anchor.bounds.bottom_left())
                             .offset(point(
                                 px(0.0),
@@ -2048,7 +2048,7 @@ impl WorkspaceApp {
                             .position_mode(AnchoredPositionMode::Window)
                             .child(popup),
                     )
-                    .with_priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY),
+                    .priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY),
                 )
                 .into_any_element(),
         )

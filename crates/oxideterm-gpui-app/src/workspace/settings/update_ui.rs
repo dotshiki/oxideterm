@@ -39,7 +39,7 @@ impl WorkspaceApp {
         }
 
         cx.spawn(async move |weak, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = weak.update(cx, |this, cx| {
                 if this
                     .native_update_notification_presence

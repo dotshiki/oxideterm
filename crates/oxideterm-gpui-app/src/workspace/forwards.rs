@@ -7,7 +7,7 @@ use std::{
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, KeyDownEvent, MouseButton, MouseDownEvent,
-    SharedString, Timer, Window, div, px, rgb,
+    SharedString, Window, div, px, rgb,
 };
 use oxideterm_forwarding::{
     DetectedPort, ForwardEvent, ForwardRule, ForwardStats, ForwardStatus, ForwardType,

@@ -786,7 +786,9 @@ window.focus(&this.focus_handle, cx);
             panel.generation
         });
         cx.spawn(async move |weak, cx| {
-            Timer::after(Duration::from_millis(1500)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
             let _ = weak.update(cx, |this, cx| {
                 let changed = this.ai_entity.update(cx, |ai, _cx| {
                     let panel = ai.terminal_inline_panel_mut();

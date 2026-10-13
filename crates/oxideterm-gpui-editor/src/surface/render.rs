@@ -968,7 +968,7 @@ impl TextEditorView {
                         .position_mode(AnchoredPositionMode::Window)
                         .child(popup),
                 )
-                .with_priority(CM_CONTEXT_MENU_Z),
+                .priority(CM_CONTEXT_MENU_Z),
             )
     }
 

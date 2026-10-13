@@ -63,7 +63,7 @@ impl SftpWorkspaceEntity {
         // The entity owns the delayed retirement so root rendering never
         // captures WorkspaceApp or schedules duplicate exit tasks.
         cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |sftp, cx| {
                 if sftp.context_menu_presence.finish_exit(generation) {
                     sftp.context_menu = None;

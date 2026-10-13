@@ -200,7 +200,7 @@ impl ProcessJob {
             }
             let _ = CloseHandle(threads);
             if !resumed {
-                return Err(windows::core::Error::from_win32());
+                return Err(windows::core::Error::from_thread());
             }
             Ok(job)
         }

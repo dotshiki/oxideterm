@@ -2,9 +2,9 @@ use std::{cell::RefCell, collections::HashMap, fmt, ops::Range, rc::Rc, time::In
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, Entity, FocusHandle,
-    GlobalElementId, InputHandler, InspectorElementId, InteractiveElement, IntoColor, IntoElement,
-    Keystroke, LayoutId, MouseButton, Pixels, Point, SharedString, Style, Styled, TextRun, Timer,
-    UTF16Selection, Window, font, point, px, rgb,
+    GlobalElementId, InputHandler, InspectorElementId, InteractiveElement, IntoElement, Keystroke,
+    LayoutId, MouseButton, Pixels, Point, SharedString, Style, Styled, TextRun, UTF16Selection,
+    Window, font, point, px, rgb, rgb_to_hsla,
 };
 use oxideterm_editor_core::utf16::{
     byte_index_for_utf16, control_k_delete_end, floor_char_boundary, line_end_for_utf16_offset,
@@ -312,7 +312,7 @@ impl WorkspaceInputEntity {
                 let Some(delay) = delay else {
                     break;
                 };
-                Timer::after(delay).await;
+                cx.background_executor().timer(delay).await;
                 let should_continue = input
                     .update(cx, |input, cx| {
                         if input.blink_generation != generation {
@@ -2101,7 +2101,7 @@ impl WorkspaceApp {
         let run = TextRun {
             len: shared.len(),
             font,
-            color: rgb(self.tokens.ui.text).into_color(),
+            color: rgb_to_hsla(rgb(self.tokens.ui.text)),
             background_color: None,
             underline: None,
             strikethrough: None,

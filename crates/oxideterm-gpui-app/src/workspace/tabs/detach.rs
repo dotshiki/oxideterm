@@ -826,7 +826,7 @@ impl WorkspaceApp {
         // The workspace owns at most one return relay. A generation check keeps
         // a stale cleanup task from removing a newer user-initiated handoff.
         cx.spawn(async move |weak, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = weak.update(cx, |workspace, cx| {
                 if workspace
                     .detached_tab_return_handoff
@@ -1513,12 +1513,12 @@ impl WorkspaceApp {
             self.workspace_context_menu_backdrop(
                 deferred(
                     anchored()
-                        .anchor(Corner::TopLeft)
+                        .anchor(Anchor::TopLeft)
                         .position(gpui::point(px(placement.x), px(placement.y)))
                         .position_mode(AnchoredPositionMode::Window)
                         .child(menu_body),
                 )
-                .with_priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY),
+                .priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY),
                 cx,
             )
             .into_any_element(),

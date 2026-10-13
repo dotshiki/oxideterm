@@ -8175,6 +8175,31 @@ pub(super) const FOLDERS: &[(&str, FileIcon, FileIcon)] = &[
     ("zeabur", FileIcon::new("material-icons/folder-zeabur.svg", "material-icons/folder-zeabur.svg"), FileIcon::new("material-icons/folder-zeabur-open.svg", "material-icons/folder-zeabur-open.svg")),
     ("zed", FileIcon::new("material-icons/folder-zed.svg", "material-icons/folder-zed.svg"), FileIcon::new("material-icons/folder-zed-open.svg", "material-icons/folder-zed-open.svg")),
 ];
+
+/// Enumerates every asset path the tables above can serve, so asset registries
+/// can register file icons without duplicating this generated path knowledge.
+pub(super) fn iter_paths() -> impl Iterator<Item = &'static str> {
+    let mut paths = std::collections::BTreeSet::new();
+    let mut record = |icon: FileIcon| {
+        paths.insert(icon.path);
+        paths.insert(icon.light);
+    };
+    record(DEFAULT);
+    record(FOLDER);
+    record(FOLDER_OPEN);
+    for (_, icon) in NAMES {
+        record(*icon);
+    }
+    for (_, icon) in EXTENSIONS {
+        record(*icon);
+    }
+    for (_, closed, opened) in FOLDERS {
+        record(*closed);
+        record(*opened);
+    }
+    paths.into_iter()
+}
+
 pub(super) fn asset(path: &str) -> Option<&'static [u8]> {
     match path {
         "material-icons/3d.svg" => Some(include_bytes!("../../resources/material-icons/3d.svg")),

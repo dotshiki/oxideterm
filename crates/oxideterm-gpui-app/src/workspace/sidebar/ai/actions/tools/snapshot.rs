@@ -2131,7 +2131,9 @@ impl WorkspaceApp {
                 // Tauri waits for connectToSaved to finish before returning
                 // connect_target. Keep native's UI-thread bridge patient enough
                 // for slow SSH/proxy chains, while still polling the snapshot.
-                Timer::after(Duration::from_millis(AI_CONNECT_TARGET_POLL_INTERVAL_MS)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(AI_CONNECT_TARGET_POLL_INTERVAL_MS))
+                    .await;
                 let ready = weak.update(cx, |this, cx| {
                     this.ai_connect_target_ready_result(
                         &tool_session_id,
@@ -2852,7 +2854,7 @@ impl WorkspaceApp {
                 }
                 tokio::select! {
                     _ = activity_rx.changed() => {},
-                    _ = Timer::after(Duration::from_millis(250)) => {},
+                    _ = cx.background_executor().timer(Duration::from_millis(250)) => {},
                     _ = sender.as_mut().unwrap().closed() => return,
                 }
             }
@@ -3089,7 +3091,7 @@ impl WorkspaceApp {
                 if recovering {
                     if std::time::Instant::now() >= deadline { break; }
                     connection_lost = true;
-                    Timer::after(Duration::from_millis(250)).await;
+                    cx.background_executor().timer(Duration::from_millis(250)).await;
                     continue;
                 }
                 if command_wait && connection_lost && !records.iter().any(|record|
@@ -3153,7 +3155,7 @@ impl WorkspaceApp {
                 }
                 tokio::select! {
                     _ = activity_rx.changed() => {},
-                    _ = Timer::after(Duration::from_millis(250)) => {},
+                    _ = cx.background_executor().timer(Duration::from_millis(250)) => {},
                     _ = sender.as_mut().unwrap().closed() => return,
                 }
             }

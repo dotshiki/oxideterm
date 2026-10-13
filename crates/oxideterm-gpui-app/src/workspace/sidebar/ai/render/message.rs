@@ -1607,7 +1607,7 @@ impl WorkspaceApp {
                     vec![gpui::TextRun {
                         len: command.len(),
                         font: gpui::font(tool_mono_font.clone()),
-                        color: rgb(self.tokens.ui.text).into_color(),
+                        color: rgb_to_hsla(rgb(self.tokens.ui.text)),
                         background_color: None,
                         underline: None,
                         strikethrough: None,

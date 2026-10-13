@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::Path, process::Stdio, time::Duration};
 
-use gpui::{AnyElement, App, Context, EntityId, Task, Timer, WeakEntity, div, prelude::*};
+use gpui::{AnyElement, App, Context, EntityId, Task, WeakEntity, div, prelude::*};
 use oxideterm_gpui_terminal::TerminalPane;
 use oxideterm_quick_commands::{QuickCommandRisk, prepare_quick_command};
 use oxideterm_terminal::TerminalSessionKind;
@@ -115,7 +115,7 @@ impl WorkspaceApp {
             let delay = Duration::from_millis(matched.delay_ms());
             let target = target.clone();
             let task = cx.spawn(async move |weak, cx| {
-                Timer::after(delay).await;
+                cx.background_executor().timer(delay).await;
                 let _ = weak.update(cx, |workspace, cx| {
                     workspace.execute_terminal_trigger_match(target, matched, cx);
                     workspace

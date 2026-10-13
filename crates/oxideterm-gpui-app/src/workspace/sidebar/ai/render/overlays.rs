@@ -102,7 +102,7 @@ impl WorkspaceApp {
                 });
             let dropdown_width = (panel_width - AI_TOP_FLOATING_INSET_X * 2.0).max(0.0);
             (
-                Corner::TopLeft,
+                Anchor::TopLeft,
                 panel_left + AI_TOP_FLOATING_INSET_X,
                 top,
                 self.render_ai_conversation_dropdown(dropdown_width, cx),
@@ -121,7 +121,7 @@ impl WorkspaceApp {
             );
             let top = f32::from(anchor.bounds.bottom()) + AI_FLOATING_GAP / 2.0;
             (
-                Corner::TopLeft,
+                Anchor::TopLeft,
                 left,
                 top,
                 self.render_ai_chat_menu(cx),
@@ -134,7 +134,7 @@ impl WorkspaceApp {
         {
             let anchor = self.select_anchors.get(&SelectAnchorId::AiModelSelector)?;
             (
-                Corner::BottomLeft,
+                Anchor::BottomLeft,
                 ai_sidebar_popup_left(
                     f32::from(anchor.bounds.left()),
                     AI_MODEL_SELECTOR_DROPDOWN_WIDTH,
@@ -148,7 +148,7 @@ impl WorkspaceApp {
         } else if self.ai_entity.read(cx).chat_ui().reasoning_menu_open {
             let anchor = self.select_anchors.get(&SelectAnchorId::AiReasoningMenu)?;
             (
-                Corner::BottomLeft,
+                Anchor::BottomLeft,
                 ai_sidebar_popup_left(
                     f32::from(anchor.bounds.left()),
                     AI_REASONING_MENU_WIDTH,
@@ -162,7 +162,7 @@ impl WorkspaceApp {
         } else if self.ai_entity.read(cx).chat_ui().safety_menu_open {
             let anchor = self.select_anchors.get(&SelectAnchorId::AiSafetyMenu)?;
             (
-                Corner::BottomLeft,
+                Anchor::BottomLeft,
                 ai_sidebar_popup_left(
                     f32::from(anchor.bounds.left()),
                     AI_MODEL_SELECTOR_DROPDOWN_WIDTH,
@@ -185,7 +185,7 @@ impl WorkspaceApp {
                 oxideterm_gpui_ui::motion::MotionDuration::Control,
             );
             (
-                Corner::BottomLeft,
+                Anchor::BottomLeft,
                 ai_sidebar_popup_left(
                     f32::from(anchor.bounds.left()),
                     AI_CONTEXT_POPOVER_WIDTH,
@@ -206,7 +206,7 @@ impl WorkspaceApp {
                 .min((panel_width - AI_TOP_FLOATING_INSET_X * 2.0).max(1.0))
                 .max(1.0);
             (
-                Corner::BottomLeft,
+                Anchor::BottomLeft,
                 ai_sidebar_popup_left(
                     f32::from(anchor.bounds.left()),
                     popup_width,
@@ -231,7 +231,7 @@ impl WorkspaceApp {
                 .position_mode(AnchoredPositionMode::Window)
                 .child(overlay_content_boundary(div().child(popup))),
         )
-        .with_priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY);
+        .priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY);
         if !dismiss_from_outside {
             return Some(popup.into_any_element());
         }

@@ -273,12 +273,12 @@ impl WorkspaceApp {
         // settings/AI popovers instead of as a surface-local absolute child.
         deferred(
             anchored()
-                .anchor(Corner::TopLeft)
+                .anchor(Anchor::TopLeft)
                 .position(gpui::point(px(placement.x), px(placement.y)))
                 .position_mode(AnchoredPositionMode::Window)
                 .child(overlay_content_boundary(menu)),
         )
-        .with_priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
+        .priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
         .into_any_element()
     }
 
@@ -355,12 +355,12 @@ impl WorkspaceApp {
         // at window level just like Radix DropdownMenuContent in Tauri.
         deferred(
             anchored()
-                .anchor(Corner::TopLeft)
+                .anchor(Anchor::TopLeft)
                 .position(gpui::point(px(placement.x), px(placement.y)))
                 .position_mode(AnchoredPositionMode::Window)
                 .child(overlay_content_boundary(menu)),
         )
-        .with_priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
+        .priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
         .into_any_element()
     }
 }

@@ -244,6 +244,7 @@ impl WgpuRenderer {
     pub fn gpu_specs(&self) -> GpuSpecs {
         GpuSpecs {
             is_software_emulated: self.adapter_info.device_type == wgpu::DeviceType::Cpu,
+            is_virtual_gpu: self.adapter_info.device_type == wgpu::DeviceType::VirtualGpu,
             device_name: self.adapter_info.name.clone(),
             driver_name: self.adapter_info.driver.clone(),
             driver_info: self.adapter_info.driver_info.clone(),

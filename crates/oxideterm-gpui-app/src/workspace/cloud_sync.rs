@@ -3,7 +3,7 @@ use std::{cell::Cell, collections::VecDeque, sync::Arc};
 use crate::workspace::ime::WorkspaceImeTarget;
 use chrono::Utc;
 use gpui::prelude::*;
-use gpui::{Div, EventEmitter, FontWeight, Rgba, Task, Timer, point};
+use gpui::{Div, EventEmitter, FontWeight, Rgba, Task, point};
 use oxideterm_cloud_sync::{
     AuthMode, BackendType, CloudSyncSettings, CloudSyncStatus, ConflictStrategy,
     OXIDE_APP_SETTINGS_SECTION_IDS, RawSyncScope, normalize_sync_scope,
@@ -603,7 +603,7 @@ impl CloudSyncWorkspaceEntity {
         );
         self.auto_upload_task = Some(cx.spawn(async move |cloud_sync, cx| {
             loop {
-                Timer::after(interval).await;
+                cx.background_executor().timer(interval).await;
                 let keep_running = cloud_sync
                     .update(cx, |cloud_sync, cx| {
                         if cloud_sync.controller.auto_upload_generation != generation
@@ -634,7 +634,9 @@ impl CloudSyncWorkspaceEntity {
         self.controller.dirty_refresh_scheduled = true;
         self.dirty_refresh_task.take();
         self.dirty_refresh_task = Some(cx.spawn(async move |cloud_sync, cx| {
-            Timer::after(Duration::from_millis(300)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
             let _ = cloud_sync.update(cx, |cloud_sync, cx| {
                 if !cloud_sync.accept_dirty_refresh_generation(generation) {
                     return;
@@ -662,7 +664,7 @@ impl CloudSyncWorkspaceEntity {
         let generation = self.confirm_exit_generation;
         self.confirm_exit_task.take();
         self.confirm_exit_task = Some(cx.spawn(async move |cloud_sync, cx| {
-            Timer::after(duration).await;
+            cx.background_executor().timer(duration).await;
             let _ = cloud_sync.update(cx, |cloud_sync, cx| {
                 if cloud_sync.confirm_exit_generation == generation {
                     cx.emit(CloudSyncWorkspaceEvent::ConfirmExitFinished {

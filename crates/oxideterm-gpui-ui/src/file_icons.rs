@@ -1,5 +1,6 @@
 use gpui::{
-    AnyElement, IntoColor, IntoElement, ParentElement, Styled, StyledImage, div, img, px, rgb, svg,
+    AnyElement, IntoElement, ParentElement, Styled, StyledImage, div, img, px, rgb, rgb_to_hsla,
+    svg,
 };
 use oxideterm_theme::ThemeTokens;
 
@@ -28,7 +29,7 @@ impl FileIcon {
     }
 
     pub fn render(self, size: f32, tokens: &ThemeTokens) -> AnyElement {
-        let background: gpui::Hsla = rgb(tokens.ui.bg).into_color();
+        let background: gpui::Hsla = rgb_to_hsla(rgb(tokens.ui.bg));
         let path = if background.lightness > 0.5 {
             self.light
         } else {
@@ -95,4 +96,10 @@ pub fn folder_icon(name: &str, expanded: bool) -> FileIcon {
 
 pub fn load_asset(path: &str) -> Option<&'static [u8]> {
     generated::asset(path)
+}
+
+/// Enumerates every asset path the generated tables can serve, so asset
+/// registries can register file icons without duplicating path knowledge.
+pub fn iter_asset_paths() -> impl Iterator<Item = &'static str> {
+    generated::iter_paths()
 }

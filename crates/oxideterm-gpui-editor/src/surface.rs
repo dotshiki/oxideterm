@@ -5,9 +5,9 @@ use std::{cell::RefCell, collections::HashMap, ops::Range, sync::Arc, time::Dura
 
 use gpui::{
     AnyElement, App, Bounds, Context, Div, Element, ElementId, ElementInputHandler, Entity,
-    FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoColor, IntoElement, LayoutId,
+    FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     ParentElement, Pixels, Point, ScrollWheelEvent, SharedString, Task, TextRun, Window, div,
-    point, prelude::*, px, rgb,
+    point, prelude::*, px, rgb, rgb_to_hsla,
 };
 use oxideterm_editor_core::{
     BufferOffset, Cursor, EditTransaction, FindMatch, LineCol, Selection, TextBuffer, TextEdit,
@@ -1346,7 +1346,7 @@ impl TextEditorView {
                 self.appearance.font_fallback_family.as_deref(),
                 self.appearance.font_weight,
             ),
-            color: rgb(self.appearance.text_hex).into_color(),
+            color: rgb_to_hsla(rgb(self.appearance.text_hex)),
             background_color: None,
             underline: None,
             strikethrough: None,

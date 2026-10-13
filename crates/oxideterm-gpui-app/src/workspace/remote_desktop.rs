@@ -687,7 +687,7 @@ impl RemoteDesktopSessionEntity {
     fn schedule_frame_apply(&self, generation: u64, delay: Duration, cx: &mut Context<Self>) {
         cx.spawn(async move |session, cx| {
             if !delay.is_zero() {
-                Timer::after(delay).await;
+                cx.background_executor().timer(delay).await;
             }
             let _ = session.update(cx, |current, cx| {
                 if current.worker_generation == generation {

@@ -1186,7 +1186,9 @@ impl PluginWorkspaceEntity {
         let generation = self.subscription_sampler_generation;
         self.subscription_sampler_task = Some(cx.spawn(async move |entity, cx| {
             loop {
-                Timer::after(NATIVE_PLUGIN_DELIVERY_POLL_INTERVAL).await;
+                cx.background_executor()
+                    .timer(NATIVE_PLUGIN_DELIVERY_POLL_INTERVAL)
+                    .await;
                 let keep_running = entity
                     .update(cx, |entity, cx| {
                         if !entity.subscription_sampler_running

@@ -210,7 +210,9 @@ impl SettingsWorkspaceEntity {
 
         // Delay manifest traffic until session restoration and the first frame settle.
         self.native_update.automatic_check_task = Some(cx.spawn(async move |settings, cx| {
-            Timer::after(AUTOMATIC_NATIVE_UPDATE_DELAY).await;
+            cx.background_executor()
+                .timer(AUTOMATIC_NATIVE_UPDATE_DELAY)
+                .await;
             let _ = settings.update(cx, |settings, cx| {
                 settings.native_update.automatic_check_task = None;
                 if matches!(settings.native_update.state, NativeUpdateUiState::Idle) {
@@ -941,7 +943,9 @@ impl WorkspaceApp {
         // process out of the way. Delay one frame so the final toast/state can
         // render before GPUI begins app shutdown.
         cx.spawn(async move |weak, cx| {
-            Timer::after(std::time::Duration::from_millis(750)).await;
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(750))
+                .await;
             let _ = weak.update(cx, |workspace, cx| {
                 workspace.request_application_quit(cx);
             });

@@ -8,7 +8,8 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
     BoxShadow, Capslock, ColorExt, Context, Corners, CursorHideMode, CursorStyle, Decorations,
-    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
+    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DynamicTexture,
+    DynamicTextureParams, Edges, Effect,
     Entity, EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global,
     GlobalElementId, GlyphId, GpuSpecs, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent,
     KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, Modifiers,
@@ -1089,6 +1090,28 @@ pub(crate) struct Frame {
     pub(crate) tab_stops: TabStopMap,
 }
 
+/// A glyph batch prepared during the prepaint phase, so the paint phase can insert it
+/// without repeating atlas lookups.
+#[derive(Debug, Default)]
+pub(crate) struct PreparedGlyphBatch {
+    pub(crate) monochrome: Vec<PreparedMonochromeGlyph>,
+    pub(crate) subpixel: Vec<PreparedMonochromeGlyph>,
+    pub(crate) polychrome: Vec<PreparedPolychromeGlyph>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedMonochromeGlyph {
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    pub(crate) color: Hsla,
+    pub(crate) tile: AtlasTile,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedPolychromeGlyph {
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    pub(crate) tile: AtlasTile,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
@@ -1439,6 +1462,65 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
         (false, false) => display_bounds.origin,
     };
     window_bounds_ctor(Bounds::new(final_origin, base_size))
+}
+
+// OxideTerm: BGRA byte-length helpers for mutable dynamic textures.
+fn dynamic_texture_dimension(value: i32, label: &str) -> Result<usize> {
+    if value <= 0 {
+        return Err(anyhow!("dynamic texture {label} must be positive"));
+    }
+    usize::try_from(value).context("dynamic texture dimension does not fit usize")
+}
+
+fn dynamic_texture_byte_len(size: Size<DevicePixels>) -> Result<usize> {
+    let width = dynamic_texture_dimension(size.width.0, "width")?;
+    let height = dynamic_texture_dimension(size.height.0, "height")?;
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("dynamic texture BGRA byte size overflow")
+}
+
+fn dynamic_texture_blank(size: Size<DevicePixels>) -> Result<Vec<u8>> {
+    Ok(vec![0; dynamic_texture_byte_len(size)?])
+}
+
+fn validate_dynamic_texture_update(
+    texture_size: Size<DevicePixels>,
+    bounds: Bounds<DevicePixels>,
+    bytes: &[u8],
+) -> Result<()> {
+    dynamic_texture_byte_len(texture_size)?;
+    let expected_len = dynamic_texture_byte_len(bounds.size)?;
+
+    if bounds.origin.x.0 < 0 || bounds.origin.y.0 < 0 {
+        return Err(anyhow!("dynamic texture update origin must not be negative"));
+    }
+
+    let right = bounds
+        .origin
+        .x
+        .0
+        .checked_add(bounds.size.width.0)
+        .context("dynamic texture update horizontal bounds overflow")?;
+    let bottom = bounds
+        .origin
+        .y
+        .0
+        .checked_add(bounds.size.height.0)
+        .context("dynamic texture update vertical bounds overflow")?;
+    if right > texture_size.width.0 || bottom > texture_size.height.0 {
+        return Err(anyhow!("dynamic texture update is outside texture bounds"));
+    }
+
+    if bytes.len() != expected_len {
+        return Err(anyhow!(
+            "dynamic texture update byte length mismatch: expected {expected_len}, got {}",
+            bytes.len()
+        ));
+    }
+
+    Ok(())
 }
 
 impl Window {
@@ -2136,6 +2218,11 @@ impl Window {
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
+    }
+
+    /// Returns whether this window is currently minimized to the taskbar or dock.
+    pub fn is_minimized(&self) -> bool {
+        self.platform_window.is_minimized()
     }
 
     /// Obtain the currently focused [`FocusHandle`]. If no elements are focused, returns `None`.
@@ -4616,6 +4703,142 @@ impl Window {
         });
     }
 
+    #[inline]
+    pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+        self.text_system().glyph_dilation_for_color(color)
+    }
+
+    /// Resolves a monochrome glyph to an atlas tile and stores bounds relative to a batch origin.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_glyph_for_batch(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        subpixel_rendering: bool,
+        dilation: u8,
+        batch_origin: Point<ScaledPixels>,
+        batch: &mut PreparedGlyphBatch,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+        let quantized_origin = Point::new(
+            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                / SUBPIXEL_VARIANTS_X as f32,
+            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                / SUBPIXEL_VARIANTS_Y as f32,
+        );
+        let subpixel_variant = Point::new(
+            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+        );
+        let integer_origin = quantized_origin.map(|coordinate| ScaledPixels(coordinate.trunc()));
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant,
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering,
+            dilation,
+        };
+
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        if raster_bounds.is_zero() {
+            return Ok(());
+        }
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&params.clone().into(), &mut || {
+                let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                Ok(Some((size, Cow::Owned(bytes))))
+            })?
+            .expect("glyph rasterization returns an atlas tile");
+        let bounds = Bounds {
+            origin: integer_origin + raster_bounds.origin.map(Into::into),
+            size: tile.bounds.size.map(Into::into),
+        } - batch_origin;
+        let glyph = PreparedMonochromeGlyph {
+            bounds,
+            color,
+            tile,
+        };
+        if subpixel_rendering {
+            batch.subpixel.push(glyph);
+        } else {
+            batch.monochrome.push(glyph);
+        }
+        Ok(())
+    }
+
+    /// Resolves an emoji glyph to an atlas tile and stores bounds relative to a batch origin.
+    pub(crate) fn prepare_emoji_for_batch(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        batch_origin: Point<ScaledPixels>,
+        batch: &mut PreparedGlyphBatch,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+        let integer_origin =
+            glyph_origin.map(|coordinate| ScaledPixels(round_half_toward_zero(coordinate.0)));
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant: Default::default(),
+            scale_factor,
+            is_emoji: true,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        if raster_bounds.is_zero() {
+            return Ok(());
+        }
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&params.clone().into(), &mut || {
+                let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                Ok(Some((size, Cow::Owned(bytes))))
+            })?
+            .expect("emoji rasterization returns an atlas tile");
+        let bounds = Bounds {
+            origin: integer_origin + raster_bounds.origin.map(Into::into),
+            size: tile.bounds.size.map(Into::into),
+        } - batch_origin;
+        batch
+            .polychrome
+            .push(PreparedPolychromeGlyph { bounds, tile });
+        Ok(())
+    }
+
+    /// Appends a prepared glyph batch without repeating atlas lookups.
+    pub(crate) fn paint_prepared_glyph_batch(
+        &mut self,
+        origin: Point<ScaledPixels>,
+        batch: Arc<PreparedGlyphBatch>,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
+        self.next_frame
+            .scene
+            .insert_prepared_glyph_batch(batch, origin, content_mask, opacity);
+    }
+
     /// Paints a monochrome (non-emoji) glyph into the scene for the next frame at the current z-index.
     ///
     /// The y component of the origin is the baseline of the glyph.
@@ -4702,7 +4925,7 @@ impl Window {
         Ok(())
     }
 
-    fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+    pub(crate) fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
@@ -5013,6 +5236,101 @@ impl Window {
         }
 
         Ok(())
+    }
+
+    /// OxideTerm: uploads a BGRA region into a dynamic texture without replacing its stable
+    /// identity. The update bounds are relative to the top-left corner of the dynamic texture.
+    pub fn update_dynamic_texture(
+        &mut self,
+        data: &DynamicTexture,
+        bounds: Bounds<DevicePixels>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        validate_dynamic_texture_update(data.size(), bounds, bytes)?;
+
+        let key = DynamicTextureParams {
+            texture_id: data.id,
+        }
+        .into();
+        let size = data.size();
+        self.sprite_atlas
+            .get_or_insert_with(&key, &mut || {
+                // Updates may arrive before the first paint, so create the stable atlas entry.
+                Ok(Some((size, Cow::Owned(dynamic_texture_blank(size)?))))
+            })?
+            .expect("dynamic texture creation always returns an atlas entry");
+        self.sprite_atlas.update(&key, bounds, bytes)
+    }
+
+    /// OxideTerm: paints a dynamic texture into the next frame as one polychrome sprite.
+    pub fn paint_dynamic_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<DynamicTexture>,
+        grayscale: bool,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let key = DynamicTextureParams {
+            texture_id: data.id,
+        }
+        .into();
+        let size = data.size();
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&key, &mut || {
+                Ok(Some((size, Cow::Owned(dynamic_texture_blank(size)?))))
+            })?
+            .expect("dynamic texture creation always returns an atlas entry");
+        let content_mask = self.snapped_content_mask();
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(bounds.size.map(|value| Pixels(value.0)))
+            .scale(self.scale_factor());
+        let opacity = self.element_opacity();
+
+        self.next_frame.scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            grayscale: grayscale.into(),
+            corner_smoothing: 0.0,
+            bounds,
+            content_mask,
+            corner_radii,
+            tile,
+            opacity,
+        });
+        Ok(())
+    }
+
+    /// OxideTerm: removes a dynamic texture from the platform atlas.
+    pub fn drop_dynamic_texture(&mut self, data: Arc<DynamicTexture>) -> Result<()> {
+        let key = DynamicTextureParams {
+            texture_id: data.id,
+        };
+        self.sprite_atlas.remove(&key.into());
+        Ok(())
+    }
+
+    /// OxideTerm: returns the generation of renderer resources backing dynamic textures.
+    pub fn renderer_resource_generation(&self) -> u64 {
+        self.sprite_atlas.resource_generation()
+    }
+
+    /// OxideTerm: allocation identity of this window's sprite atlas; combined with the
+    /// generation counter in paint-cache keys.
+    pub(crate) fn renderer_resource_identity(&self) -> usize {
+        // Generation counters are atlas-local, so the allocation identity prevents
+        // reusing tiles after a pane moves to a window backed by another atlas.
+        Arc::as_ptr(&self.sprite_atlas) as *const () as usize
+    }
+
+    /// Returns the cursor resolved for the current mouse hit test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cursor_style_for_test(&self) -> CursorStyle {
+        self.rendered_frame
+            .cursor_style(self)
+            .unwrap_or(CursorStyle::Arrow)
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.

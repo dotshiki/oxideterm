@@ -9,7 +9,7 @@ use std::{
 
 use gpui::{
     AnyElement, AnyWindowHandle, App, AppContext, Context, IntoElement, KeyDownEvent,
-    ParentElement, Timer, Window, div,
+    ParentElement, Window, div,
 };
 use oxideterm_connections::{SavedConnectionsConflictStrategy, SavedConnectionsSyncSnapshot};
 use oxideterm_gpui_terminal::{TerminalNotice, TerminalNoticeVariant};
@@ -118,7 +118,7 @@ impl WorkspaceApp {
             return;
         }
         cx.spawn(async move |weak, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = weak.update(cx, |this, cx| {
                 let promoted = this
                     .plugin_entity

@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use gpui::{AppContext, Context, Entity, Task, Timer, WeakEntity};
+use gpui::{AppContext, Context, Entity, Task, WeakEntity};
 use oxideterm_gpui_editor::{
     EditorContextMenuLabels, EditorPresentation, EditorSettings, TextEditorView,
 };
@@ -838,7 +838,7 @@ impl TerminalCommandSenderEntity {
                         break 'repeats;
                     }
                     if !is_final_unit {
-                        Timer::after(interval).await;
+                        cx.background_executor().timer(interval).await;
                     }
                 }
             }

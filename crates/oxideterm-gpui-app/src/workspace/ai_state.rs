@@ -2302,7 +2302,7 @@ impl AiWorkspaceEntity {
         // The AI owner retains modal completion across settings visibility
         // changes so a confirmed user action cannot be stranded in the root.
         self.settings_confirm_exit_task = Some(cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 entity.settings_confirm_exit_task = None;
                 entity.finish_settings_confirm_exit(generation, confirmed, cx);
@@ -2463,7 +2463,7 @@ impl AiWorkspaceEntity {
             return (true, effect);
         }
         self.chat_confirm_exit_task = Some(cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 entity.finish_chat_confirm_exit(generation, cx);
             });
@@ -2653,7 +2653,7 @@ impl AiWorkspaceEntity {
         // The Entity retains exit completion so a settings visibility change
         // cannot strand a secret-bearing dialog in its transitional phase.
         self.mcp_dialog_exit_task = Some(cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 entity.mcp_dialog_exit_task = None;
                 entity.finish_mcp_dialog_exit(generation, submit, configured_names, cx);
@@ -2762,7 +2762,7 @@ impl AiWorkspaceEntity {
             return false;
         }
         self.mcp_status_tick_task = Some(cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 entity.mcp_status_tick_task = None;
                 cx.emit(AiWorkspaceEvent::McpRuntimeChanged);
@@ -4080,7 +4080,7 @@ impl AiWorkspaceEntity {
         });
         let conversation_id = conversation_id.to_string();
         cx.spawn(async move |entity, cx| {
-            Timer::after(Duration::from_secs(5)).await;
+            cx.background_executor().timer(Duration::from_secs(5)).await;
             let _ = entity.update(cx, |entity, cx| {
                 let should_clear = entity.compaction_notice.as_ref().is_some_and(|notice| {
                     notice.conversation_id == conversation_id

@@ -729,6 +729,32 @@ impl AssetSource for NativeAssets {
             .map(SharedString::from)
             .collect());
         }
+        if path.is_empty() {
+            // The gpui AssetRegistry enumerates assets through `list("")`; return every
+            // path this source serves so icon, font, and file-icon loads stay on-demand.
+            let mut paths: Vec<SharedString> = Vec::new();
+            paths.extend(SVG_FONTS.iter().map(|(path, _)| SharedString::from(*path)));
+            for file in self.list("lucide")? {
+                paths.push(SharedString::from(format!("lucide/{file}")));
+            }
+            paths.extend(
+                DISTRO_ICONS
+                    .iter()
+                    .map(|icon| SharedString::from(icon.path)),
+            );
+            paths.extend(
+                [
+                    "window-controls/minimize.svg",
+                    "window-controls/maximize.svg",
+                    "window-controls/restore.svg",
+                    "window-controls/close.svg",
+                ]
+                .into_iter()
+                .map(SharedString::from),
+            );
+            paths.extend(oxideterm_gpui_ui::file_icons::iter_asset_paths().map(SharedString::from));
+            return Ok(paths);
+        }
         Ok(Vec::new())
     }
 }
@@ -740,7 +766,7 @@ mod tests {
     #[test]
     fn distribution_assets_render_in_color_through_the_native_image_pipeline() {
         let assets = NativeAssets;
-        let renderer = gpui::SvgRenderer::new(std::sync::Arc::new(NativeAssets));
+        let renderer = gpui::SvgRenderer::new(std::sync::Arc::new(NativeAssets.into()));
         for icon in DISTRO_ICONS {
             let bytes = assets
                 .load(icon.path)
@@ -806,6 +832,25 @@ mod tests {
             assert!(
                 face.glyph_index(glyph).is_some(),
                 "{family} must cover {glyph}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_asset_registry_built_from_the_native_source_serves_every_asset_path() {
+        // Application::with_assets builds the registry through the source's
+        // iter_ondemand enumeration, which relies on `list("")`; a path this
+        // test cannot load would render as a missing icon at runtime.
+        let registry = gpui::AssetRegistry::from(NativeAssets);
+        for path in [
+            "lucide/activity.svg",
+            "window-controls/close.svg",
+            "fonts/JetBrainsMono/JetBrainsMonoNerdFontMono-Subset-Regular.ttf",
+            "material-icons/file.svg",
+        ] {
+            assert!(
+                registry.load(path).is_some(),
+                "asset {path} must be enumerable through list(\"\")"
             );
         }
     }

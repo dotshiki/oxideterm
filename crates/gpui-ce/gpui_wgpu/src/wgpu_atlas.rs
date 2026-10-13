@@ -42,6 +42,8 @@ struct WgpuAtlasState {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
     next_texture_identity: u64,
+    // OxideTerm: bumped whenever atlas resources are invalidated, for paint-cache keys.
+    resource_generation: u64,
 }
 
 pub struct WgpuTextureInfo {
@@ -66,6 +68,7 @@ impl WgpuAtlas {
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
             next_texture_identity: 0,
+            resource_generation: 0,
         }))
     }
 
@@ -98,6 +101,8 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        // Wrapping avoids getting permanently stuck at the maximum generation value.
+        lock.resource_generation = lock.resource_generation.wrapping_add(1);
     }
 
     /// Handles device lost by clearing all textures and cached tiles.
@@ -110,6 +115,7 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        lock.resource_generation = lock.resource_generation.wrapping_add(1);
     }
 }
 
@@ -134,9 +140,12 @@ impl PlatformAtlas for WgpuAtlas {
                 "atlas tile {size:?} exceeds the device texture limit {}",
                 lock.max_texture_size
             );
-            let tile = lock
-                .allocate(size, key.texture_kind())
-                .context("failed to allocate")?;
+            let tile = if matches!(key, AtlasKey::DynamicTexture(_)) {
+                lock.allocate_dedicated(size, key.texture_kind())
+            } else {
+                lock.allocate(size, key.texture_kind())
+            }
+            .context("failed to allocate")?;
             lock.upload_texture(tile.texture_id, tile.bounds, &bytes);
             lock.tiles_by_key.insert(key.clone(), tile);
             Ok(Some(tile))
@@ -169,6 +178,26 @@ impl PlatformAtlas for WgpuAtlas {
             }
         }
     }
+
+    // OxideTerm: uploads a dirty region of a dynamic texture in place.
+    fn update(&self, key: &AtlasKey, bounds: Bounds<DevicePixels>, bytes: &[u8]) -> Result<()> {
+        let mut lock = self.0.lock();
+        let Some(tile) = lock.tiles_by_key.get(key).copied() else {
+            return Ok(());
+        };
+
+        lock.validate_upload(tile, bounds, bytes)?;
+        let upload_bounds = Bounds {
+            origin: tile.bounds.origin + bounds.origin,
+            size: bounds.size,
+        };
+        lock.upload_texture(tile.texture_id, upload_bounds, bytes);
+        Ok(())
+    }
+
+    fn resource_generation(&self) -> u64 {
+        self.0.lock().resource_generation
+    }
 }
 
 impl WgpuAtlasState {
@@ -193,6 +222,73 @@ impl WgpuAtlasState {
         texture.allocate(size)
     }
 
+    // OxideTerm: allocates an exact-size texture so a mutable framebuffer's dirty uploads
+    // cannot affect atlas peers.
+    fn allocate_dedicated(
+        &mut self,
+        size: Size<DevicePixels>,
+        texture_kind: AtlasTextureKind,
+    ) -> Option<AtlasTile> {
+        let max_texture_size = self.max_texture_size as i32;
+        if size.width.0 <= 0
+            || size.height.0 <= 0
+            || size.width.0 > max_texture_size
+            || size.height.0 > max_texture_size
+        {
+            return None;
+        }
+
+        self.push_texture_with_size(size, texture_kind)
+            .allocate(size)
+    }
+
+    // OxideTerm: tile-bounds validation for dynamic texture uploads.
+    fn validate_upload(
+        &self,
+        tile: AtlasTile,
+        bounds: Bounds<DevicePixels>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            bounds.origin.x.0 >= 0 && bounds.origin.y.0 >= 0,
+            "texture update origin must be non-negative"
+        );
+        anyhow::ensure!(
+            bounds.size.width.0 > 0 && bounds.size.height.0 > 0,
+            "texture update size must be positive"
+        );
+        let right = bounds
+            .origin
+            .x
+            .0
+            .checked_add(bounds.size.width.0)
+            .context("texture update horizontal bounds overflow")?;
+        let bottom = bounds
+            .origin
+            .y
+            .0
+            .checked_add(bounds.size.height.0)
+            .context("texture update vertical bounds overflow")?;
+        anyhow::ensure!(
+            right <= tile.bounds.size.width.0 && bottom <= tile.bounds.size.height.0,
+            "texture update exceeds the allocated tile bounds"
+        );
+
+        let texture = self
+            .storage
+            .get(tile.texture_id)
+            .context("texture update references a missing texture")?;
+        let expected_len = bounds.size.width.0 as usize
+            * bounds.size.height.0 as usize
+            * texture.bytes_per_pixel() as usize;
+        anyhow::ensure!(
+            bytes.len() == expected_len,
+            "texture update contains {} bytes, expected {expected_len}",
+            bytes.len()
+        );
+        Ok(())
+    }
+
     fn push_texture(
         &mut self,
         min_size: Size<DevicePixels>,
@@ -211,6 +307,70 @@ impl WgpuAtlasState {
         };
 
         let size = min_size.max(&DEFAULT_ATLAS_SIZE).min(&max_atlas_size);
+        let format = match kind {
+            AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
+            AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
+        };
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas"),
+            size: wgpu::Extent3d {
+                width: size.width.0 as u32,
+                height: size.height.0 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let texture_list = &mut self.storage[kind];
+        let index = texture_list.free_list.pop();
+
+        let atlas_texture = WgpuAtlasTexture {
+            id: AtlasTextureId {
+                index: index.unwrap_or(texture_list.textures.len()) as u32,
+                kind,
+            },
+            allocator: BucketedAtlasAllocator::new(device_size_to_etagere(size)),
+            format,
+            texture,
+            view,
+            identity,
+            live_atlas_keys: 0,
+        };
+
+        if let Some(ix) = index {
+            texture_list.textures[ix] = Some(atlas_texture);
+            texture_list
+                .textures
+                .get_mut(ix)
+                .and_then(|t| t.as_mut())
+                .expect("texture must exist")
+        } else {
+            texture_list.textures.push(Some(atlas_texture));
+            texture_list
+                .textures
+                .last_mut()
+                .and_then(|t| t.as_mut())
+                .expect("texture must exist")
+        }
+    }
+
+    // OxideTerm: creates a texture with the exact requested size (no default-size clamping),
+    // so a mutable framebuffer owns its own texture.
+    fn push_texture_with_size(
+        &mut self,
+        size: Size<DevicePixels>,
+        kind: AtlasTextureKind,
+    ) -> &mut WgpuAtlasTexture {
+        let identity = WgpuTextureIdentity(self.next_texture_identity);
+        self.next_texture_identity = self.next_texture_identity.wrapping_add(1);
         let format = match kind {
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
             AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
@@ -422,7 +582,7 @@ fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
 mod tests {
     use super::*;
     use gpui::block_on;
-    use gpui::{ImageId, RenderImageParams};
+    use gpui::{DynamicTextureId, DynamicTextureParams, ImageId, RenderImageParams};
     use std::sync::Arc;
 
     fn test_device_and_queue() -> anyhow::Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
@@ -457,6 +617,153 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
             Ok((Arc::new(device), Arc::new(queue)))
         })
+    }
+
+    fn dynamic_texture_key(id: usize) -> AtlasKey {
+        AtlasKey::DynamicTexture(DynamicTextureParams {
+            texture_id: DynamicTextureId(id),
+        })
+    }
+
+    fn texture_size(width: i32, height: i32) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(width),
+            height: DevicePixels(height),
+        }
+    }
+
+    fn texture_bounds(x: i32, y: i32, width: i32, height: i32) -> Bounds<DevicePixels> {
+        Bounds {
+            origin: Point {
+                x: DevicePixels(x),
+                y: DevicePixels(y),
+            },
+            size: texture_size(width, height),
+        }
+    }
+
+    #[test]
+    fn dynamic_textures_receive_dedicated_exact_size_allocations() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let size = texture_size(3, 2);
+        let bytes = vec![0; 3 * 2 * 4];
+
+        let first_key = dynamic_texture_key(1);
+        let second_key = dynamic_texture_key(2);
+        let mut first_build = || Ok(Some((size, Cow::Borrowed(bytes.as_slice()))));
+        let mut second_build = || Ok(Some((size, Cow::Borrowed(bytes.as_slice()))));
+        let first_tile = atlas
+            .get_or_insert_with(&first_key, &mut first_build)?
+            .expect("first dynamic texture should be allocated");
+        let second_tile = atlas
+            .get_or_insert_with(&second_key, &mut second_build)?
+            .expect("second dynamic texture should be allocated");
+
+        assert_ne!(first_tile.texture_id, second_tile.texture_id);
+        assert_eq!(first_tile.bounds, texture_bounds(0, 0, 3, 2));
+        assert_eq!(second_tile.bounds, texture_bounds(0, 0, 3, 2));
+
+        let lock = atlas.0.lock();
+        let first_texture = lock
+            .storage
+            .get(first_tile.texture_id)
+            .expect("first backing texture should exist");
+        assert_eq!(first_texture.texture.width(), 3);
+        assert_eq!(first_texture.texture.height(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_texture_update_offsets_and_swizzles_pending_upload() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Rgba8Unorm);
+        let key = dynamic_texture_key(3);
+        let size = texture_size(2, 2);
+        let initial_bytes = vec![0; 2 * 2 * 4];
+        let mut build = || Ok(Some((size, Cow::Borrowed(initial_bytes.as_slice()))));
+        atlas
+            .get_or_insert_with(&key, &mut build)?
+            .expect("dynamic texture should be allocated");
+
+        let dirty_bytes = [0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0xDD];
+        atlas.update(&key, texture_bounds(1, 0, 1, 2), &dirty_bytes)?;
+
+        let lock = atlas.0.lock();
+        let upload = lock
+            .pending_uploads
+            .last()
+            .expect("dirty upload should be queued");
+        assert_eq!(upload.bounds, texture_bounds(1, 0, 1, 2));
+        assert_eq!(
+            upload.data,
+            vec![0x30, 0x20, 0x10, 0x40, 0xCC, 0xBB, 0xAA, 0xDD]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_dynamic_texture_drops_its_pending_uploads() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = dynamic_texture_key(4);
+        let size = texture_size(2, 2);
+        let bytes = vec![0; 2 * 2 * 4];
+        let mut build = || Ok(Some((size, Cow::Borrowed(bytes.as_slice()))));
+        let tile = atlas
+            .get_or_insert_with(&key, &mut build)?
+            .expect("dynamic texture should be allocated");
+
+        atlas.remove(&key);
+
+        let lock = atlas.0.lock();
+        assert!(
+            lock.pending_uploads
+                .iter()
+                .all(|upload| upload.id != tile.texture_id)
+        );
+        assert!(lock.storage.get(tile.texture_id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn clearing_atlas_advances_resource_generation_and_drops_uploads() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = dynamic_texture_key(5);
+        let size = texture_size(1, 1);
+        let bytes = vec![0; 4];
+        let mut build = || Ok(Some((size, Cow::Borrowed(bytes.as_slice()))));
+        atlas
+            .get_or_insert_with(&key, &mut build)?
+            .expect("dynamic texture should be allocated");
+
+        assert_eq!(atlas.resource_generation(), 0);
+        atlas.clear();
+        assert_eq!(atlas.resource_generation(), 1);
+        assert!(atlas.0.lock().pending_uploads.is_empty());
+        atlas.clear();
+        assert_eq!(atlas.resource_generation(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_texture_update_rejects_invalid_bounds_and_byte_count() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = dynamic_texture_key(6);
+        let size = texture_size(2, 2);
+        let bytes = vec![0; 2 * 2 * 4];
+        let mut build = || Ok(Some((size, Cow::Borrowed(bytes.as_slice()))));
+        atlas
+            .get_or_insert_with(&key, &mut build)?
+            .expect("dynamic texture should be allocated");
+
+        let out_of_bounds = atlas.update(&key, texture_bounds(2, 0, 1, 1), &[0; 4]);
+        assert!(out_of_bounds.is_err());
+        let wrong_byte_count = atlas.update(&key, texture_bounds(0, 0, 1, 1), &[0; 3]);
+        assert!(wrong_byte_count.is_err());
+        Ok(())
     }
 
     #[test]

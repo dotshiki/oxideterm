@@ -786,7 +786,9 @@ impl WorkspaceTabHostEntity {
         let generation = self.recording_elapsed_generation;
         self.recording_elapsed_task = Some(cx.spawn(async move |tab_host, cx| {
             loop {
-                Timer::after(RECORDING_ELAPSED_TICK_INTERVAL).await;
+                cx.background_executor()
+                    .timer(RECORDING_ELAPSED_TICK_INTERVAL)
+                    .await;
                 let should_continue = tab_host
                     .update(cx, |tab_host, cx| {
                         if tab_host.recording_elapsed_generation != generation
@@ -1416,7 +1418,7 @@ impl WorkspaceTabHostEntity {
             return (true, effect);
         }
         self.close_confirm_exit_task = Some(cx.spawn(async move |tab_host, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = tab_host.update(cx, |tab_host, cx| {
                 tab_host.finish_close_confirm_exit(generation, cx);
             });

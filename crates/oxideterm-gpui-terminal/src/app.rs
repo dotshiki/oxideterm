@@ -17,7 +17,7 @@ use chrono::Timelike;
 use futures::future::{Either, pending, select};
 use gpui::{
     App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, PathPromptOptions, Pixels,
-    Point, SharedString, Subscription, Timer, Window, px,
+    Point, SharedString, Subscription, Window, px,
 };
 use oxideterm_ssh::SshConnectionHandle;
 use oxideterm_terminal::{
@@ -1785,7 +1785,7 @@ impl TerminalPane {
         let generation = self.privilege_prompt_expiry_generation;
         let delay = deadline.saturating_duration_since(Instant::now());
         self.privilege_prompt_expiry_task = Some(cx.spawn(async move |pane, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = pane.update(cx, |pane, cx| {
                 if pane.privilege_prompt_expiry_generation != generation {
                     return;

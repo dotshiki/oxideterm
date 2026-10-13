@@ -174,7 +174,9 @@ impl WorkspaceApp {
                 match rx.try_recv() {
                     Ok(result) => break result,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        Timer::after(Duration::from_millis(16)).await;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(16))
+                            .await;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
                 }

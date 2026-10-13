@@ -135,7 +135,9 @@ fn project_root_manifest_names() -> &'static [&'static str] {
 }
 
 fn project_path_depth(path: &str) -> usize {
-    path.split('/').filter(|part| !part.is_empty()).count()
+    path.split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .count()
 }
 
 fn find_entry<'a>(

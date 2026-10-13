@@ -190,7 +190,7 @@ impl WorkspaceApp {
         // User intent outlives a virtual-list row only for the real transition,
         // then expires so remounts and programmatic navigation render settled.
         cx.spawn(async move |weak, cx| {
-            Timer::after(motion.duration).await;
+            cx.background_executor().timer(motion.duration).await;
             let _ = weak.update(cx, |this, cx| {
                 if this
                     .segmented_control_user_motion

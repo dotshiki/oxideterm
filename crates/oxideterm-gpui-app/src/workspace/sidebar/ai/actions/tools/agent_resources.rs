@@ -232,7 +232,7 @@ impl WorkspaceApp {
             let monitor_key = key.clone();
             let task = cx.spawn(async move |weak, cx| {
                 loop {
-                    Timer::after(Duration::from_millis(250)).await;
+                    cx.background_executor().timer(Duration::from_millis(250)).await;
                     let finished = weak.update(cx, |this, cx| {
                         if !lease.is_current() {
                             // A returned tool no longer owns input. Preserve any confirmed outcome

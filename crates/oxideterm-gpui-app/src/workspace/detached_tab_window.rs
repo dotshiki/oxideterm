@@ -48,7 +48,7 @@ impl DetachedTabWindow {
                 // The relay is a bounded visual snapshot. Drop it after the
                 // one-shot transition so detached windows retain no stale state.
                 cx.spawn(async move |weak, cx| {
-                    Timer::after(delay).await;
+                    cx.background_executor().timer(delay).await;
                     let _ = weak.update(cx, |detached, cx| {
                         detached.entry_handoff_origin = None;
                         cx.notify();

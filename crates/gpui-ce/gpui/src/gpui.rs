@@ -375,6 +375,8 @@ where
 pub struct GpuSpecs {
     /// Whether the GPU is really a fake (like `llvmpipe`) running on the CPU.
     pub is_software_emulated: bool,
+    /// Whether the GPU is provided by a desktop hypervisor instead of real hardware.
+    pub is_virtual_gpu: bool,
     /// The name of the device, as reported by Vulkan.
     pub device_name: String,
     /// The name of the driver, as reported by Vulkan.

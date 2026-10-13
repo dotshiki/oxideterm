@@ -80,7 +80,19 @@ fn expand_local_git_home_with(cwd: &str, home: Option<&Path>) -> String {
     }
     if let Some(rest) = cwd.strip_prefix("~/") {
         if let Some(home) = home {
-            return home.join(rest).to_string_lossy().to_string();
+            // Preserve the home argument's separator style: Path::join would
+            // insert the platform separator and yield mixed separators when a
+            // POSIX-style home is joined on Windows.
+            let mut expanded = home.to_string_lossy().to_string();
+            if !expanded.ends_with(['/', '\\']) {
+                if expanded.contains('\\') {
+                    expanded.push('\\');
+                } else {
+                    expanded.push('/');
+                }
+            }
+            expanded.push_str(rest);
+            return expanded;
         }
     }
     cwd.to_string()

@@ -110,7 +110,7 @@ impl WorkspaceApp {
                     biased;
                     _ = async { if let Some(dispatch) = &owner.dispatch { dispatch.cancelled().await; } else { std::future::pending::<()>().await; } } => break,
                     result = &mut process.process => Some(result),
-                    _ = Timer::after(wait_timeout), if sender.is_some() => None,
+                    _ = cx.background_executor().timer(wait_timeout), if sender.is_some() => None,
                     _ = async { if let Some(sender) = &mut sender { sender.closed().await; } else { std::future::pending::<()>().await; } } => break,
                     _ = async { if let Some(dispatch) = &owner.dispatch { dispatch.invalidated().await; } else { std::future::pending::<()>().await; } }, if sender.is_some() => {
                         if let Some(sender) = sender.take() {

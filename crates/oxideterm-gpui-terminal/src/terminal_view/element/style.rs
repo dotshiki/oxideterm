@@ -1,6 +1,6 @@
 use gpui::{
-    Font, FontStyle, FontWeight, Hsla, IntoColor, Rgba, StrikethroughStyle, TextRun,
-    UnderlineStyle, px, rgb, rgba,
+    Font, FontStyle, FontWeight, Hsla, Rgba, StrikethroughStyle, TextRun, UnderlineStyle, px, rgb,
+    rgb_to_hsla, rgba,
 };
 use oxideterm_terminal::{TerminalCell, TerminalColor};
 
@@ -34,7 +34,7 @@ pub(crate) fn text_run_for_cell(
             style,
         },
         color: if link {
-            rgb(0x61afef).into_color()
+            rgb_to_hsla(rgb(0x61afef))
         } else {
             color
         },
@@ -42,7 +42,7 @@ pub(crate) fn text_run_for_cell(
         underline: (cell.attrs.underline() || link).then_some(UnderlineStyle {
             thickness: px(1.0),
             color: Some(if link {
-                rgb(0x61afef).into_color()
+                rgb_to_hsla(rgb(0x61afef))
             } else {
                 color
             }),
@@ -57,12 +57,12 @@ pub(crate) fn text_run_for_cell(
 }
 
 pub(crate) fn marked_text_run(text: &str, metrics: &TerminalMetrics) -> TextRun {
-    let color = rgb(0xe6e8eb).into_color();
+    let color = rgb_to_hsla(rgb(0xe6e8eb));
     TextRun {
         len: text.len(),
         font: metrics.font.clone(),
         color,
-        background_color: Some(rgba(0x528bff33).into_color()),
+        background_color: Some(rgb_to_hsla(rgba(0x528bff33))),
         underline: Some(UnderlineStyle {
             thickness: px(1.0),
             color: Some(color),
@@ -81,7 +81,7 @@ pub(crate) fn ghost_text_run(
     TextRun {
         len: text.len(),
         font: metrics.font.clone(),
-        color: rgba((theme.foreground << 8) | 0x66).into_color(),
+        color: rgb_to_hsla(rgba((theme.foreground << 8) | 0x66)),
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -97,7 +97,7 @@ pub(crate) fn timestamp_text_run(
     TextRun {
         len: text.len(),
         font: metrics.font.clone(),
-        color: rgba((theme.header_foreground << 8) | 0xcc).into_color(),
+        color: rgb_to_hsla(rgba((theme.header_foreground << 8) | 0xcc)),
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -203,7 +203,7 @@ pub(crate) fn to_rgba(color: TerminalColor) -> Rgba {
 }
 
 pub(crate) fn to_hsla(color: TerminalColor) -> Hsla {
-    to_rgba(color).into_color()
+    rgb_to_hsla(to_rgba(color))
 }
 
 pub(crate) fn terminal_background(theme: &TerminalUiTheme) -> Hsla {

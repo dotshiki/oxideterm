@@ -87,12 +87,15 @@ impl ProjectManifestEntry {
     }
 
     pub fn file_name(&self) -> &str {
-        self.path.rsplit('/').next().unwrap_or(self.path.as_str())
+        self.path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(self.path.as_str())
     }
 
     pub fn parent_path(&self) -> &str {
         self.path
-            .rsplit_once('/')
+            .rsplit_once(['/', '\\'])
             .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
             .unwrap_or(".")
     }

@@ -436,13 +436,13 @@ impl WorkspaceApp {
                 .child(
                     deferred(
                         anchored()
-                            .anchor(Corner::TopRight)
+                            .anchor(Anchor::TopRight)
                             .position(anchor.bounds.bottom_right())
                             .offset(point(px(0.0), px(4.0)))
                             .position_mode(AnchoredPositionMode::Window)
                             .child(popup),
                     )
-                    .with_priority(oxideterm_gpui_ui::modal::TAURI_SELECT_LAYER_PRIORITY),
+                    .priority(oxideterm_gpui_ui::modal::TAURI_SELECT_LAYER_PRIORITY),
                 )
                 .into_any_element(),
         )

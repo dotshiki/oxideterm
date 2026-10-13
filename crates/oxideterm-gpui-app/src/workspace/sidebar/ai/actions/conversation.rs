@@ -362,7 +362,7 @@ impl WorkspaceApp {
         }
         // The open flag remains set until this generation's exit frame completes.
         cx.spawn(async move |weak, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = weak.update(cx, |this, cx| {
                 if this.finish_ai_standard_confirm_exit(kind, generation, cx) {
                     cx.notify();

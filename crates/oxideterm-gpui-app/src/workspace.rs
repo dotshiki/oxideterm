@@ -104,14 +104,14 @@ use self::{
 };
 use anyhow::Result;
 use gpui::{
-    AnchoredPositionMode, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds,
-    ClipboardEntry, ClipboardItem, Context, Corner, CursorStyle, Entity, FocusHandle, Focusable,
-    FollowMode, Image, ImageFormat, IntoColor, IntoElement, KeyDownEvent, KeyUpEvent,
+    Anchor, AnchoredPositionMode, Animation, AnimationExt, AnyElement, AnyWindowHandle, App,
+    Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    FollowMode, Image, ImageFormat, IntoElement, KeyDownEvent, KeyUpEvent,
     ListAlignment, ListState, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render, RenderImage,
     Rgba, ScrollHandle, ScrollWheelEvent, SharedString, Styled, StyledImage, Subscription, Task,
-    TextLayout, Timer, UniformListScrollHandle, Window, anchored, canvas, deferred, div,
-    prelude::*, px, relative, rgb, rgba, svg,
+    TextLayout, UniformListScrollHandle, Window, anchored, canvas, deferred, div,
+    prelude::*, px, relative, rgb, rgb_to_hsla, rgba, svg,
 };
 use oxideterm_connection_monitor::{
     CompactMonitorRow, ConnectionPoolEntryState, ConnectionPoolEntrySummary,

@@ -939,7 +939,9 @@ impl WorkspaceApp {
         // GPUI likewise needs a post-layout turn before the uniform-list extent
         // is current, otherwise the newest event can remain just below view.
         cx.spawn(async move |weak, cx| {
-            Timer::after(Duration::from_millis(16)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
             let _ = weak.update(cx, move |_this, cx| {
                 scroll_tauri_virtual_list_to_index(
                     &handle,

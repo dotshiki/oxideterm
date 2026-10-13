@@ -331,7 +331,9 @@ impl WorkspaceApp {
         let client_ref = client_ref.clone();
         let recording_ref = recording_ref.clone();
         cx.spawn(async move |workspace, cx| {
-            gpui::Timer::after(RECORDING_CONTENT_RETENTION).await;
+            cx.background_executor()
+                .timer(RECORDING_CONTENT_RETENTION)
+                .await;
             let _ = workspace.update(cx, |workspace, _cx| {
                 let Some(record) = workspace
                     .public_mcp

@@ -928,12 +928,12 @@ impl WorkspaceApp {
 
         let (anchor_corner, position, offset_y) = if opens_above {
             (
-                Corner::BottomLeft,
+                Anchor::BottomLeft,
                 point(anchor.bounds.left(), anchor.bounds.top()),
                 -popup_gap,
             )
         } else {
-            (Corner::TopLeft, anchor.bounds.bottom_left(), popup_gap)
+            (Anchor::TopLeft, anchor.bounds.bottom_left(), popup_gap)
         };
         let popup = popup.into_any_element();
 
@@ -964,7 +964,7 @@ impl WorkspaceApp {
                             .position_mode(AnchoredPositionMode::Window)
                             .child(popup),
                     )
-                    .with_priority(oxideterm_gpui_ui::modal::TAURI_SELECT_LAYER_PRIORITY),
+                    .priority(oxideterm_gpui_ui::modal::TAURI_SELECT_LAYER_PRIORITY),
                 )
                 .into_any_element(),
         )

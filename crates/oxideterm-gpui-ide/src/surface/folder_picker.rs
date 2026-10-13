@@ -340,7 +340,7 @@ impl IdeSurface {
             font: font(SharedString::from(
                 self.tokens.metrics.markdown_code_font_family,
             )),
-            color: rgb(self.tokens.ui.text).into_color(),
+            color: rgb_to_hsla(rgb(self.tokens.ui.text)),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -375,7 +375,7 @@ impl IdeSurface {
             font: font(SharedString::from(
                 self.tokens.metrics.markdown_code_font_family,
             )),
-            color: rgb(self.tokens.ui.text).into_color(),
+            color: rgb_to_hsla(rgb(self.tokens.ui.text)),
             background_color: None,
             underline: None,
             strikethrough: None,

@@ -49,9 +49,12 @@ impl PlatformAtlas for MetalAtlas {
             let Some((size, bytes)) = build()? else {
                 return Ok(None);
             };
-            let tile = lock
-                .allocate(size, key.texture_kind())
-                .context("failed to allocate")?;
+            let tile = if matches!(key, AtlasKey::DynamicTexture(_)) {
+                lock.allocate_dedicated(size, key.texture_kind())
+            } else {
+                lock.allocate(size, key.texture_kind())
+            }
+            .context("failed to allocate")?;
             let texture = lock.texture(tile.texture_id);
             texture.upload(tile.bounds, &bytes);
             lock.tiles_by_key.insert(key.clone(), tile);
@@ -90,6 +93,25 @@ impl PlatformAtlas for MetalAtlas {
             }
         }
     }
+
+    // OxideTerm: uploads a dirty region of a dynamic texture in place.
+    fn update(&self, key: &AtlasKey, bounds: Bounds<DevicePixels>, bytes: &[u8]) -> Result<()> {
+        let lock = self.0.lock();
+        let Some(tile) = lock.tiles_by_key.get(key).copied() else {
+            return Ok(());
+        };
+        let upload_bounds = Bounds {
+            origin: tile.bounds.origin + bounds.origin,
+            size: bounds.size,
+        };
+        lock.texture(tile.texture_id).upload(upload_bounds, bytes);
+        Ok(())
+    }
+
+    fn resource_generation(&self) -> u64 {
+        // Metal devices are not recreated by the current backend.
+        0
+    }
 }
 
 impl MetalAtlasState {
@@ -118,6 +140,26 @@ impl MetalAtlasState {
         texture.allocate(size)
     }
 
+    // OxideTerm: allocates an exact-size texture so a mutable framebuffer's dirty uploads
+    // cannot affect atlas peers.
+    fn allocate_dedicated(
+        &mut self,
+        size: Size<DevicePixels>,
+        texture_kind: AtlasTextureKind,
+    ) -> Option<AtlasTile> {
+        // Max texture size on all modern Apple GPUs; must match push_texture's clamp bound.
+        const MAX_TEXTURE_SIZE: Size<DevicePixels> = Size {
+            width: DevicePixels(16384),
+            height: DevicePixels(16384),
+        };
+        if size.width > MAX_TEXTURE_SIZE.width || size.height > MAX_TEXTURE_SIZE.height {
+            return None;
+        }
+
+        self.push_texture_with_size(size, texture_kind)
+            .allocate(size)
+    }
+
     fn push_texture(
         &mut self,
         min_size: Size<DevicePixels>,
@@ -143,6 +185,70 @@ impl MetalAtlasState {
                 // Shared shaders read coverage from red, like WGPU's R8 atlas; A8 samples
                 // coverage through alpha and made every glyph transparent.
                 pixel_format = metal::MTLPixelFormat::R8Unorm;
+                usage = metal::MTLTextureUsage::ShaderRead;
+            }
+            AtlasTextureKind::Polychrome => {
+                pixel_format = metal::MTLPixelFormat::BGRA8Unorm;
+                usage = metal::MTLTextureUsage::ShaderRead;
+            }
+            AtlasTextureKind::Subpixel => unreachable!(),
+        }
+        texture_descriptor.set_pixel_format(pixel_format);
+        texture_descriptor.set_usage(usage);
+        // Shared memory mode can be used only on Apple GPU families
+        // https://developer.apple.com/documentation/metal/mtlresourceoptions/storagemodeshared
+        texture_descriptor.set_storage_mode(if self.is_apple_gpu {
+            metal::MTLStorageMode::Shared
+        } else {
+            metal::MTLStorageMode::Managed
+        });
+        let metal_texture = self.device.new_texture(&texture_descriptor);
+
+        let texture_list = match kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Subpixel => unreachable!(),
+        };
+
+        let index = texture_list.free_list.pop();
+
+        let atlas_texture = MetalAtlasTexture {
+            id: AtlasTextureId {
+                index: index.unwrap_or(texture_list.textures.len()) as u32,
+                kind,
+            },
+            allocator: etagere::BucketedAtlasAllocator::new(size_to_etagere(size)),
+            metal_texture: AssertSend(metal_texture),
+            live_atlas_keys: 0,
+        };
+
+        if let Some(ix) = index {
+            texture_list.textures[ix] = Some(atlas_texture);
+            texture_list.textures.get_mut(ix)
+        } else {
+            texture_list.textures.push(Some(atlas_texture));
+            texture_list.textures.last_mut()
+        }
+        .unwrap()
+        .as_mut()
+        .unwrap()
+    }
+
+    // OxideTerm: creates a texture with the exact requested size (no default-size clamping),
+    // so a mutable framebuffer owns its own texture.
+    fn push_texture_with_size(
+        &mut self,
+        size: Size<DevicePixels>,
+        kind: AtlasTextureKind,
+    ) -> &mut MetalAtlasTexture {
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.into());
+        texture_descriptor.set_height(size.height.into());
+        let pixel_format;
+        let usage;
+        match kind {
+            AtlasTextureKind::Monochrome => {
+                pixel_format = metal::MTLPixelFormat::A8Unorm;
                 usage = metal::MTLTextureUsage::ShaderRead;
             }
             AtlasTextureKind::Polychrome => {
@@ -277,7 +383,7 @@ unsafe impl<T> Send for AssertSend<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::PlatformAtlas;
+    use gpui::{DynamicTextureId, DynamicTextureParams, PlatformAtlas};
     use std::borrow::Cow;
 
     fn create_atlas() -> Option<MetalAtlas> {
@@ -289,6 +395,12 @@ mod tests {
         AtlasKey::Image(gpui::RenderImageParams {
             image_id: gpui::ImageId(image_id),
             frame_index,
+        })
+    }
+
+    fn make_dynamic_texture_key(texture_id: usize) -> AtlasKey {
+        AtlasKey::DynamicTexture(DynamicTextureParams {
+            texture_id: DynamicTextureId(texture_id),
         })
     }
 
@@ -408,5 +520,64 @@ mod tests {
             atlas.metal_texture(tile.texture_id).pixel_format(),
             metal::MTLPixelFormat::R8Unorm
         );
+    }
+
+    #[test]
+    fn dynamic_textures_use_exact_sized_dedicated_metal_textures() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let size = Size {
+            width: DevicePixels(64),
+            height: DevicePixels(32),
+        };
+
+        let first = insert_tile(&atlas, &make_dynamic_texture_key(1), size);
+        let second = insert_tile(&atlas, &make_dynamic_texture_key(2), size);
+
+        assert_ne!(first.texture_id, second.texture_id);
+        let first_texture = atlas.metal_texture(first.texture_id);
+        assert_eq!(first_texture.width(), 64);
+        assert_eq!(first_texture.height(), 32);
+        assert_eq!(atlas.resource_generation(), 0);
+    }
+
+    #[test]
+    fn dynamic_texture_updates_upload_only_the_requested_region() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let size = Size {
+            width: DevicePixels(2),
+            height: DevicePixels(2),
+        };
+        let key = make_dynamic_texture_key(3);
+        let tile = insert_tile(&atlas, &key, size);
+        let dirty_pixel = [1, 2, 3, 4];
+
+        atlas
+            .update(
+                &key,
+                Bounds {
+                    origin: Point::new(DevicePixels(1), DevicePixels(1)),
+                    size: Size {
+                        width: DevicePixels(1),
+                        height: DevicePixels(1),
+                    },
+                },
+                &dirty_pixel,
+            )
+            .expect("partial upload should succeed");
+
+        let texture = atlas.metal_texture(tile.texture_id);
+        let mut uploaded = [0u8; 16];
+        texture.get_bytes(
+            uploaded.as_mut_ptr().cast(),
+            8,
+            metal::MTLRegion::new_2d(0, 0, 2, 2),
+            0,
+        );
+        assert_eq!(&uploaded[..12], &[0; 12]);
+        assert_eq!(&uploaded[12..], &dirty_pixel);
     }
 }

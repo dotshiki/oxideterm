@@ -2,8 +2,8 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use gpui::{
     AnyElement, App, Bounds, CursorStyle, Div, Element, ElementId, GlobalElementId, HighlightStyle,
-    InspectorElementId, IntoColor, IntoElement, LayoutId, ParentElement, Pixels, Point, Styled,
-    StyledText, TextLayout, UnderlineStyle, Window, div, fill, point, prelude::*, px, rgb, rgba,
+    InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, Point, Styled, StyledText,
+    TextLayout, UnderlineStyle, Window, div, fill, point, prelude::*, px, rgb, rgb_to_hsla, rgba,
     size,
 };
 use oxideterm_theme::ThemeTokens;
@@ -467,7 +467,7 @@ fn text_input_value_segments_with_viewport(
         let styled = StyledText::new(projected.clone()).with_highlights([(
             ghost_start..projected.len(),
             HighlightStyle {
-                color: Some(rgba((theme.text_muted << 8) | 0x99).into_color()),
+                color: Some(rgb_to_hsla(rgba((theme.text_muted << 8) | 0x99))),
                 ..HighlightStyle::default()
             },
         )]);
@@ -531,7 +531,7 @@ fn text_input_value_segments_with_marked_text(
         HighlightStyle {
             underline: Some(UnderlineStyle {
                 thickness: px(1.0),
-                color: Some(rgb(theme.text).into_color()),
+                color: Some(rgb_to_hsla(rgb(theme.text))),
                 wavy: false,
             }),
             ..HighlightStyle::default()

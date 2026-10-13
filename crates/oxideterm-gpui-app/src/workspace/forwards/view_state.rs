@@ -224,7 +224,7 @@ impl ForwardingWorkspaceEntity {
         self.view.copied_forward_id = Some(forward_id.clone());
         let page = self.page_id();
         cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 if page.is_some_and(|id| !entity.has_page(id)) {
                     return;

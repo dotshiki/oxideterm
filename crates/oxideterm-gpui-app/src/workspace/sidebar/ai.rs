@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::workspace::ai_state::{AiChatPopover, AiWorkspaceEntity, AiWorkspaceVisibility};
 use crate::workspace::ime::WorkspaceImeTarget;
 use crate::workspace::*;
-use gpui::{Context, Div, MouseDownEvent, Rgba, Window};
+use gpui::{Anchor, Context, Div, MouseDownEvent, Rgba, Window};
 use oxideterm_ai::stream_state::*;
 use oxideterm_ai::{
     AiAutocompleteCandidate, AiAutocompleteKind, AiChatMessage, AiChatMessageMetadata, AiChatRole,

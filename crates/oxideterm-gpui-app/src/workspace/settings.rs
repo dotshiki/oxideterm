@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    AnchoredPositionMode, Corner, Div, ObjectFit, PathPromptOptions, Rgba, anchored, deferred, img,
+    AnchoredPositionMode, Div, ObjectFit, PathPromptOptions, Rgba, anchored, deferred, img,
     point, relative,
 };
 use oxideterm_settings::{

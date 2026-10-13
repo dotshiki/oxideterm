@@ -1,8 +1,8 @@
 use super::ime::WorkspaceImeTarget;
 use super::*;
 use gpui::{
-    AnchoredPositionMode, Corner, Entity, EventEmitter, Focusable, ObjectFit, PathPromptOptions,
-    Pixels, Point, SharedString, Subscription, Task, UniformListScrollHandle, anchored, deferred,
+    AnchoredPositionMode, Entity, EventEmitter, Focusable, ObjectFit, PathPromptOptions, Pixels,
+    Point, SharedString, Subscription, Task, UniformListScrollHandle, anchored, deferred,
     prelude::*,
 };
 use oxideterm_connections::SshChannelStrategy;
@@ -1424,7 +1424,7 @@ impl SftpWorkspaceEntity {
         }
         self.dialog_exit_generation = Some(generation);
         self.dialog_exit_task = Some(cx.spawn(async move |entity, cx| {
-            gpui::Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |sftp, cx| {
                 sftp.finish_dialog_exit(generation, cx);
             });

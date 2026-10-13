@@ -661,7 +661,7 @@ impl WorkspaceApp {
             ai.show_context_trim_notice(count)
         });
         cx.spawn(async move |weak, cx| {
-            Timer::after(Duration::from_secs(5)).await;
+            cx.background_executor().timer(Duration::from_secs(5)).await;
             let _ = weak.update(cx, |this, cx| {
                 let cleared = this
                     .ai_entity

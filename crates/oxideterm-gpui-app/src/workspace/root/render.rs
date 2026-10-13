@@ -1563,7 +1563,7 @@ impl WorkspaceApp {
                         ),
                 ),
         )
-        .with_priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
+        .priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
         .into_any_element()
     }
 }

@@ -47,7 +47,9 @@ impl WorkspaceApp {
 
         self.pending_window_ui_state = Some(next);
         self.window_state_save_task = Some(cx.spawn(async move |weak, cx| {
-            Timer::after(WINDOW_STATE_SAVE_DELAY).await;
+            cx.background_executor()
+                .timer(WINDOW_STATE_SAVE_DELAY)
+                .await;
             let _ = weak.update(cx, |this, cx| {
                 this.window_state_save_task = None;
                 this.commit_main_window_state(cx);

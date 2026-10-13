@@ -355,13 +355,13 @@ impl WorkspaceApp {
         Some(
             deferred(
                 anchored()
-                    .anchor(Corner::TopLeft)
+                    .anchor(Anchor::TopLeft)
                     .position(anchor.bounds.bottom_left())
                     .offset(gpui::point(px(0.0), px(PATH_COMPLETION_POPUP_GAP)))
                     .position_mode(AnchoredPositionMode::Window)
                     .child(oxideterm_gpui_ui::modal::overlay_content_boundary(popup)),
             )
-            .with_priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
+            .priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
             .into_any_element(),
         )
     }

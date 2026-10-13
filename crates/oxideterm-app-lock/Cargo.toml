@@ -28,4 +28,4 @@ objc2-foundation = { version = "0.3", features = ["NSError", "NSString"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = ["Foundation", "Security_Credentials_UI", "Win32_Foundation", "Win32_System_WinRT"] }
 windows-core.workspace = true
-windows-future = "0.2"
+windows-future = "0.3"

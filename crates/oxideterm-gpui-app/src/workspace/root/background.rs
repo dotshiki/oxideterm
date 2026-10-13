@@ -153,7 +153,9 @@ impl window_shell::WorkspaceWindowBackgroundEntity {
         // Each shell owns its cache completion task, so releasing one native
         // window cannot keep repaint work alive through the shared session.
         self.decode_completion_task = Some(cx.spawn(async move |window_background, cx| {
-            Timer::after(Duration::from_millis(16)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
             let _ = window_background.update(cx, |window_background, cx| {
                 window_background.decode_completion_task = None;
                 if window_background.cache.drain_completed() {

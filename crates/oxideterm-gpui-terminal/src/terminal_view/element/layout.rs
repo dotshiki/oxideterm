@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use gpui::{Bounds, IntoColor, Pixels, point, px, rgba, size};
+use gpui::{Bounds, Pixels, point, px, rgb_to_hsla, rgba, size};
 use oxideterm_terminal::{TerminalSearchMatch, TerminalSnapshot};
 use oxideterm_terminal_unicode::visual_line_for_row_if_bidi;
 
@@ -122,7 +122,7 @@ pub(crate) fn search_match_rects_for_rows(
                 row: row_index,
                 col: start_col,
                 cells,
-                color: rgba(0xffcc6644).into_color(),
+                color: rgb_to_hsla(rgba(0xffcc6644)),
             });
         }
     }
@@ -151,9 +151,9 @@ pub(crate) fn visible_search_match_rects(
                     col: range.start_col,
                     cells: range.end_col.saturating_sub(range.start_col),
                     color: if selected_match == Some(index) {
-                        rgba(0xffdd8899).into_color()
+                        rgb_to_hsla(rgba(0xffdd8899))
                     } else {
-                        rgba(0xffcc6644).into_color()
+                        rgb_to_hsla(rgba(0xffcc6644))
                     },
                 })
             })

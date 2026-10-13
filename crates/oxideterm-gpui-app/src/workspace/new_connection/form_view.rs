@@ -1,5 +1,5 @@
 use gpui::{
-    AnchoredPositionMode, AnyElement, ClipboardItem, Context, Corner, KeyDownEvent, MouseButton,
+    Anchor, AnchoredPositionMode, AnyElement, ClipboardItem, Context, KeyDownEvent, MouseButton,
     MouseMoveEvent, ParentElement, PathPromptOptions, SharedString, Styled, Window, anchored,
     deferred, div, point, prelude::*, px, rgb, rgba,
 };

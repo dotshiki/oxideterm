@@ -1029,6 +1029,14 @@ impl MacWindowState {
         }
     }
 
+    fn is_minimized(&self) -> bool {
+        // isMiniaturized is not exposed as a generated objc2 method, so query it directly.
+        unsafe {
+            let minimized: Bool = msg_send![self.native_window, isMiniaturized];
+            minimized == Bool::new(true)
+        }
+    }
+
     fn is_fullscreen(&self) -> bool {
         unsafe {
             let style_mask = self.native_window.styleMask();

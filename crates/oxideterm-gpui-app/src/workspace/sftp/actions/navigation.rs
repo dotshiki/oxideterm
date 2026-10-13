@@ -1171,7 +1171,9 @@ impl SftpWorkspaceEntity {
         }
         self.drag_autoscroll_scheduled = true;
         cx.spawn(async move |entity, cx| {
-            gpui::Timer::after(Duration::from_millis(16)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
             let _ = entity.update(cx, |sftp, cx| {
                 sftp.drag_autoscroll_scheduled = false;
                 let Some(position) = sftp.drag_autoscroll_position else {

@@ -111,6 +111,9 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
         CursorStyle::ResizeUpLeftDownRight => (&SIZENWSE, IDC_SIZENWSE),
         CursorStyle::ResizeUpRightDownLeft => (&SIZENESW, IDC_SIZENESW),
         CursorStyle::OperationNotAllowed => (&NO, IDC_NO),
+        // The remote desktop paints its own cursor, so the system pointer must be
+        // hidden instead of falling back to the arrow cursor.
+        CursorStyle::None => return None,
         _ => (&ARROW, IDC_ARROW),
     };
     Some(

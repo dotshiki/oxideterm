@@ -292,7 +292,9 @@ impl WorkspaceTerminalEntity {
         // before another GPUI test or workspace can install its scheduler.
         self.cast_tick_task = Some(cx.spawn(async move |terminal, cx| {
             loop {
-                Timer::after(Duration::from_millis(33)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
                 let should_continue = terminal
                     .update(cx, |terminal, cx| {
                         if terminal.cast_tick_generation != generation {

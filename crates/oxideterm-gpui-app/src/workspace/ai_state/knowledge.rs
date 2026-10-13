@@ -315,7 +315,7 @@ impl AiWorkspaceEntity {
             return;
         }
         let task = cx.spawn(async move |entity, cx| {
-            gpui::Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 entity.finish_knowledge_create_dialog_exit(generation);
                 entity.emit_knowledge_page_changed(cx);
@@ -372,7 +372,7 @@ impl AiWorkspaceEntity {
             return;
         }
         let task = cx.spawn(async move |entity, cx| {
-            gpui::Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 entity.finish_knowledge_document_dialog_exit(generation);
                 entity.emit_knowledge_page_changed(cx);

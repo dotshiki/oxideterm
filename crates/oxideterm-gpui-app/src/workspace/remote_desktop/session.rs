@@ -80,7 +80,7 @@ impl RemoteDesktopSessionEntity {
         self.automatic_reconnect_worker_generation = Some(failed_generation);
         let delay = remote_desktop_automatic_reconnect_delay(attempt);
         let reconnect_task = cx.spawn(async move |session, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let window_handle = session
                 .update(cx, |session, _cx| {
                     (session.automatic_reconnect_worker_generation == Some(failed_generation)
@@ -777,7 +777,9 @@ impl RemoteDesktopSessionEntity {
 
         cx.spawn(async move |session, cx| {
             for _ in 0..REMOTE_DESKTOP_INITIAL_LAYOUT_PROBE_TICKS {
-                Timer::after(REMOTE_DESKTOP_INITIAL_LAYOUT_PROBE_INTERVAL).await;
+                cx.background_executor()
+                    .timer(REMOTE_DESKTOP_INITIAL_LAYOUT_PROBE_INTERVAL)
+                    .await;
                 let done = session
                     .update(cx, |session, cx| {
                         if session.worker.is_some() {
@@ -1415,12 +1417,12 @@ impl WorkspaceApp {
 
         deferred(
             anchored()
-                .anchor(Corner::TopLeft)
+                .anchor(Anchor::TopLeft)
                 .position(gpui::point(px(placement.x), px(placement.y)))
                 .position_mode(AnchoredPositionMode::Window)
                 .child(overlay_content_boundary(menu)),
         )
-        .with_priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
+        .priority(oxideterm_gpui_ui::modal::TAURI_POPOVER_LAYER_PRIORITY)
         .into_any_element()
     }
 

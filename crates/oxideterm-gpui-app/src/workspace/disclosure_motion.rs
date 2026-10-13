@@ -143,7 +143,7 @@ impl WorkspaceApp {
         // Only IDs and scalar motion state survive the transition, never message content.
         // The weak workspace handle prevents completion from retaining a closed window.
         cx.spawn(async move |weak, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = weak.update(cx, |this, cx| {
                 if this.disclosure_motions.finish(&key, generation) {
                     cx.notify();

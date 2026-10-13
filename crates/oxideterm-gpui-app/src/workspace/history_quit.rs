@@ -56,7 +56,10 @@ pub(crate) fn request_app_quit(cx: &mut App) {
                     .map(|wait| async move { wait.await.unwrap_or(false) }),
             )
             .boxed_local();
-            let timeout = Timer::after(Duration::from_secs(5)).boxed_local();
+            let timeout = cx
+                .background_executor()
+                .timer(Duration::from_secs(5))
+                .boxed_local();
             if let futures_util::future::Either::Left((saved, _)) =
                 futures_util::future::select(saved, timeout).await
             {

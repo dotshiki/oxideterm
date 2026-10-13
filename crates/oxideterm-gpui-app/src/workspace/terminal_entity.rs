@@ -504,10 +504,11 @@ impl WorkspaceTerminalEntity {
         let generation = self.git_probe_schedule_generation;
         self.git_probe_schedule_task = Some(cx.spawn(async move |terminal, cx| {
             loop {
-                Timer::after(Duration::from_millis(
-                    terminal_git::TERMINAL_GIT_PROBE_TTL_MS,
-                ))
-                .await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(
+                        terminal_git::TERMINAL_GIT_PROBE_TTL_MS,
+                    ))
+                    .await;
                 let should_continue = terminal
                     .update(cx, |terminal, cx| {
                         if terminal.git_probe_schedule_generation != generation
@@ -567,7 +568,9 @@ impl WorkspaceTerminalEntity {
         let generation = self.project_probe_schedule_generation;
         self.project_probe_schedule_task = Some(cx.spawn(async move |terminal, cx| {
             loop {
-                Timer::after(Duration::from_millis(TERMINAL_PROJECT_PROBE_TTL_MS)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(TERMINAL_PROJECT_PROBE_TTL_MS))
+                    .await;
                 let should_continue = terminal
                     .update(cx, |terminal, cx| {
                         if terminal.project_probe_schedule_generation != generation

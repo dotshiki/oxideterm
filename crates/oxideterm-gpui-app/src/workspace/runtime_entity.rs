@@ -2006,7 +2006,9 @@ impl WorkspaceRuntimeEntity {
         // Retaining the latest debounce task cancels superseded timers and
         // prevents their async wake from escaping the runtime entity lifetime.
         self.reconnect_debounce_task = Some(cx.spawn(async move |entity, cx| {
-            Timer::after(RECONNECT_DEBOUNCE_DELAY).await;
+            cx.background_executor()
+                .timer(RECONNECT_DEBOUNCE_DELAY)
+                .await;
             let _ = entity.update(cx, |entity, cx| {
                 entity.flush_reconnect_roots(generation, cx);
             });
@@ -2057,7 +2059,7 @@ impl WorkspaceRuntimeEntity {
             let retry_node_id = node_id.clone();
             let retry_delay = self.reconnect_orchestrator.retry_delay_for_attempt(1);
             let task = cx.spawn(async move |entity, cx| {
-                Timer::after(retry_delay).await;
+                cx.background_executor().timer(retry_delay).await;
                 let _ = entity.update(cx, |entity, cx| {
                     let retry_is_current = entity
                         .reconnect_requeue_states
@@ -2131,7 +2133,7 @@ impl WorkspaceRuntimeEntity {
         self.reconnect_cascade_generation = self.reconnect_cascade_generation.wrapping_add(1);
         let generation = self.reconnect_cascade_generation;
         self.reconnect_cascade_task = Some(cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 if entity.reconnect_cascade_generation == generation
                     && !entity.pending_reconnect_cascade_nodes.is_empty()
@@ -2159,7 +2161,7 @@ impl WorkspaceRuntimeEntity {
             .retain(|scheduled| !scheduled.task.is_ready());
         let node_id = reconnect_schedule_action_node_id(&action);
         let task = cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 entity.push_reconnect_schedule_action(action, cx);
             });
@@ -2452,7 +2454,7 @@ impl WorkspaceRuntimeEntity {
         // Only the runtime entity owns the keepalive timer. Replacing or
         // releasing the entity must cancel the previous async wake.
         self.active_probe_timer_task = Some(cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |entity, cx| {
                 if entity.active_probe_timer_generation == generation {
                     entity.active_probe_timer_task = None;

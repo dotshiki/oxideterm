@@ -44,6 +44,8 @@ use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+// These PCI vendor IDs identify adapters provided by common desktop hypervisors.
+const VIRTUAL_GPU_VENDOR_IDS: &[u32] = &[0x15ad, 0x1ab8, 0x1af4, 0x80ee];
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -1482,6 +1484,7 @@ impl DirectXRenderer {
         .unwrap_or("Unknown Driver".to_string());
         Ok(GpuSpecs {
             is_software_emulated,
+            is_virtual_gpu: VIRTUAL_GPU_VENDOR_IDS.contains(&desc.VendorId),
             device_name,
             driver_name,
             driver_info: driver_version,

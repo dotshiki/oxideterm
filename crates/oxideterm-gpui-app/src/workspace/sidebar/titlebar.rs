@@ -45,7 +45,7 @@ fn visible_window_buttons(
 fn activate_client_titlebar_control(
     control_area: gpui::WindowControlArea,
     window: &mut Window,
-    cx: &mut App,
+    _cx: &mut App,
 ) {
     match control_area {
         gpui::WindowControlArea::Min => window.minimize_window(),
@@ -56,7 +56,7 @@ fn activate_client_titlebar_control(
                 window.zoom_window();
             }
         }
-        gpui::WindowControlArea::Close => window.request_close(cx),
+        gpui::WindowControlArea::Close => window.remove_window(),
         gpui::WindowControlArea::Drag => {}
     }
 }

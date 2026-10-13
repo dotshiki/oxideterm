@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use super::ime::WorkspaceImeTarget;
 use super::*;
 use gpui::{
-    AnchoredPositionMode, Corner, EventEmitter, Task, UniformListScrollHandle, anchored, deferred,
+    AnchoredPositionMode, EventEmitter, Task, UniformListScrollHandle, anchored, deferred,
     prelude::*,
 };
 use oxideterm_editor_core::utf16::replace_utf16;
@@ -484,7 +484,7 @@ impl FileManagerState {
             return true;
         }
         self.dialog_exit_task = Some(cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |file_manager, cx| {
                 file_manager.finish_rich_dialog_exit(generation, cx);
             });
@@ -865,7 +865,7 @@ impl FileManagerState {
             return;
         }
         self.context_menu_exit_task = Some(cx.spawn(async move |entity, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = entity.update(cx, |file_manager, cx| {
                 if file_manager.context_menu_presence.finish_exit(generation) {
                     file_manager.context_menu = None;

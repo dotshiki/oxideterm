@@ -197,7 +197,7 @@ mod platform {
         if windows_core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>().is_err() {
             return BiometricAvailability::Unavailable;
         }
-        match UserConsentVerifier::CheckAvailabilityAsync().and_then(|operation| operation.get()) {
+        match UserConsentVerifier::CheckAvailabilityAsync().and_then(|operation| operation.join()) {
             Ok(UserConsentVerifierAvailability::Available) => BiometricAvailability::Available,
             _ => BiometricAvailability::Unavailable,
         }
@@ -221,7 +221,7 @@ mod platform {
         }
         .context("failed to start Windows Hello verification")?;
         let result = operation
-            .get()
+            .join()
             .context("Windows Hello verification did not complete")?;
         Ok(match result {
             UserConsentVerificationResult::Verified => BiometricOutcome::Verified,

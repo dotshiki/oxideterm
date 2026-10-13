@@ -1179,7 +1179,7 @@ impl WorkspaceApp {
         let tab_id = exiting_visual.tab_id;
         self.main_window_tabs.exiting_tabs.push(exiting_visual);
         cx.spawn(async move |weak, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = weak.update(cx, |this, cx| {
                 let Some(position) = this
                     .main_window_tabs

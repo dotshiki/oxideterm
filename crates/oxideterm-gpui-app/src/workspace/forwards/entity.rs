@@ -375,7 +375,7 @@ impl ForwardingWorkspaceEntity {
         }
         self.sampling_visible = false;
         self.sampling_generation = self.sampling_generation.wrapping_add(1);
-        // Dropping the Entity-owned GPUI task cancels its pending Timer.
+        // Dropping the Entity-owned GPUI task cancels its pending timer task.
         self.sampling_task.take();
         for state in self.port_detection_by_node.values_mut() {
             if !state.port_scan_pending {
@@ -387,7 +387,7 @@ impl ForwardingWorkspaceEntity {
     fn schedule_sampling(&mut self, generation: u64, cx: &mut Context<Self>) {
         self.sampling_task = Some(cx.spawn(async move |entity, cx| {
             loop {
-                Timer::after(FORWARDS_SAMPLING_TICK_INTERVAL).await;
+                cx.background_executor().timer(FORWARDS_SAMPLING_TICK_INTERVAL).await;
                 let keep_running = entity
                     .update(cx, |entity, cx| entity.apply_sampling_tick(generation, cx))
                     .unwrap_or(false);

@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use gpui::{Context, EventEmitter, KeyDownEvent, Task, Timer};
+use gpui::{Context, EventEmitter, KeyDownEvent, Task};
 use oxideterm_connections::{
     ConnectionImportDuplicateStrategy, ConnectionImportPreview, ConnectionImportSource,
     PrivilegeCredentialKind,
@@ -1060,7 +1060,7 @@ impl SettingsWorkspaceEntity {
         }
         // Retaining the task makes reopen and Entity release cancel stale exits.
         self.keybinding_reset_confirm_exit_task = Some(cx.spawn(async move |settings, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = settings.update(cx, |settings, cx| {
                 settings.finish_keybinding_reset_confirm_exit(generation, cx);
             });
@@ -1247,7 +1247,7 @@ impl SettingsWorkspaceEntity {
             return true;
         }
         self.data_directory_confirm_exit_task = Some(cx.spawn(async move |settings, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = settings.update(cx, |settings, cx| {
                 settings.data_directory_confirm_exit_task = None;
                 settings.finish_data_directory_confirm_exit(generation, confirmed, cx);
@@ -1777,7 +1777,7 @@ impl SettingsWorkspaceEntity {
         // The settings Entity retains the exit task so reopen and release
         // cancel it without a reverse dependency on the workspace root.
         self.theme_editor_exit_task = Some(cx.spawn(async move |settings, cx| {
-            Timer::after(delay).await;
+            cx.background_executor().timer(delay).await;
             let _ = settings.update(cx, |settings, cx| {
                 settings.finish_theme_editor_exit(generation, cx);
             });

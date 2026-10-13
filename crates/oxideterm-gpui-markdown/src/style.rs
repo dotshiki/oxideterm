@@ -3,7 +3,7 @@
 
 //! Style helpers that map OxideTerm theme tokens to GPUI text / element styling.
 
-use gpui::{AbsoluteLength, Font, FontStyle, FontWeight, Hsla, IntoColor, Rgba, SharedString};
+use gpui::{AbsoluteLength, Font, FontStyle, FontWeight, Hsla, Rgba, SharedString, rgb_to_hsla};
 use oxideterm_theme::ThemeTokens;
 
 use crate::options::MarkdownOptions;
@@ -30,7 +30,7 @@ pub fn hex_to_hsla(hex: u32) -> Hsla {
     let r = ((hex >> 16) & 0xff) as f32 / 255.0;
     let g = ((hex >> 8) & 0xff) as f32 / 255.0;
     let b = (hex & 0xff) as f32 / 255.0;
-    Rgba::new(r, g, b, 1.0).into_color()
+    rgb_to_hsla(Rgba::new(r, g, b, 1.0))
 }
 
 // ── token-derived style values ──────────────────────────────────────────

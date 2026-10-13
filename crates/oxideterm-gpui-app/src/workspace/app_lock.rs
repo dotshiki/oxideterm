@@ -485,7 +485,7 @@ impl WorkspaceApp {
         }));
         self.focused_settings_input = Some(SettingsInput::AppLockCurrentPassword);
         cx.spawn(async move |weak, cx| {
-            Timer::after(cooldown).await;
+            cx.background_executor().timer(cooldown).await;
             let _ = weak.update(cx, |this, cx| {
                 if this
                     .app_lock

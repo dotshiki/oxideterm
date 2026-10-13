@@ -42,7 +42,8 @@ pub(crate) type PlatformScreenCaptureFrame = ();
 
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
-    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
+    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, DynamicTextureParams, Edges,
+    ExternalDragPayload, Font,
     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap,
     LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
@@ -389,6 +390,16 @@ pub trait PlatformDisplay: Debug {
 
     /// Get the bounds for this display
     fn bounds(&self) -> Bounds<Pixels>;
+
+    /// Returns display bounds in the platform's physical pixel coordinate space.
+    fn physical_bounds(&self) -> Bounds<DevicePixels> {
+        self.bounds().to_device_pixels(self.scale_factor())
+    }
+
+    /// Returns the scale used to map logical coordinates to physical pixels.
+    fn scale_factor(&self) -> f32 {
+        1.0
+    }
 
     /// Get the visible bounds for this display, excluding taskbar/dock areas.
     /// This is the usable area where windows can be placed without being obscured.
@@ -869,6 +880,9 @@ pub enum TextInputStateChange {
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
+    fn is_minimized(&self) -> bool {
+        false
+    }
     fn window_bounds(&self) -> WindowBounds;
     fn content_size(&self) -> Size<Pixels>;
     fn resize(&mut self, size: Size<Pixels>);
@@ -1379,6 +1393,8 @@ pub enum AtlasKey {
     Glyph(RenderGlyphParams),
     Svg(RenderSvgParams),
     Image(RenderImageParams),
+    /// OxideTerm: stable-identity key for mutable dynamic textures.
+    DynamicTexture(DynamicTextureParams),
 }
 
 impl AtlasKey {
@@ -1403,6 +1419,7 @@ impl AtlasKey {
             }
             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
             AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
+            AtlasKey::DynamicTexture(_) => AtlasTextureKind::Polychrome,
         }
     }
 }
@@ -1425,6 +1442,12 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
+impl From<DynamicTextureParams> for AtlasKey {
+    fn from(params: DynamicTextureParams) -> Self {
+        Self::DynamicTexture(params)
+    }
+}
+
 #[expect(missing_docs)]
 pub trait PlatformAtlas {
     fn get_or_insert_with<'a>(
@@ -1433,6 +1456,17 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
+
+    /// OxideTerm: updates a device-pixel region relative to the top-left of an existing atlas
+    /// entry, used for mutable dynamic textures.
+    fn update(&self, _key: &AtlasKey, _bounds: Bounds<DevicePixels>, _bytes: &[u8]) -> Result<()> {
+        anyhow::bail!("dynamic texture updates are not supported by this platform atlas")
+    }
+
+    /// OxideTerm: returns the generation of the GPU resources backing this atlas.
+    fn resource_generation(&self) -> u64 {
+        0
+    }
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
@@ -2543,6 +2577,9 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// Hide the system cursor.
+    None,
 }
 
 /// A clipboard item that should be copied to the clipboard

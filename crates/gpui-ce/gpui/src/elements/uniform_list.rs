@@ -13,6 +13,16 @@ use crate::{
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc};
 
+fn overscanned_visible_range(
+    first_visible: usize,
+    last_visible: usize,
+    item_count: usize,
+    overscan: usize,
+) -> Range<usize> {
+    first_visible.saturating_sub(overscan)
+        ..cmp::min(last_visible.saturating_add(overscan), item_count)
+}
+
 use super::ListHorizontalSizingBehavior;
 
 /// uniform_list provides lazy rendering for a set of items that are of uniform height.
@@ -51,6 +61,7 @@ where
         scroll_handle: None,
         sizing_behavior: ListSizingBehavior::default(),
         horizontal_sizing_behavior: ListHorizontalSizingBehavior::default(),
+        overscan: 0,
     }
 }
 
@@ -66,6 +77,7 @@ pub struct UniformList {
     scroll_handle: Option<UniformListScrollHandle>,
     sizing_behavior: ListSizingBehavior,
     horizontal_sizing_behavior: ListHorizontalSizingBehavior,
+    overscan: usize,
 }
 
 /// Frame state used by the [UniformList].
@@ -476,8 +488,12 @@ impl Element for UniformList {
                         / item_height)
                         .ceil() as usize;
 
-                    let visible_range = first_visible_element_ix
-                        ..cmp::min(last_visible_element_ix, self.item_count);
+                    let visible_range = overscanned_visible_range(
+                        first_visible_element_ix,
+                        last_visible_element_ix,
+                        self.item_count,
+                        self.overscan,
+                    );
 
                     let items = if y_flipped {
                         let flipped_range = self.item_count.saturating_sub(visible_range.end)
@@ -646,6 +662,12 @@ impl UniformList {
                 self.interactivity.base_style.overflow.x = Some(Overflow::Scroll);
             }
         }
+        self
+    }
+
+    /// Sets the number of extra rows rendered before and after the visible range.
+    pub fn with_overscan(mut self, overscan: usize) -> Self {
+        self.overscan = overscan;
         self
     }
 
