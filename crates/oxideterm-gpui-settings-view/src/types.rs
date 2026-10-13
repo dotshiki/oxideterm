@@ -53,11 +53,21 @@ pub trait SettingsSelectAnchorExt {
 impl SettingsSelectAnchorExt for SettingsSelect {
     fn anchor_id(self) -> SelectAnchorId {
         match self {
+            Self::PluginMarketplaceSort => SelectAnchorId::PluginMarketplaceSort,
             Self::Language => SelectAnchorId::SettingsLanguage,
             Self::UpdateChannel => SelectAnchorId::SettingsUpdateChannel,
             Self::UpdateProxyMode => SelectAnchorId::SettingsUpdateProxyMode,
             Self::UpdateProxyProtocol => SelectAnchorId::SettingsUpdateProxyProtocol,
             Self::AppearanceTheme => SelectAnchorId::SettingsAppearanceTheme,
+            Self::AppearanceTerminalTheme => SelectAnchorId::SettingsAppearanceTerminalTheme,
+            Self::AppearanceThemeLight => SelectAnchorId::SettingsAppearanceThemeLight,
+            Self::AppearanceThemeDark => SelectAnchorId::SettingsAppearanceThemeDark,
+            Self::AppearanceTerminalThemeLight => {
+                SelectAnchorId::SettingsAppearanceTerminalThemeLight
+            }
+            Self::AppearanceTerminalThemeDark => {
+                SelectAnchorId::SettingsAppearanceTerminalThemeDark
+            }
             Self::AppearanceDensity => SelectAnchorId::SettingsAppearanceDensity,
             Self::AppearanceAnimation => SelectAnchorId::SettingsAppearanceAnimation,
             Self::AppearanceRenderProfile => SelectAnchorId::SettingsAppearanceRenderProfile,

@@ -93,9 +93,8 @@ pub(in crate::workspace) fn settings_language_from_locale(locale: Locale) -> Lan
     }
 }
 
-pub(crate) fn tokens_from_settings(settings: &PersistedSettings) -> ThemeTokens {
-    let mut tokens = oxideterm_settings_model::custom_theme_tokens_from_settings(settings)
-        .unwrap_or_else(|| ThemeTokens::from_builtin(theme_by_id(&settings.terminal.theme)));
+pub(crate) fn tokens_from_settings(settings: &PersistedSettings, system_dark: bool) -> ThemeTokens {
+    let mut tokens = oxideterm_settings_model::theme_tokens_for_system(settings, system_dark);
     let radius = settings.appearance.border_radius as f32;
     tokens.radii = UiRadii {
         xs: (radius - 4.0).max(0.0),
@@ -590,6 +589,7 @@ impl WorkspaceApp {
         detail: Option<String>,
         source: &'static str,
     ) {
+        let title = title.into();
         self.notification_center.event_log.push(
             severity,
             category,
@@ -599,25 +599,6 @@ impl WorkspaceApp {
             detail,
             source,
         );
-    }
-
-    pub(in crate::workspace) fn clear_event_log(&mut self) {
-        self.notification_center.event_log.clear();
-    }
-
-    pub(in crate::workspace) fn cycle_event_log_severity_filter(&mut self) {
-        self.notification_center.event_log.cycle_severity_filter();
-    }
-
-    pub(in crate::workspace) fn cycle_event_log_category_filter(&mut self) {
-        self.notification_center.event_log.cycle_category_filter();
-    }
-
-    pub(in crate::workspace) fn event_log_entry_matches_filter(
-        &self,
-        entry: &WorkspaceEventLogEntry,
-    ) -> bool {
-        self.notification_center.event_log.matches_filter(entry)
     }
 
     pub(in crate::workspace) fn push_notification_entry(
@@ -934,6 +915,7 @@ impl WorkspaceApp {
         cx: &mut Context<Self>,
     ) {
         self.session_sort_menu_open = false;
+        self.audit.open_filter = None;
         // Tauri dialogs are Radix modal roots: opening one dismisses background
         // popovers and input focus before the overlay starts trapping events.
         self.release_active_remote_desktop_inputs(cx);
@@ -963,7 +945,8 @@ impl WorkspaceApp {
         &mut self,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mut changed = false;
+        let mut changed = self.audit.open_filter.take().is_some();
+        changed |= self.close_native_plugin_select(cx);
 
         // Match browser/Radix outside-click behavior for non-modal UI only.
         // Auth prompts, confirm dialogs, QuickLook, and SFTP editor shells keep

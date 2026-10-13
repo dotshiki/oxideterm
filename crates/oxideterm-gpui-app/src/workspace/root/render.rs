@@ -424,6 +424,12 @@ impl WorkspaceApp {
                 }
                 if this.active_sftp_editor_owns_key(event.keystroke.key.as_str(), cx)
                     || this.quick_command_text_editor_focused(window, cx)
+                    || this
+                        .tab_host
+                        .read(cx)
+                        .panes()
+                        .values()
+                        .any(|pane| pane.read(cx).paste_editor_focused(window, cx))
                 {
                     // Windows emits committed characters only after an unhandled
                     // keydown. Do not let pane-level capture override the modal
@@ -771,10 +777,22 @@ impl WorkspaceApp {
                         }
                     });
                 }
+                if phase == gpui::DispatchPhase::Bubble && event.button == MouseButton::Left {
+                    // File lists finish valid drops first. A release outside their hitboxes
+                    // must still retire the SFTP drag, including releases outside the root.
+                    read_only_selection_workspace.update(cx, |this, cx| {
+                        if this.cancel_sftp_drag_capture(cx) {
+                            cx.notify();
+                        }
+                    });
+                }
             })
             .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                 if event.button == MouseButton::Left
-                    && this.browser_pointer_capture_owner(cx).is_some()
+                    && this.browser_pointer_capture_owner(cx).is_some_and(|owner| {
+                        // SFTP drop targets consume mouse-up during bubbling, after capture.
+                        owner != browser_behavior::BrowserPointerCaptureOwner::SftpFileDrag
+                    })
                 {
                     this.finish_workspace_pointer_captures(event, window, cx);
                 }
@@ -788,6 +806,11 @@ impl WorkspaceApp {
             .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                 let _ = this.create_local_terminal_tab(window, cx);
             }))
+            .on_action(cx.listener(
+                |this, action: &oxideterm_gpui_editor::ManageLanguagePlugin, window, cx| {
+                    this.open_language_plugin(&action.plugin_id, window, cx);
+                },
+            ))
             .on_action(cx.listener(|this, _: &ShellLauncher, _window, cx| {
                 this.open_local_shell_launcher(cx);
             }))
@@ -1260,6 +1283,10 @@ impl WorkspaceApp {
             // Tab-owned dialogs are portaled here so their backdrops cover all window chrome.
             .children(active_tab_window_modals)
             .when_some(settings_select_overlay, |root, overlay| root.child(overlay))
+            .when_some(
+                self.render_native_plugin_select_overlay(window, cx),
+                |root, overlay| root.child(overlay),
+            )
             .when_some(
                 self.render_ai_sidebar_floating_overlay(window, cx),
                 |root, overlay| root.child(overlay),

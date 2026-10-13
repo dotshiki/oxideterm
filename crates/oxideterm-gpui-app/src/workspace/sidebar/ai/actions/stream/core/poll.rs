@@ -114,6 +114,32 @@ impl WorkspaceApp {
                 }
                 AiStreamDeliveryEvent::AcpClientEvent { agent_id, event } => {
                     match event {
+                        oxideterm_ai::AcpClientEvent::CursorRequest { request, response_tx } => {
+                            self.flush_pending_ai_stream_text(&mut pending_text, cx);
+                            if !request.valid() || !self.ai_entity.read(cx).is_chat_stream_generation(delivery.generation) {
+                                let _ = response_tx.send(Ok(oxideterm_ai::CursorRequest::cancelled_response()));
+                                continue;
+                            }
+                            let id = request.tool_call_id().to_owned();
+                            let method = request.method();
+                            // The complete question/plan stays in transient state, not tool history.
+                            self.apply_ai_tool_status(delivery.generation, &delivery.conversation_id,
+                                &delivery.assistant_id, &id, method, "{}", "waiting_user", None,
+                                Some("read".into()), Some(self.i18n.t("ai.questions.waiting")), false,
+                                None, None, None, cx);
+                            self.notify_ai_agent_attention(&delivery.conversation_id, &delivery.assistant_id, "ai.questions.waiting", cx);
+                            let selections = match &request {
+                                oxideterm_ai::CursorRequest::Questions(request) => vec![Vec::new(); request.questions.len()],
+                                oxideterm_ai::CursorRequest::Plan(_) => Vec::new(),
+                            };
+                            self.ai_entity.update(cx, |ai, _| {
+                                ai.pending_cursor_requests.insert((delivery.generation, id), crate::workspace::ai_state::AiPendingCursorRequest {
+                                    conversation_id: delivery.conversation_id,
+                                    assistant_id: delivery.assistant_id,
+                                    request, selections, response_tx: Some(response_tx),
+                                });
+                            });
+                        }
                         oxideterm_ai::AcpClientEvent::RequestPermission {
                             request,
                             response_tx,
@@ -953,6 +979,7 @@ impl WorkspaceApp {
                     let _ = sender.send(context);
                 }
                 AiStreamDeliveryEvent::ToolExecutionRequested {
+                    audit_context,
                     dispatch,
                     leases,
                     tool_session_id,
@@ -986,19 +1013,28 @@ impl WorkspaceApp {
                         self.ai_entity.update(cx, |ai, _cx| { ai.agents.tool_leases.insert((tool_session_id.clone(), tool_call_id.clone()), leases); });
                     }
                     let raw_arguments = zeroize::Zeroizing::new(args.to_string());
-                    self.start_ai_ui_orchestrator_tool_execution(
-                        AiToolRunContext { arguments: zeroize::Zeroizing::new(sanitize_ai_tool_arguments_for_approval(&raw_arguments)), generation: delivery.generation, conversation_id: delivery.conversation_id.clone(),
-                            assistant_id: delivery.assistant_id.clone(), dispatch },
-                        tool_session_id,
-                        tool_call_id,
-                        name,
-                        args,
-                        post_user_approval,
-                        dangerous_command_approved,
-                        sender,
-                        window,
-                        cx,
-                    );
+                    oxideterm_audit::AuditContext::with_sync_request(audit_context.as_ref(), || {
+                        self.start_ai_ui_orchestrator_tool_execution(
+                            AiToolRunContext {
+                                arguments: zeroize::Zeroizing::new(
+                                    sanitize_ai_tool_arguments_for_approval(&raw_arguments),
+                                ),
+                                generation: delivery.generation,
+                                conversation_id: delivery.conversation_id.clone(),
+                                assistant_id: delivery.assistant_id.clone(),
+                                dispatch,
+                            },
+                            tool_session_id,
+                            tool_call_id,
+                            name,
+                            args,
+                            post_user_approval,
+                            dangerous_command_approved,
+                            sender,
+                            window,
+                            cx,
+                        );
+                    });
                 }
             }
         }

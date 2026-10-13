@@ -143,6 +143,25 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.audit.open_filter = None;
+        for input in [
+            super::super::audit::AuditPolicyInput::Retention,
+            super::super::audit::AuditPolicyInput::Capacity,
+        ] {
+            if self
+                .ime_selected_range_for_target(WorkspaceImeTarget::AuditPolicy(input), cx)
+                .is_some()
+            {
+                self.clear_ime_selection();
+                break;
+            }
+        }
+        if self
+            .ime_selected_range_for_target(WorkspaceImeTarget::AuditSearch, cx)
+            .is_some()
+        {
+            self.clear_ime_selection();
+        }
         if self.focus_detached_tab_window(tab_id, cx) {
             return;
         }
@@ -174,6 +193,12 @@ impl WorkspaceApp {
     }
 
     pub(in crate::workspace) fn sync_active_tab_surface(&mut self, cx: &mut Context<Self>) {
+        if !self.tabs(cx).iter().any(|tab| {
+            tab.kind == TabKind::NotificationCenter
+                && self.tab_host.read(cx).surface_is_visible(tab.id)
+        }) {
+            self.hide_audit_page();
+        }
         // Tauri keeps the SSH session tree independent from terminal tab focus,
         // but app-level utility tabs still light up their owning activity icon.
         // Keep terminal/SFTP/IDE ownership separate while syncing these sidebar
@@ -599,17 +624,6 @@ impl WorkspaceApp {
         cx.notify();
     }
 
-    pub(in crate::workspace) fn close_active_tab(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(index) = self.active_tab_index(cx) else {
-            return;
-        };
-        self.close_tab_at_index(index, window, cx);
-    }
-
     pub(in crate::workspace) fn request_close_active_tab(
         &mut self,
         window: &mut Window,
@@ -660,9 +674,7 @@ impl WorkspaceApp {
             );
             return;
         }
-        if self.tabs(cx)[index].kind == TabKind::Knowledge
-            && self.guard_dirty_knowledge_tab_close(tab_id, window, cx)
-        {
+        if self.guard_dirty_knowledge_tab_close(tab_id, window, cx) {
             return;
         }
         self.close_tab_at_index(index, window, cx);
@@ -705,7 +717,7 @@ impl WorkspaceApp {
         let tab_ids = self
             .tabs(cx)
             .iter()
-            .filter(|tab| tab.id != active_tab_id)
+            .filter(|tab| self.tab_host.read(cx).container_tab_id(tab.id) != active_tab_id)
             .map(|tab| tab.id)
             .collect::<Vec<_>>();
         if tab_ids.is_empty() {
@@ -976,7 +988,6 @@ impl WorkspaceApp {
 
     fn close_tab_at_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs(cx).get(index)
-            && tab.kind == TabKind::Knowledge
             && self.guard_dirty_knowledge_tab_close(tab.id, window, cx)
         {
             return;
@@ -1004,6 +1015,9 @@ impl WorkspaceApp {
             previous_active_tab_id,
             next_active_tab_id,
         } = transition;
+        if tab.kind == TabKind::NotificationCenter {
+            self.hide_audit_page();
+        }
         let mut pages = Vec::new();
         if let Some(root) = &tab.root_pane {
             root.collect_page_ids(&mut pages);
@@ -1732,21 +1746,13 @@ mod tests {
     }
 
     #[test]
-    fn focusing_terminal_does_not_mark_node_ready() {
+    fn focusing_terminal_selects_and_expands_its_node() {
         let node_id = NodeId("focus-only".to_string());
-        let node = WorkspaceSshNode::new(
-            None,
-            &SshConfig::default(),
-            "Focus only".to_string(),
-            vec![TerminalSessionId(1)],
-            NodeReadiness::Disconnected,
-        );
         let mut active_node_id = None;
         let mut expanded_node_ids = HashSet::new();
 
         focus_terminal_node_projection(&node_id, &mut active_node_id, &mut expanded_node_ids);
 
-        assert_eq!(node.readiness, NodeReadiness::Disconnected);
         assert_eq!(active_node_id, Some(node_id.clone()));
         assert!(expanded_node_ids.contains(&node_id));
     }

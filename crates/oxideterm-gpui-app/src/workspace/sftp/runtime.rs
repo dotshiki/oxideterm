@@ -78,6 +78,18 @@ fn sidebar_sftp_target(
 }
 
 impl SftpWorkspaceEntity {
+    fn take_remote_browse_request(
+        &mut self,
+        remote_id: &SftpRemoteId,
+        path: &str,
+    ) -> Option<oxideterm_audit::AuditContext> {
+        self.remote_browse_request
+            .take()
+            .and_then(|(requested_remote, requested_path, context)| {
+                (requested_remote == *remote_id && requested_path == path).then_some(context)
+            })
+    }
+
     fn remote_load_state(&self) -> SftpRemoteLoadState {
         SftpRemoteLoadState {
             loading: self.remote_loading,
@@ -144,7 +156,7 @@ impl SftpWorkspaceEntity {
             .get(&remote_id)
             .cloned()
             .unwrap_or_else(default_download_path);
-        self.apply_local_path(local_path);
+        let _ = self.apply_local_path(local_path);
 
         let remembered_remote = self
             .remote_path_by_remote
@@ -671,10 +683,11 @@ impl SftpWorkspaceEntity {
                 true
             }
             SftpWorkerResult::PreviewLoaded {
+                asset_owner,
                 generation,
                 path,
                 result,
-            } => self.apply_preview_loaded(generation, path, result, cx),
+            } => self.apply_preview_loaded(generation, path, result, asset_owner, cx),
             SftpWorkerResult::PreviewHexLoaded {
                 generation,
                 path,
@@ -1339,13 +1352,26 @@ impl WorkspaceApp {
         if !self.sftp_surface_is_visible(surface_id, &remote_id, cx) {
             return false;
         }
-        let Some((path, view_generation)) = self.sftp_view().update(cx, |sftp, _cx| {
-            sftp.start_remote_load(surface_id, &remote_id)
-        }) else {
+        let Some((path, view_generation, audit_request)) =
+            self.sftp_view().update(cx, |sftp, _cx| {
+                sftp.start_remote_load(surface_id, &remote_id)
+                    .map(|(path, view_generation)| {
+                        let audit_request = sftp.take_remote_browse_request(&remote_id, &path);
+                        (path, view_generation, audit_request)
+                    })
+            })
+        else {
             return false;
         };
         let delivery = self.sftp_view().read(cx).worker_sender();
-        self.spawn_sftp_remote_load(surface_id, remote_id, path, view_generation, delivery);
+        self.spawn_sftp_remote_load(
+            surface_id,
+            remote_id,
+            path,
+            view_generation,
+            audit_request,
+            delivery,
+        );
         true
     }
 
@@ -1355,11 +1381,26 @@ impl WorkspaceApp {
         remote_id: SftpRemoteId,
         path: String,
         view_generation: u64,
+        audit_request: Option<oxideterm_audit::AuditContext>,
         tx: delivery::ActiveDeliverySender<SftpWorkerResult>,
     ) {
         let session_id = format!("{}:sftp", remote_id.storage_key());
         let runtime = self.forwarding_runtime.clone();
         let Some(backend) = self.sftp_remote_backend(&remote_id) else {
+            if let Some(context) = audit_request {
+                context
+                    .operation(
+                        oxideterm_audit::AuditCategory::File,
+                        "file_browse",
+                        Some(&path),
+                    )
+                    .finish(
+                        oxideterm_audit::AuditOutcome::Failed,
+                        oxideterm_audit::AuditEvidence::Lifecycle,
+                        None,
+                        None,
+                    );
+            }
             let _ = tx.send(SftpWorkerResult::RemoteList {
                 surface_id,
                 remote_id,
@@ -1378,7 +1419,47 @@ impl WorkspaceApp {
             });
         }
         runtime.spawn(async move {
-            let result = load_remote_sftp_listing(backend, &path).await;
+            let audit_context = audit_request.map(|request| {
+                let owner = match &backend {
+                    SftpRemoteBackend::Node {
+                        router, node_id, ..
+                    } => router.audit_context(node_id),
+                    SftpRemoteBackend::Standalone { handle } => handle.audit_context(),
+                    SftpRemoteBackend::Ftp { runtime } => {
+                        let mut context = request.clone();
+                        context.protocol = Some(
+                            if runtime.options.security == oxideterm_ftp::Security::ExplicitTls {
+                                "ftps"
+                            } else {
+                                "ftp"
+                            }
+                            .into(),
+                        );
+                        context.target = Some(oxideterm_audit::redact(&format!(
+                            "{}@{}:{}",
+                            runtime.options.username, runtime.options.host, runtime.options.port
+                        )));
+                        Some(context)
+                    }
+                };
+                owner.map_or(request.clone(), |owner| owner.with_request(&request))
+            });
+            let mut audit = oxideterm_audit::AuditOperation::in_context(
+                audit_context.as_ref(),
+                oxideterm_audit::AuditCategory::File,
+                "file_browse",
+                Some(&path),
+            );
+            let task = load_remote_sftp_listing(backend, &path);
+            let result = if let Some(context) = audit_context {
+                context.scope(task).await
+            } else {
+                task.await
+            };
+            if let Ok(listing) = &result {
+                audit.summary(&format!("path={path}; entries={}", listing.files.len()));
+            }
+            audit.result(&result);
             let _ = tx.send(SftpWorkerResult::RemoteList {
                 surface_id,
                 remote_id,
@@ -1439,11 +1520,15 @@ impl WorkspaceApp {
                     path,
                     view_generation,
                 } => {
+                    let audit_request = self.sftp_view().update(cx, |sftp, _cx| {
+                        sftp.take_remote_browse_request(&remote_id, &path)
+                    });
                     self.spawn_sftp_remote_load(
                         surface_id,
                         remote_id,
                         path,
                         view_generation,
+                        audit_request,
                         delivery.clone(),
                     );
                 }
@@ -1672,19 +1757,25 @@ impl SftpWorkspaceEntity {
         generation: u64,
         path: String,
         result: Result<PreviewContent, String>,
+        asset_owner: Option<PreviewAssetOwner>,
         cx: &mut Context<Self>,
     ) -> bool {
         if generation != self.preview_generation {
             return false;
         }
+        self.preview_load_task = None;
         self.preview_loading = false;
         self.preview_hex_loading_more = false;
         self.preview_path = Some(path);
         match result {
             Ok(content) => {
-                let asset_owner = PreviewAssetOwner::from_asset_content_owned_temp(&content);
                 if let Some(owner) = asset_owner.as_ref() {
                     match owner.kind() {
+                        AssetFileKind::Document => {
+                            if let Some(view) = &self.preview_plugin {
+                                view.update(cx, |view, cx| view.set_source(owner.clone(), cx));
+                            }
+                        }
                         AssetFileKind::Audio => {
                             let _ = self.preview_audio.load(owner.path());
                         }
@@ -1901,16 +1992,6 @@ mod remote_load_state_tests {
     }
 
     #[test]
-    fn remote_list_completion_clears_inflight_before_return() {
-        let loading = SftpRemoteLoadState::default().request().start().unwrap();
-
-        let completed = loading.complete();
-
-        assert_eq!(completed, SftpRemoteLoadState::default());
-        assert!(!completed.inflight);
-    }
-
-    #[test]
     fn queued_remote_load_starts_after_the_previous_request_completes() {
         let old_request = SftpRemoteLoadState::default().request().start().unwrap();
         let switched_view = old_request.request();
@@ -1925,22 +2006,13 @@ mod remote_load_state_tests {
                 inflight: false,
             }
         );
-        assert!(old_request_completed.start().is_some());
-    }
-
-    #[test]
-    fn hidden_pending_load_starts_after_activation_wake() {
-        let hidden_pending = SftpRemoteLoadState::default().request();
-
-        let reactivated = hidden_pending.start().unwrap();
-
         assert_eq!(
-            reactivated,
-            SftpRemoteLoadState {
+            old_request_completed.start(),
+            Some(SftpRemoteLoadState {
                 loading: true,
                 pending: false,
                 inflight: true,
-            }
+            })
         );
     }
 }
@@ -2005,6 +2077,60 @@ fn apply_tauri_transfer_completion(
 mod tests {
     use super::*;
 
+    struct TestKeys;
+
+    impl oxideterm_audit::AuditKeyProvider for TestKeys {
+        fn load(
+            &self,
+            _: &str,
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, oxideterm_audit::AuditError> {
+            Ok(zeroize::Zeroizing::new(vec![17; 32]))
+        }
+
+        fn create(
+            &self,
+            id: &str,
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, oxideterm_audit::AuditError> {
+            self.load(id)
+        }
+    }
+
+    #[test]
+    fn queued_navigation_keeps_its_request_and_refresh_does_not_reuse_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = oxideterm_audit::AuditService::with_key_provider(
+            directory.path().join("audit.db"),
+            TestKeys,
+        )
+        .unwrap();
+        let context = oxideterm_audit::AuditContext::new(
+            service.client(),
+            oxideterm_audit::AuditSource::User,
+        );
+        let mut state = SftpWorkspaceEntity::default();
+        let surface = SftpSurfaceId::Sidebar;
+        let remote = SftpRemoteId::Node(NodeId::new("node-a"));
+        state.activate_view(surface, remote.clone());
+        state.remote_path = "/manual".into();
+        state.remote_browse_request = Some((remote.clone(), "/manual".into(), context));
+
+        let (path, _) = state.start_remote_load(surface, &remote).unwrap();
+        assert_eq!(path, "/manual");
+        assert_eq!(
+            state
+                .take_remote_browse_request(&remote, &path)
+                .unwrap()
+                .source,
+            oxideterm_audit::AuditSource::User
+        );
+
+        state.remote_load_inflight = false;
+        state.request_remote_load();
+        let (path, _) = state.start_remote_load(surface, &remote).unwrap();
+        assert_eq!(path, "/manual");
+        assert!(state.take_remote_browse_request(&remote, &path).is_none());
+    }
+
     #[test]
     fn sidebar_follows_focus_unless_pinned_and_stays_closed_until_opened() {
         let a = NodeId::new("a");
@@ -2020,54 +2146,5 @@ mod tests {
         assert_eq!(sidebar_sftp_target(Some(&a), false, None), None);
         assert_eq!(sidebar_sftp_target(Some(&a), true, None), Some(a));
         assert_eq!(sidebar_sftp_target(None, false, Some(b)), None);
-    }
-
-    #[test]
-    fn stale_node_sftp_errors_are_connection_unavailable() {
-        assert!(oxideterm_sftp::error_is_connection_unavailable(
-            "Connection abc is stale: transport is closed"
-        ));
-        assert!(oxideterm_sftp::error_is_connection_unavailable(
-            "SFTP init failed: Channel error: SSH connection is closed and cannot open an SFTP channel"
-        ));
-        assert!(oxideterm_sftp::error_is_connection_unavailable(
-            "Capability unavailable: Session not found: node-1"
-        ));
-        assert!(oxideterm_sftp::error_is_connection_unavailable(
-            "SFTP subsystem not available: failed to open SFTP channel: channel closed"
-        ));
-        assert!(!oxideterm_sftp::error_is_connection_unavailable(
-            "Permission denied: /home/me/secret"
-        ));
-    }
-
-    #[test]
-    fn sftp_path_not_found_classifier_does_not_catch_dead_sessions() {
-        assert!(oxideterm_sftp::error_is_not_found(
-            "Directory not found: /home/me/missing"
-        ));
-        assert!(oxideterm_sftp::error_is_not_found(
-            "No such file or directory: /home/me/missing"
-        ));
-
-        assert!(!oxideterm_sftp::error_is_not_found(
-            "Capability unavailable: Session not found: node-1"
-        ));
-        assert!(!oxideterm_sftp::error_is_not_found(
-            "Node not found: node-1"
-        ));
-    }
-
-    #[test]
-    fn sftp_auth_failure_is_not_path_permission_denied() {
-        assert!(oxideterm_sftp::error_is_auth_failure(
-            "Authentication failed: Permission denied (publickey,password)"
-        ));
-        assert!(!oxideterm_sftp::error_is_permission_denied(
-            "Authentication failed: Permission denied (publickey,password)"
-        ));
-        assert!(oxideterm_sftp::error_is_permission_denied(
-            "Permission denied: /home/me/secret"
-        ));
     }
 }

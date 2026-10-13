@@ -42,7 +42,7 @@ use oxideterm_remote_desktop::{
     RemoteDesktopMouseButton, RemoteDesktopMouseButtonState, RemoteDesktopProtocol,
     RemoteDesktopProviderManifest, RemoteDesktopRemoteFileEntry, RemoteDesktopRemoteFileKind,
     RemoteDesktopSecret, RemoteDesktopSessionStatus, RemoteDesktopSize, RemoteDesktopWheelDelta,
-    builtin_preview_provider_registry, builtin_provider_registry,
+    builtin_preview_provider_registry,
 };
 use oxideterm_workspace::{Tab, TabKind, TabTitleSource};
 use tokio::sync::Notify;
@@ -405,24 +405,29 @@ impl RemoteDesktopWorkerOwner {
         self.request_tx.clone()
     }
 
-    fn send(&self, request: RemoteDesktopHelperRequest) {
-        if let Some(request_tx) = self.request_tx.as_ref() {
-            let _ = request_tx.send(request);
-        }
+    fn send(&self, request: RemoteDesktopHelperRequest) -> bool {
+        self.request_tx
+            .as_ref()
+            .is_some_and(|request_tx| request_tx.send(request).is_ok())
     }
 
     fn shutdown(&mut self) {
+        let worker_thread = self.close_and_take_thread();
+        Self::retire_worker_thread(worker_thread);
+    }
+
+    fn close_and_take_thread(&mut self) -> Option<thread::JoinHandle<()>> {
         if let Some(request_tx) = self.request_tx.take() {
             // Session shutdown and helper replacement release input state before
             // asking the helper to exit cooperatively.
             let _ = request_tx.send(RemoteDesktopHelperRequest::ReleaseAllInputs);
             let _ = request_tx.send(RemoteDesktopHelperRequest::Close);
         }
-        self.retire_worker_thread();
+        self.worker_thread.take()
     }
 
-    fn retire_worker_thread(&mut self) {
-        let Some(worker_thread) = self.worker_thread.take() else {
+    fn retire_worker_thread(worker_thread: Option<thread::JoinHandle<()>>) {
+        let Some(worker_thread) = worker_thread else {
             return;
         };
         if worker_thread.is_finished() {
@@ -457,12 +462,57 @@ enum RemoteDesktopPublicClipboard {
     },
 }
 
+fn remote_desktop_audit_context(
+    profile: &RemoteDesktopConnectionProfile,
+) -> Option<oxideterm_audit::AuditContext> {
+    oxideterm_audit::AuditContext::current_request()
+        .or_else(oxideterm_audit::AuditContext::current)
+        .map(|mut context| {
+            if context.source == oxideterm_audit::AuditSource::Application {
+                context.source = oxideterm_audit::AuditSource::User;
+            }
+            context.session(
+                profile.protocol.provider_id(),
+                &format!("{}:{}", profile.endpoint.host, profile.endpoint.port),
+            )
+        })
+}
+
+fn desktop_connection_audit(
+    context: Option<&oxideterm_audit::AuditContext>,
+    action: &str,
+    source: Option<oxideterm_audit::AuditSource>,
+) -> Option<oxideterm_audit::AuditOperation> {
+    context.map(|context| {
+        let mut context = context.clone();
+        if let Some(source) = source {
+            context.source = source;
+            context.agent_id = None;
+        }
+        let mut audit = context.operation(oxideterm_audit::AuditCategory::Connection, action, None);
+        let mcp = context.source == oxideterm_audit::AuditSource::Mcp;
+        audit.authorization(
+            if mcp {
+                oxideterm_audit::AuditAuthorization::Approved
+            } else {
+                oxideterm_audit::AuditAuthorization::NotRequired
+            },
+            mcp.then_some("mcp_client_policy"),
+        );
+        audit
+    })
+}
+
 pub(in crate::workspace) struct RemoteDesktopSshTunnelLease {
+    audit_context: Option<oxideterm_audit::AuditContext>,
+    connect_audit: Option<oxideterm_audit::AuditOperation>,
     lease_id: String,
     forwarding_service: forwards::ForwardingRuntimeService,
 }
 
 pub(in crate::workspace) struct PendingRemoteDesktopSshTunnel {
+    audit_context: Option<oxideterm_audit::AuditContext>,
+    connect_audit: Option<oxideterm_audit::AuditOperation>,
     lease_id: Option<String>,
     forwarding_service: forwards::ForwardingRuntimeService,
     worker: Option<tokio::task::JoinHandle<Result<RemoteDesktopEndpoint, String>>>,
@@ -473,8 +523,12 @@ impl PendingRemoteDesktopSshTunnel {
         lease_id: String,
         forwarding_service: forwards::ForwardingRuntimeService,
         worker: tokio::task::JoinHandle<Result<RemoteDesktopEndpoint, String>>,
+        audit_context: Option<oxideterm_audit::AuditContext>,
+        connect_audit: Option<oxideterm_audit::AuditOperation>,
     ) -> Self {
         Self {
+            audit_context,
+            connect_audit,
             lease_id: Some(lease_id),
             forwarding_service,
             worker: Some(worker),
@@ -484,22 +538,54 @@ impl PendingRemoteDesktopSshTunnel {
     pub(in crate::workspace) async fn finish(
         mut self,
     ) -> Result<(RemoteDesktopEndpoint, RemoteDesktopSshTunnelLease), String> {
+        // Retain the handle while awaiting so cancellation of this future
+        // still aborts setup through the pending owner's Drop implementation.
         let worker = self
             .worker
-            .take()
+            .as_mut()
             .expect("pending remote desktop tunnel owns one worker");
-        let endpoint = worker.await.map_err(|error| error.to_string())??;
+        let endpoint = match worker
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                if let Some(audit) = self.connect_audit.take() {
+                    audit.finish(
+                        oxideterm_audit::AuditOutcome::Failed,
+                        oxideterm_audit::AuditEvidence::Protocol,
+                        None,
+                        None,
+                    );
+                }
+                return Err(error);
+            }
+        };
         let lease_id = self
             .lease_id
             .take()
             .expect("pending remote desktop tunnel owns one lease id");
-        let lease = RemoteDesktopSshTunnelLease::new(lease_id, self.forwarding_service.clone());
+        let lease = RemoteDesktopSshTunnelLease {
+            lease_id,
+            forwarding_service: self.forwarding_service.clone(),
+            audit_context: self.audit_context.take(),
+            connect_audit: self.connect_audit.take(),
+        };
         Ok((endpoint, lease))
     }
 }
 
 impl Drop for PendingRemoteDesktopSshTunnel {
     fn drop(&mut self) {
+        if let Some(audit) = self.connect_audit.take() {
+            audit.finish(
+                oxideterm_audit::AuditOutcome::Cancelled,
+                oxideterm_audit::AuditEvidence::Lifecycle,
+                None,
+                None,
+            );
+        }
         if let Some(worker) = self.worker.take() {
             worker.abort();
         }
@@ -512,20 +598,16 @@ impl Drop for PendingRemoteDesktopSshTunnel {
     }
 }
 
-impl RemoteDesktopSshTunnelLease {
-    pub(in crate::workspace) fn new(
-        lease_id: String,
-        forwarding_service: forwards::ForwardingRuntimeService,
-    ) -> Self {
-        Self {
-            lease_id,
-            forwarding_service,
-        }
-    }
-}
-
 impl Drop for RemoteDesktopSshTunnelLease {
     fn drop(&mut self) {
+        if let Some(audit) = self.connect_audit.take() {
+            audit.finish(
+                oxideterm_audit::AuditOutcome::Cancelled,
+                oxideterm_audit::AuditEvidence::Lifecycle,
+                None,
+                None,
+            );
+        }
         // The lease stops only its hidden listener; NodeRouter retains the
         // physical SSH node for every other registered consumer.
         self.forwarding_service
@@ -537,6 +619,7 @@ pub(in crate::workspace) struct RemoteDesktopSessionEntity {
     tab_id: TabId,
     profile: RemoteDesktopConnectionProfile,
     provider: RemoteDesktopProviderManifest,
+    plugin_entity: Option<gpui::WeakEntity<super::plugin_entity::PluginWorkspaceEntity>>,
     password: Option<RemoteDesktopSecret>,
     credential_prompt_task: Option<gpui::Task<()>>,
     credential_prompt_generation: Option<u64>,
@@ -549,6 +632,11 @@ pub(in crate::workspace) struct RemoteDesktopSessionEntity {
     ui_frame_visible: bool,
     public_mcp_frame_observers: usize,
     public_mcp_clipboard: Option<RemoteDesktopPublicClipboard>,
+    clipboard_activation: Option<Subscription>,
+    last_clipboard_files: Option<u64>,
+    audit_context: Option<oxideterm_audit::AuditContext>,
+    connect_audit: Option<oxideterm_audit::AuditOperation>,
+    file_audits: HashMap<String, oxideterm_audit::AuditOperation>,
     ssh_tunnel: Option<RemoteDesktopSshTunnelLease>,
     delivery_tx: mpsc::Sender<RemoteDesktopWorkerDelivery>,
     delivery_rx: mpsc::Receiver<RemoteDesktopWorkerDelivery>,
@@ -598,6 +686,7 @@ impl RemoteDesktopSessionEntity {
         frame_slot: RemoteDesktopFrameDeliverySlot,
         window_handle: AnyWindowHandle,
     ) -> Self {
+        let audit_context = remote_desktop_audit_context(&profile);
         let (delivery_tx, delivery_rx) = mpsc::channel();
         let mut state = RemoteDesktopViewState::new(profile.label.clone(), profile.protocol)
             .with_read_only(profile.read_only);
@@ -609,6 +698,7 @@ impl RemoteDesktopSessionEntity {
             tab_id,
             profile,
             provider,
+            plugin_entity: None,
             // The tab retains one zeroizing credential owner so a reconnect
             // can answer a fresh certificate-gated authentication request.
             password,
@@ -623,6 +713,11 @@ impl RemoteDesktopSessionEntity {
             ui_frame_visible: false,
             public_mcp_frame_observers: 0,
             public_mcp_clipboard: None,
+            clipboard_activation: None,
+            last_clipboard_files: None,
+            audit_context,
+            connect_audit: None,
+            file_audits: HashMap::new(),
             ssh_tunnel: None,
             // Each tab owns its delivery mailbox. A wake for one detached window
             // must never drain another tab's lifecycle events or frame notices.
@@ -701,6 +796,7 @@ impl RemoteDesktopSessionEntity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::workspace) enum RemoteDesktopSessionEvent {
+    PluginRequired { protocol: RemoteDesktopProtocol },
     CredentialsRequired { generation: u64 },
     DeliveryReady { generation: u64 },
     FrameApplyReady { generation: u64 },
@@ -718,6 +814,66 @@ pub(in crate::workspace) struct RemoteDesktopWorkspaceEntity {
 }
 
 impl RemoteDesktopWorkspaceEntity {
+    pub(in crate::workspace) fn stop_plugins(
+        &self,
+        plugin_id: Option<&str>,
+        cx: &mut App,
+    ) -> Vec<thread::JoinHandle<()>> {
+        self.sessions
+            .values()
+            .filter_map(|session| {
+                session.update(cx, |session, cx| {
+                    if session.plugin_entity.is_none()
+                        || plugin_id.is_some_and(|id| id != session.provider.id)
+                    {
+                        return None;
+                    }
+                    // Reap the helper before replacing its executable, including on Windows.
+                    let worker_thread = session
+                        .worker
+                        .as_mut()
+                        .and_then(RemoteDesktopWorkerOwner::close_and_take_thread);
+                    session.shutdown(None, cx);
+                    session.worker_generation =
+                        next_remote_desktop_worker_generation(session.worker_generation);
+                    session.state.apply_event(RemoteDesktopHelperEvent::Status {
+                        status: RemoteDesktopSessionStatus::Disconnected,
+                        message: None,
+                    });
+                    cx.notify();
+                    worker_thread
+                })
+            })
+            .collect()
+    }
+
+    pub(in crate::workspace) fn sync_plugins(
+        &self,
+        providers: &[RemoteDesktopProviderManifest],
+        cx: &mut App,
+    ) {
+        for session in self.sessions.values() {
+            let current = session.read(cx);
+            if current.plugin_entity.is_none()
+                || providers
+                    .iter()
+                    .any(|provider| provider == &current.provider)
+            {
+                continue;
+            }
+            session.update(cx, |session, cx| {
+                session.shutdown(None, cx);
+                session.worker_generation =
+                    next_remote_desktop_worker_generation(session.worker_generation);
+                session.state.apply_event(RemoteDesktopHelperEvent::Status {
+                    status: RemoteDesktopSessionStatus::Disconnected,
+                    message: None,
+                });
+                cx.notify();
+            });
+        }
+    }
+
     pub(in crate::workspace) fn new() -> Self {
         Self {
             sessions: HashMap::new(),
@@ -961,29 +1117,21 @@ mod tests {
     }
 
     #[test]
-    fn manual_reconnect_is_available_after_terminal_states() {
-        assert!(remote_desktop_reconnect_enabled(
-            RemoteDesktopSessionStatus::Disconnected
-        ));
-        assert!(remote_desktop_reconnect_enabled(
-            RemoteDesktopSessionStatus::Failed
-        ));
-        assert!(remote_desktop_reconnect_enabled(
-            RemoteDesktopSessionStatus::Idle
-        ));
-    }
-
-    #[test]
-    fn manual_reconnect_waits_for_in_flight_connection_attempts() {
-        assert!(remote_desktop_reconnect_enabled(
-            RemoteDesktopSessionStatus::Connected
-        ));
-        assert!(!remote_desktop_reconnect_enabled(
-            RemoteDesktopSessionStatus::Connecting
-        ));
-        assert!(!remote_desktop_reconnect_enabled(
-            RemoteDesktopSessionStatus::Reconnecting
-        ));
+    fn manual_reconnect_is_blocked_only_during_connection_attempts() {
+        for (status, expected) in [
+            (RemoteDesktopSessionStatus::Disconnected, true),
+            (RemoteDesktopSessionStatus::Failed, true),
+            (RemoteDesktopSessionStatus::Idle, true),
+            (RemoteDesktopSessionStatus::Connected, true),
+            (RemoteDesktopSessionStatus::Connecting, false),
+            (RemoteDesktopSessionStatus::Reconnecting, false),
+        ] {
+            assert_eq!(
+                remote_desktop_reconnect_enabled(status),
+                expected,
+                "{status:?}"
+            );
+        }
     }
 
     #[test]
@@ -1056,48 +1204,6 @@ mod tests {
             })
         );
         assert_eq!(remainder, remote_desktop_empty_wheel_delta());
-    }
-
-    #[test]
-    fn resize_request_retries_when_initial_frame_size_differs_from_viewport() {
-        let viewport = RemoteDesktopSize {
-            width: 1600,
-            height: 900,
-        };
-
-        assert!(remote_desktop_resize_request_needed(
-            Some(RemoteDesktopSize {
-                width: 1280,
-                height: 720,
-            }),
-            None,
-            Some(viewport),
-            None,
-            viewport,
-            viewport,
-            Some(100),
-        ));
-    }
-
-    #[test]
-    fn resize_request_does_not_repeat_pending_retry() {
-        let viewport = RemoteDesktopSize {
-            width: 1600,
-            height: 900,
-        };
-
-        assert!(!remote_desktop_resize_request_needed(
-            Some(RemoteDesktopSize {
-                width: 1280,
-                height: 720,
-            }),
-            Some(viewport),
-            Some(viewport),
-            None,
-            viewport,
-            viewport,
-            Some(100),
-        ));
     }
 
     #[test]
@@ -1309,112 +1415,108 @@ mod tests {
     }
 
     #[test]
-    fn resize_request_does_not_repeat_ignored_retry() {
+    fn resize_requests_preserve_retry_and_scale_boundaries() {
         let viewport = RemoteDesktopSize {
             width: 1600,
             height: 900,
         };
-
-        assert!(!remote_desktop_resize_request_needed(
-            Some(RemoteDesktopSize {
-                width: 1280,
-                height: 720,
-            }),
-            None,
-            Some(viewport),
-            Some(resize_state(viewport, Some(100))),
-            viewport,
-            viewport,
-            Some(100),
-        ));
-    }
-
-    #[test]
-    fn resize_request_skips_when_frame_already_matches_viewport() {
-        let viewport = RemoteDesktopSize {
-            width: 1600,
-            height: 900,
+        let smaller_frame = RemoteDesktopSize {
+            width: 1280,
+            height: 720,
         };
-
-        assert!(!remote_desktop_resize_request_needed(
-            Some(viewport),
-            None,
-            Some(viewport),
-            None,
-            viewport,
-            viewport,
-            None,
-        ));
-    }
-
-    #[test]
-    fn resize_request_does_not_duplicate_initial_scaled_connect() {
-        let viewport = RemoteDesktopSize {
-            width: 1600,
-            height: 900,
-        };
-        let request_size = RemoteDesktopSize {
+        let scaled_frame = RemoteDesktopSize {
             width: 3200,
             height: 1800,
         };
-
-        assert!(!remote_desktop_resize_request_needed(
-            Some(request_size),
-            None,
-            Some(viewport),
-            None,
-            viewport,
-            request_size,
-            Some(200),
-        ));
-    }
-
-    #[test]
-    fn resize_request_sends_scale_only_change_once() {
-        let viewport = RemoteDesktopSize {
-            width: 1600,
-            height: 900,
-        };
-
-        assert!(remote_desktop_resize_request_needed(
-            Some(viewport),
-            None,
-            Some(viewport),
-            Some(resize_state(viewport, Some(100))),
-            viewport,
-            viewport,
-            Some(125),
-        ));
-        assert!(!remote_desktop_resize_request_needed(
-            Some(viewport),
-            None,
-            Some(viewport),
-            Some(resize_state(viewport, Some(125))),
-            viewport,
-            viewport,
-            Some(125),
-        ));
-    }
-
-    #[test]
-    fn resize_request_can_replace_pending_scale_change() {
-        let viewport = RemoteDesktopSize {
-            width: 1600,
-            height: 900,
-        };
-
-        assert!(remote_desktop_resize_request_needed(
-            Some(RemoteDesktopSize {
-                width: 1280,
-                height: 720,
-            }),
-            Some(viewport),
-            Some(viewport),
-            Some(resize_state(viewport, Some(100))),
-            viewport,
-            viewport,
-            Some(125),
-        ));
+        let cases = [
+            (
+                "initial mismatch",
+                smaller_frame,
+                None,
+                None,
+                viewport,
+                Some(100),
+                true,
+            ),
+            (
+                "pending retry",
+                smaller_frame,
+                Some(viewport),
+                None,
+                viewport,
+                Some(100),
+                false,
+            ),
+            (
+                "ignored retry",
+                smaller_frame,
+                None,
+                Some(resize_state(viewport, Some(100))),
+                viewport,
+                Some(100),
+                false,
+            ),
+            (
+                "matching frame",
+                viewport,
+                None,
+                None,
+                viewport,
+                None,
+                false,
+            ),
+            (
+                "scaled initial connect",
+                scaled_frame,
+                None,
+                None,
+                scaled_frame,
+                Some(200),
+                false,
+            ),
+            (
+                "changed scale",
+                viewport,
+                None,
+                Some(resize_state(viewport, Some(100))),
+                viewport,
+                Some(125),
+                true,
+            ),
+            (
+                "already sent scale",
+                viewport,
+                None,
+                Some(resize_state(viewport, Some(125))),
+                viewport,
+                Some(125),
+                false,
+            ),
+            (
+                "replace pending scale",
+                smaller_frame,
+                Some(viewport),
+                Some(resize_state(viewport, Some(100))),
+                viewport,
+                Some(125),
+                true,
+            ),
+        ];
+        for (scenario, frame, pending, last_sent, request, scale, expected) in cases {
+            assert_eq!(
+                remote_desktop_resize_request_needed(
+                    Some(frame),
+                    pending,
+                    Some(viewport),
+                    last_sent,
+                    viewport,
+                    request,
+                    scale,
+                ),
+                expected,
+                "{scenario}",
+            );
+        }
     }
 
     #[test]

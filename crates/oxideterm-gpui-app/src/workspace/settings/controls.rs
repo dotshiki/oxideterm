@@ -109,7 +109,32 @@ impl WorkspaceApp {
         };
 
         let popup = match (active_tab, open_select) {
-            (SettingsTab::General, SettingsSelect::Language) => {
+            (_, SettingsSelect::PluginMarketplaceSort) => {
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for sort in [
+                    oxideterm_settings::PluginMarketplaceSort::Name,
+                    oxideterm_settings::PluginMarketplaceSort::RecentUpdates,
+                    oxideterm_settings::PluginMarketplaceSort::NewestListings,
+                ] {
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            self.i18n
+                                .t(plugin_manager::plugin_marketplace_sort_label(sort)),
+                            sort == settings.plugin_marketplace_sort,
+                        ),
+                        false,
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.close_settings_select();
+                            this.set_plugin_marketplace_sort(sort, cx);
+                            cx.stop_propagation();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
+            (_, SettingsSelect::Language) => {
                 let mut popup = select_overlay_popup(&self.tokens, width);
                 for language in language_options() {
                     let label = self.language_label(language);
@@ -242,7 +267,16 @@ impl WorkspaceApp {
                 }
                 Some(popup)
             }
-            (SettingsTab::Appearance, SettingsSelect::AppearanceTheme) => {
+            (
+                _,
+                select @ (SettingsSelect::AppearanceTheme
+                | SettingsSelect::AppearanceTerminalTheme
+                | SettingsSelect::AppearanceThemeLight
+                | SettingsSelect::AppearanceThemeDark
+                | SettingsSelect::AppearanceTerminalThemeLight
+                | SettingsSelect::AppearanceTerminalThemeDark),
+            ) => {
+                let target = select.theme_target().expect("theme selector");
                 let mut popup = select_panel_overlay_popup_with_max_height(
                     &self.tokens,
                     width,
@@ -263,7 +297,7 @@ impl WorkspaceApp {
                             let row = oxideterm_gpui_ui::select::select_option_highlighted(
                                 &self.tokens,
                                 "",
-                                theme_id == settings.terminal.theme,
+                                Some(theme_id.as_str()) == select.selected_theme_id(settings),
                                 self.settings_theme_preview.as_deref() == Some(theme_id.as_str()),
                             )
                             .h_auto()
@@ -279,10 +313,26 @@ impl WorkspaceApp {
                                     .gap(px(4.0))
                                     .child(div().truncate().child(label))
                                     .child(
-                                        oxideterm_gpui_settings_view::settings_theme_palette_swatch(
-                                            &self.tokens,
-                                            palette,
-                                        ),
+                                        match target {
+                                            ThemeTarget::Application => {
+                                                let ui = oxideterm_settings_model::theme_ui_colors(settings, &theme_id);
+                                                div()
+                                                    .min_w_0()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(self.tokens.spacing.one))
+                                                    .child(
+                                                        div()
+                                                            .whitespace_normal()
+                                                            .text_size(px(self.tokens.metrics.ui_text_xs))
+                                                            .text_color(rgb(self.tokens.ui.text_muted))
+                                                            .child(oxideterm_gpui_settings_view::application_theme_description(&theme_id, ui, &self.i18n)),
+                                                    )
+                                                    .child(oxideterm_gpui_settings_view::settings_application_palette_swatch(&self.tokens, ui))
+                                                    .into_any_element()
+                                            }
+                                            ThemeTarget::Terminal => oxideterm_gpui_settings_view::settings_theme_palette_swatch(&self.tokens, palette).into_any_element(),
+                                        },
                                     ),
                             )
                             .on_mouse_move(cx.listener(
@@ -300,7 +350,13 @@ impl WorkspaceApp {
                                 cx.listener(move |this, _, _, cx| {
                                     this.close_settings_select();
                                     this.edit_settings(
-                                        |settings| settings.terminal.theme = theme_id.clone(),
+                                        |settings| {
+                                            target.apply_for_scheme(
+                                                settings,
+                                                select.theme_system_dark(),
+                                                theme_id.clone(),
+                                            )
+                                        },
                                         cx,
                                     );
                                     cx.stop_propagation();
@@ -458,10 +514,7 @@ impl WorkspaceApp {
                         false,
                         cx.listener(move |this, _event, _window, cx| {
                             this.close_settings_select();
-                            this.edit_settings(
-                                |settings| settings.terminal.background_fit = fit,
-                                cx,
-                            );
+                            this.edit_background_style(|style| style.fit = fit, cx);
                             cx.stop_propagation();
                         }),
                     ));
@@ -495,6 +548,8 @@ impl WorkspaceApp {
             (SettingsTab::Ide, SettingsSelect::IdeCjkFontFamily) => {
                 let mut popup = select_overlay_popup(&self.tokens, width);
                 let current_family = settings.ide.cjk_font_family.as_deref().map(str::trim);
+                let custom = self.settings_workspace.read(cx).ide_cjk_font_custom
+                    || current_family.is_some_and(cjk_font_is_custom);
                 for family in std::iter::once(None)
                     .chain(terminal_cjk_font_options().iter().copied().map(Some))
                 {
@@ -506,12 +561,15 @@ impl WorkspaceApp {
                                 .unwrap_or_else(|| {
                                     self.i18n.t("settings_view.ide.follow_terminal")
                                 }),
-                            family == current_family,
+                            !custom && family == current_family,
                         ),
                         false,
                         false,
                         cx.listener(move |this, _event, _window, cx| {
                             this.close_settings_select();
+                            this.settings_workspace.update(cx, |state, _| {
+                                state.ide_cjk_font_custom = false;
+                            });
                             this.edit_settings(
                                 |settings| {
                                     settings.ide.cjk_font_family = family.map(str::to_string)
@@ -522,6 +580,30 @@ impl WorkspaceApp {
                         }),
                     ));
                 }
+                popup = popup.child(select_option_action(
+                    select_option(
+                        &self.tokens,
+                        self.i18n.t("settings_view.terminal.cjk_font_custom"),
+                        custom,
+                    ),
+                    false,
+                    false,
+                    cx.listener(|this, _, window, cx| {
+                        this.settings_workspace.update(cx, |state, _| {
+                            state.ide_cjk_font_custom = true;
+                        });
+                        let value = this
+                            .settings_store
+                            .settings()
+                            .ide
+                            .cjk_font_family
+                            .clone()
+                            .unwrap_or_default();
+                        this.focus_settings_input(SettingsInput::IdeCjkFontFamily, value, cx);
+                        window.focus(&this.focus_handle, cx);
+                        cx.stop_propagation();
+                    }),
+                ));
                 Some(popup)
             }
             (SettingsTab::Terminal, SettingsSelect::TerminalFontFamily) => {
@@ -550,17 +632,22 @@ impl WorkspaceApp {
             (SettingsTab::Terminal, SettingsSelect::TerminalCjkFontFamily) => {
                 let mut popup = select_overlay_popup(&self.tokens, width);
                 let current_family = settings.terminal.cjk_font_family.trim();
+                let custom = self.settings_workspace.read(cx).terminal_cjk_font_custom
+                    || cjk_font_is_custom(current_family);
                 for &family in terminal_cjk_font_options() {
                     popup = popup.child(select_option_action(
                         select_option(
                             &self.tokens,
                             terminal_cjk_font_label(family, &self.i18n),
-                            family == current_family,
+                            !custom && family == current_family,
                         ),
                         false,
                         false,
                         cx.listener(move |this, _event, _window, cx| {
                             this.close_settings_select();
+                            this.settings_workspace.update(cx, |state, _| {
+                                state.terminal_cjk_font_custom = false;
+                            });
                             this.edit_settings(
                                 |settings| settings.terminal.cjk_font_family = family.to_string(),
                                 cx,
@@ -569,6 +656,29 @@ impl WorkspaceApp {
                         }),
                     ));
                 }
+                popup = popup.child(select_option_action(
+                    select_option(
+                        &self.tokens,
+                        self.i18n.t("settings_view.terminal.cjk_font_custom"),
+                        custom,
+                    ),
+                    false,
+                    false,
+                    cx.listener(|this, _, window, cx| {
+                        this.settings_workspace.update(cx, |state, _| {
+                            state.terminal_cjk_font_custom = true;
+                        });
+                        let value = this
+                            .settings_store
+                            .settings()
+                            .terminal
+                            .cjk_font_family
+                            .clone();
+                        this.focus_settings_input(SettingsInput::TerminalCjkFontFamily, value, cx);
+                        window.focus(&this.focus_handle, cx);
+                        cx.stop_propagation();
+                    }),
+                ));
                 Some(popup)
             }
             (SettingsTab::Terminal, SettingsSelect::TerminalEncoding) => {
@@ -2074,9 +2184,8 @@ impl WorkspaceApp {
             return;
         }
         self.settings_theme_preview = None;
-        if select_id == SettingsSelect::AppearanceTheme {
-            let selected = &self.settings_store.settings().terminal.theme;
-            self.settings_theme_preview = Some(selected.clone());
+        if let Some(selected) = select_id.selected_theme_id(self.settings_store.settings()) {
+            self.settings_theme_preview = Some(selected.to_string());
             self.settings_theme_scroll = ScrollHandle::new();
             if let Some(row) = appearance_theme_entries(self.settings_store.settings())
                 .iter()
@@ -2095,6 +2204,15 @@ impl WorkspaceApp {
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) -> bool {
+        let Some(target) = self
+            .open_settings_select
+            .and_then(SettingsSelect::theme_target)
+        else {
+            return false;
+        };
+        let system_dark = self
+            .open_settings_select
+            .and_then(SettingsSelect::theme_system_dark);
         if event.keystroke.modifiers.platform
             || event.keystroke.modifiers.control
             || event.keystroke.modifiers.alt
@@ -2110,7 +2228,10 @@ impl WorkspaceApp {
             "enter" | "space" | " " => {
                 if let Some(id) = self.settings_theme_preview.clone() {
                     self.close_settings_select();
-                    self.edit_settings(|settings| settings.terminal.theme = id, cx);
+                    self.edit_settings(
+                        |settings| target.apply_for_scheme(settings, system_dark, id),
+                        cx,
+                    );
                 }
                 true
             }

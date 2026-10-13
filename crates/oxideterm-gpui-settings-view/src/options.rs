@@ -143,6 +143,10 @@ pub fn terminal_cjk_font_options() -> &'static [&'static str] {
     ]
 }
 
+pub fn cjk_font_is_custom(family: &str) -> bool {
+    !terminal_cjk_font_options().contains(&family.trim())
+}
+
 pub fn terminal_encoding_options() -> &'static [TerminalEncoding] {
     &[
         TerminalEncoding::Utf8,
@@ -572,6 +576,25 @@ pub fn settings_slider_anchor_id(slider: SettingsSlider) -> SelectAnchorId {
         SettingsSlider::AppearanceBackgroundBlur => {
             SelectAnchorId::SettingsAppearanceBackgroundBlurSlider
         }
+        SettingsSlider::BackgroundEffectSpeed => SelectAnchorId::SettingsBackgroundEffectSpeed,
+        SettingsSlider::BackgroundReadability => SelectAnchorId::SettingsBackgroundReadability,
+        SettingsSlider::BackgroundEffectStrength => {
+            SelectAnchorId::SettingsBackgroundEffectStrength
+        }
+        SettingsSlider::BackgroundEffectSheen => SelectAnchorId::SettingsBackgroundEffectSheen,
+        SettingsSlider::BackgroundEffectSize => SelectAnchorId::SettingsBackgroundEffectSize,
+        SettingsSlider::BackgroundEffectBrightness => {
+            SelectAnchorId::SettingsBackgroundEffectBrightness
+        }
+        SettingsSlider::BackgroundEffectRoughness => {
+            SelectAnchorId::SettingsBackgroundEffectRoughness
+        }
+        SettingsSlider::BackgroundEffectDirection => {
+            SelectAnchorId::SettingsBackgroundEffectDirection
+        }
+        SettingsSlider::BackgroundParticleCount => SelectAnchorId::SettingsBackgroundParticleCount,
+        SettingsSlider::BackgroundCameraAmount => SelectAnchorId::SettingsBackgroundCameraAmount,
+        SettingsSlider::BackgroundCameraSpeed => SelectAnchorId::SettingsBackgroundCameraSpeed,
     }
 }
 

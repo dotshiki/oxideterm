@@ -5,6 +5,7 @@ mod ai_lazy;
 mod ai_runtime_context;
 mod ai_state;
 mod app_lock;
+mod audit;
 mod breadcrumb_scroll;
 mod browser_behavior;
 mod cloud_sync;
@@ -18,6 +19,7 @@ mod graphics;
 mod graphics_vnc;
 mod history_quit;
 pub(crate) use history_quit::request_app_quit;
+mod acp_plugins;
 mod ide;
 mod ime;
 mod knowledge;
@@ -33,6 +35,7 @@ mod path_completion;
 mod plugin_entity;
 mod plugin_lifecycle;
 mod plugin_manager;
+mod plugin_preview;
 mod plugin_ui;
 mod public_mcp;
 mod quick_commands;
@@ -106,10 +109,10 @@ use anyhow::Result;
 use gpui::{
     AnchoredPositionMode, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds,
     ClipboardEntry, ClipboardItem, Context, Corner, CursorStyle, Entity, FocusHandle, Focusable,
-    FollowMode, Image, ImageFormat, IntoColor, IntoElement, KeyDownEvent, KeyUpEvent,
-    ListAlignment, ListState, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render, RenderImage,
-    Rgba, ScrollHandle, ScrollWheelEvent, SharedString, Styled, StyledImage, Subscription, Task,
+    FollowMode, Image, ImageFormat, IntoElement, KeyDownEvent, KeyUpEvent, ListAlignment,
+    ListState, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render, RenderImage, Rgba,
+    ScrollHandle, ScrollWheelEvent, SharedString, Styled, StyledImage, Subscription, Task,
     TextLayout, Timer, UniformListScrollHandle, Window, anchored, canvas, deferred, div,
     prelude::*, px, relative, rgb, rgba, svg,
 };
@@ -202,10 +205,8 @@ use oxideterm_i18n::{I18n, Locale};
 use oxideterm_ide_fs::NodeAgentIdeFileSystem;
 use oxideterm_notification_center::{
     ActivityView as WorkspaceActivityView, EventCategory as WorkspaceEventCategory,
-    EventCategoryFilter as WorkspaceEventCategoryFilter, EventLogEntry as WorkspaceEventLogEntry,
-    EventSeverity as WorkspaceEventSeverity, EventSeverityFilter as WorkspaceEventSeverityFilter,
-    NotificationCenterState, NotificationEntry as WorkspaceNotificationEntry,
-    NotificationKind as WorkspaceNotificationKind,
+    EventSeverity as WorkspaceEventSeverity, NotificationCenterState,
+    NotificationEntry as WorkspaceNotificationEntry, NotificationKind as WorkspaceNotificationKind,
     NotificationKindFilter as WorkspaceNotificationKindFilter,
     NotificationScope as WorkspaceNotificationScope,
     NotificationSeverity as WorkspaceNotificationSeverity,
@@ -352,8 +353,8 @@ pub(super) use selectable_text::{
 };
 pub(super) use virtual_list::{
     TauriVirtualListSpec, TauriVirtualScrollAlign, scroll_tauri_virtual_list_to_index,
-    tauri_virtual_list, tauri_virtual_list_is_near_bottom, tauri_virtual_list_state,
-    tauri_virtual_uniform_list, uniform_list_edge_autoscroll,
+    tauri_virtual_list, tauri_virtual_list_state, tauri_virtual_uniform_list,
+    uniform_list_edge_autoscroll,
 };
 use virtual_list::{
     VirtualListSignatureCache, sync_tauri_variable_list_state_by_signatures,
@@ -824,6 +825,7 @@ pub(crate) struct WorkspaceApp {
     context_sidebar_motion: oxideterm_gpui_ui::motion::SidebarMotion,
     ai_entity: Entity<ai_state::AiWorkspaceEntity>,
     acp_entity: Entity<acp_workspace::AcpWorkspaceEntity>,
+    mosh_plugin_sessions: Arc<oxideterm_mosh::MoshPluginSessions>,
     skill_registry: std::sync::Arc<parking_lot::RwLock<oxideterm_skills::SkillRegistry>>,
     skill_workspace_root: Option<std::path::PathBuf>,
     loaded_conversation_skills: HashMap<String, HashMap<String, String>>,
@@ -907,7 +909,6 @@ pub(crate) struct WorkspaceApp {
     notification_center: NotificationCenterState,
     notification_sidebar_list_state: ListState,
     notification_sidebar_list_cache: RefCell<VirtualListSignatureCache>,
-    event_log_sidebar_scroll_handle: UniformListScrollHandle,
     ssh_nodes: HashMap<NodeId, WorkspaceSshNode>,
     saved_ssh_nodes: HashMap<String, NodeId>,
     expanded_ssh_nodes: HashSet<NodeId>,
@@ -952,6 +953,9 @@ pub(crate) struct WorkspaceApp {
     _cloud_sync_subscription: Subscription,
     i18n: I18n,
     tokens: ThemeTokens,
+    system_dark: bool,
+    appearance_edit_dark: Option<bool>,
+    active_background: oxideterm_settings::BackgroundStyle,
     detected_graphics: DetectedGraphics,
     render_profile_override: Option<RenderProfile>,
     render_policy: EffectiveRenderPolicy,
@@ -975,6 +979,8 @@ pub(crate) struct WorkspaceApp {
     _terminal_subscription: Subscription,
     overlay: Entity<WorkspaceOverlayEntity>,
     _overlay_observation: Subscription,
+    // Producers release before the writer, so their final cancellation records can drain.
+    audit: audit::AuditState,
 }
 
 impl Drop for WorkspaceApp {

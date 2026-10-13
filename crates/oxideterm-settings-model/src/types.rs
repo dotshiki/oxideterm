@@ -59,7 +59,6 @@ pub enum TerminalSettingsPage {
 pub enum AiSettingsPage {
     General,
     Providers,
-    Agents,
     Context,
     Tools,
 }
@@ -82,11 +81,17 @@ pub enum SettingsKeybindingScopeFilter {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSelect {
+    PluginMarketplaceSort,
     Language,
     UpdateChannel,
     UpdateProxyMode,
     UpdateProxyProtocol,
     AppearanceTheme,
+    AppearanceTerminalTheme,
+    AppearanceThemeLight,
+    AppearanceThemeDark,
+    AppearanceTerminalThemeLight,
+    AppearanceTerminalThemeDark,
     AppearanceDensity,
     AppearanceAnimation,
     AppearanceRenderProfile,
@@ -142,10 +147,45 @@ pub enum SettingsSelect {
     ConnectionImportDuplicateStrategy,
 }
 
+impl SettingsSelect {
+    pub fn theme_target(self) -> Option<crate::ThemeTarget> {
+        match self {
+            Self::AppearanceTheme | Self::AppearanceThemeLight | Self::AppearanceThemeDark => {
+                Some(crate::ThemeTarget::Application)
+            }
+            Self::AppearanceTerminalTheme
+            | Self::AppearanceTerminalThemeLight
+            | Self::AppearanceTerminalThemeDark => Some(crate::ThemeTarget::Terminal),
+            _ => None,
+        }
+    }
+
+    pub fn theme_system_dark(self) -> Option<bool> {
+        match self {
+            Self::AppearanceThemeLight | Self::AppearanceTerminalThemeLight => Some(false),
+            Self::AppearanceThemeDark | Self::AppearanceTerminalThemeDark => Some(true),
+            _ => None,
+        }
+    }
+
+    pub fn selected_theme_id(
+        self,
+        settings: &oxideterm_settings::PersistedSettings,
+    ) -> Option<&str> {
+        let target = self.theme_target()?;
+        Some(match self.theme_system_dark() {
+            Some(true) => &target.system_themes(settings).dark,
+            Some(false) => &target.system_themes(settings).light,
+            None => target.selected_id(settings),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum SettingsInput {
     SettingsSearch,
     TerminalCustomFontFamily,
+    TerminalCjkFontFamily,
     TerminalFontSize,
     TerminalFontWeight,
     TerminalScrollback,
@@ -154,15 +194,25 @@ pub enum SettingsInput {
     TerminalPaddingVertical,
     IdeFontWeight,
     IdeCustomFontFamily,
+    IdeCjkFontFamily,
     IdeFontSize,
     IdeLineHeight,
     AppearanceUiFont,
+    BackgroundMaxWidth,
+    BackgroundMaxHeight,
+    BackgroundMaxFps,
+    BackgroundEffectMaxFps,
+    BackgroundEffectColor(usize),
     LocalDefaultCwd,
     LocalGitBashPath,
     LocalOhMyPoshTheme,
     LocalPrivilegeLabel,
     LocalPrivilegeUsernameHint,
     LocalPrivilegeSecret,
+    TotpName,
+    TotpSecret,
+    TotpPattern,
+    TotpPeriod,
     LocalPrivilegePromptPatterns,
     ConnectionDefaultUsername,
     ConnectionDefaultPort,
@@ -268,6 +318,10 @@ pub enum SettingsInput {
     NativePluginInstallChecksum,
     NativePluginRegistryUrl,
     NativePluginMarketplaceSearch,
+    NativePluginInstalledPageSize,
+    NativePluginMarketplacePageSize,
+    NativePluginInstalledPageJump,
+    NativePluginMarketplacePageJump,
     ManagedKeyFilePath,
     ManagedKeyFileName,
     ManagedKeyFilePassphrase,
@@ -288,6 +342,17 @@ pub enum SettingsSlider {
     AppearanceWindowOpacity,
     AppearanceBackgroundOpacity,
     AppearanceBackgroundBlur,
+    BackgroundReadability,
+    BackgroundEffectStrength,
+    BackgroundEffectSheen,
+    BackgroundEffectSpeed,
+    BackgroundEffectSize,
+    BackgroundEffectBrightness,
+    BackgroundEffectRoughness,
+    BackgroundEffectDirection,
+    BackgroundParticleCount,
+    BackgroundCameraAmount,
+    BackgroundCameraSpeed,
 }
 
 impl TerminalSettingsPage {
@@ -320,20 +385,13 @@ impl TerminalSettingsPage {
 
 impl AiSettingsPage {
     pub fn all() -> &'static [Self] {
-        &[
-            Self::General,
-            Self::Providers,
-            Self::Agents,
-            Self::Context,
-            Self::Tools,
-        ]
+        &[Self::General, Self::Providers, Self::Context, Self::Tools]
     }
 
     pub fn label_key(self) -> &'static str {
         match self {
             Self::General => "settings_view.ai.page_general",
             Self::Providers => "settings_view.ai.page_providers",
-            Self::Agents => "settings_view.ai.page_agents",
             Self::Context => "settings_view.ai.page_context",
             Self::Tools => "settings_view.ai.page_tools",
         }
@@ -459,7 +517,7 @@ impl SettingsTab {
             Self::Terminal => "settings_view.terminal.title",
             Self::Appearance => "settings_view.appearance.title",
             Self::Connections => "settings_view.connections.keys_and_connections_title",
-            Self::Privilege => "settings_view.privilege_credentials.title",
+            Self::Privilege => "settings_view.credentials.title",
             Self::Network => "settings_view.network.title",
             Self::Sftp => "settings_view.sftp.title",
             Self::Ide => "settings_view.ide.title",
@@ -477,7 +535,7 @@ impl SettingsTab {
             Self::Terminal => "settings_view.terminal.description",
             Self::Appearance => "settings_view.appearance.description",
             Self::Connections => "settings_view.connections.keys_and_connections_description",
-            Self::Privilege => "settings_view.privilege_credentials.description",
+            Self::Privilege => "settings_view.credentials.description",
             Self::Network => "settings_view.network.description",
             Self::Sftp => "settings_view.sftp.description",
             Self::Ide => "settings_view.ide.description",
@@ -506,6 +564,16 @@ impl SettingsTab {
 }
 
 impl SettingsInput {
+    pub fn is_background(self) -> bool {
+        matches!(
+            self,
+            Self::BackgroundMaxWidth
+                | Self::BackgroundMaxHeight
+                | Self::BackgroundMaxFps
+                | Self::BackgroundEffectMaxFps
+                | Self::BackgroundEffectColor(_)
+        )
+    }
     pub fn accepts_newline(self) -> bool {
         // Keep multiline behavior beside the input identity so IME handling and
         // render controls cannot drift when new settings fields are added.
@@ -544,6 +612,7 @@ impl SettingsInput {
         match self {
             Self::SettingsSearch => SETTINGS_SEARCH_INPUT_ANCHOR_KEY,
             Self::TerminalCustomFontFamily => 19,
+            Self::TerminalCjkFontFamily => 24,
             Self::TerminalFontSize => 1,
             Self::TerminalFontWeight => 21,
             Self::TerminalScrollback => 33_000,
@@ -552,15 +621,25 @@ impl SettingsInput {
             Self::TerminalPaddingVertical => 23,
             Self::IdeFontWeight => 34_010,
             Self::IdeCustomFontFamily => 34_011,
+            Self::IdeCjkFontFamily => 34_012,
             Self::IdeFontSize => 3,
             Self::IdeLineHeight => 4,
             Self::AppearanceUiFont => 5,
+            Self::BackgroundMaxWidth => 33_001,
+            Self::BackgroundMaxHeight => 33_002,
+            Self::BackgroundMaxFps => 33_003,
+            Self::BackgroundEffectMaxFps => 33_006,
+            Self::BackgroundEffectColor(index) => 33_004 + index as u64,
             Self::LocalDefaultCwd => 6,
             Self::LocalGitBashPath => 7,
             Self::LocalOhMyPoshTheme => 8,
             Self::LocalPrivilegeLabel => 31_000,
             Self::LocalPrivilegeUsernameHint => 31_001,
             Self::LocalPrivilegeSecret => 31_002,
+            Self::TotpName => 31_010,
+            Self::TotpSecret => 31_011,
+            Self::TotpPattern => 31_012,
+            Self::TotpPeriod => 31_013,
             Self::LocalPrivilegePromptPatterns => 31_003,
             Self::ConnectionDefaultUsername => 9,
             Self::ConnectionDefaultPort => 10,
@@ -668,6 +747,10 @@ impl SettingsInput {
             Self::NativePluginInstallChecksum => PLUGIN_MANAGER_INPUT_ANCHOR_BASE + 1,
             Self::NativePluginRegistryUrl => PLUGIN_MANAGER_INPUT_ANCHOR_BASE + 2,
             Self::NativePluginMarketplaceSearch => PLUGIN_MANAGER_INPUT_ANCHOR_BASE + 3,
+            Self::NativePluginInstalledPageSize => PLUGIN_MANAGER_INPUT_ANCHOR_BASE + 4,
+            Self::NativePluginMarketplacePageSize => PLUGIN_MANAGER_INPUT_ANCHOR_BASE + 5,
+            Self::NativePluginInstalledPageJump => PLUGIN_MANAGER_INPUT_ANCHOR_BASE + 6,
+            Self::NativePluginMarketplacePageJump => PLUGIN_MANAGER_INPUT_ANCHOR_BASE + 7,
             Self::ManagedKeyFilePath => 30_000,
             Self::ManagedKeyFileName => 30_001,
             Self::ManagedKeyFilePassphrase => 30_002,
@@ -699,6 +782,7 @@ impl SettingsInput {
                 | Self::AppLockNewPassword
                 | Self::AppLockConfirmPassword
                 | Self::LocalPrivilegeSecret
+                | Self::TotpSecret
                 | Self::ManagedKeyFilePassphrase
                 | Self::ManagedKeyPastePrivateKey
                 | Self::ManagedKeyPastePassphrase

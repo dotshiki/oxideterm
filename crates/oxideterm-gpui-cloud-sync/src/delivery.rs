@@ -32,7 +32,7 @@ use oxideterm_cloud_sync::{
 use oxideterm_connections::{
     ConnectionStore,
     oxide_file::{
-        ImportConflictStrategy, OxideExportOptions, OxideFile, OxideForwardRecord,
+        ImportConflictStrategy, OxideExportOptions, OxideForwardRecord,
         preview_oxide_import_with_progress,
     },
 };
@@ -51,6 +51,11 @@ use crate::{
 
 #[derive(Debug)]
 pub enum CloudSyncDelivery {
+    CausalPrepared {
+        action: CloudSyncActionResult<oxideterm_cloud_sync::operation::PreparedSync>,
+        automatic: bool,
+    },
+    CausalFinished(CloudSyncActionResult<oxideterm_cloud_sync::operation::SyncOutcome>),
     Progress(CloudSyncProgress),
     RollbackBackupCreated(CloudSyncRollbackBackup),
     CheckFinished(CloudSyncActionResult<Option<oxideterm_cloud_sync::backend::RemoteMetadata>>),
@@ -68,6 +73,47 @@ pub enum CloudSyncDelivery {
     MicrosoftOauthFinished(CloudSyncActionResult<()>),
     GoogleOauthUrl(CloudSyncOauthBrowserPrompt),
     GoogleOauthFinished(CloudSyncActionResult<()>),
+}
+
+pub async fn deliver_causal_sync(
+    tx: impl CloudSyncDeliverySink,
+    service: CloudSyncOperationService,
+    mut connections: ConnectionStore,
+    forwards: ForwardingRegistry,
+    mut settings_store: SettingsStore,
+    settings: CloudSyncSettings,
+    hints: BTreeMap<String, bool>,
+    scope: oxideterm_cloud_sync::SyncScope,
+    filter: oxideterm_cloud_sync::operation::StructuredUploadItemFilter,
+    automatic: bool,
+    direction: oxideterm_cloud_sync::operation::SyncDirection,
+) {
+    let mut provider = CloudSyncKeychainSecretProvider::new(hints);
+    let result = service
+        .prepare_sync_with_direction(
+            &mut connections,
+            &forwards,
+            &mut settings_store,
+            &settings,
+            &mut provider,
+            scope,
+            filter,
+            // The GUI offers directional previews, so it needs the complete remote view.
+            oxideterm_cloud_sync::operation::SyncDirection::Download,
+        )
+        .await
+        .map(|mut prepared| {
+            prepared.set_direction(direction);
+            prepared
+        })
+        .map_err(|error| error.to_string());
+    let _ = tx.send(CloudSyncDelivery::CausalPrepared {
+        action: CloudSyncActionResult {
+            result,
+            secret_hints: provider.hints().clone(),
+        },
+        automatic,
+    });
 }
 
 /// Sends Cloud Sync worker results without prescribing how the UI is woken.
@@ -112,11 +158,50 @@ pub struct CloudSyncUploadActionResult {
     pub secret_hints: BTreeMap<String, bool>,
 }
 
-#[derive(Debug)]
 pub struct CloudSyncApplyUiOutcome {
     pub connection_store: ConnectionStore,
     pub settings_store: SettingsStore,
     pub outcome: CloudSyncApplyOutcome,
+    pub legacy_import_audit: Option<PendingLegacyImportAudit>,
+}
+
+pub struct PendingLegacyImportAudit(Option<oxideterm_audit::AuditOperation>);
+
+impl PendingLegacyImportAudit {
+    pub fn finish(mut self, summary: &str, outcome: oxideterm_audit::AuditOutcome) {
+        if let Some(mut audit) = self.0.take() {
+            audit.summary(summary);
+            audit.finish(
+                outcome,
+                oxideterm_audit::AuditEvidence::Protocol,
+                None,
+                None,
+            );
+        }
+    }
+}
+
+impl Drop for PendingLegacyImportAudit {
+    fn drop(&mut self) {
+        if let Some(audit) = self.0.take() {
+            audit.finish(
+                oxideterm_audit::AuditOutcome::Partial,
+                oxideterm_audit::AuditEvidence::Lifecycle,
+                None,
+                None,
+            );
+        }
+    }
+}
+
+impl std::fmt::Debug for CloudSyncApplyUiOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CloudSyncApplyUiOutcome")
+            .field("outcome", &self.outcome)
+            .field("legacy_import_audit", &self.legacy_import_audit.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -379,6 +464,16 @@ pub async fn deliver_cloud_sync_upload(
     options: UploadOptions,
     automatic: bool,
 ) {
+    let mut audit = oxideterm_audit::AuditOperation::begin(
+        oxideterm_audit::AuditCategory::Configuration,
+        "cloud_sync_upload",
+        None,
+        None,
+    );
+    audit.summary(&format!(
+        "provider={:?},automatic={automatic},direction=upload",
+        settings.backend_type
+    ));
     let mut provider = CloudSyncKeychainSecretProvider::new(hints);
     let progress_tx = tx.clone();
     let mut progress = move |progress| {
@@ -397,13 +492,51 @@ pub async fn deliver_cloud_sync_upload(
         .await
     {
         Ok(Some(outcome)) => (Ok(outcome), None, None),
-        Ok(None) => return,
+        Ok(None) => {
+            audit.finish(
+                oxideterm_audit::AuditOutcome::Unchanged,
+                oxideterm_audit::AuditEvidence::Protocol,
+                None,
+                None,
+            );
+            return;
+        }
         Err(error) => (
             Err(error.to_string()),
             error.remote_metadata,
             error.revision_sequence_consumed,
         ),
     };
+    if let Ok(outcome) = &result {
+        let scope = &outcome.local_snapshot.scope;
+        let selected_kinds = [
+            scope.sync_connections,
+            scope.sync_forwards,
+            scope.sync_quick_commands,
+            scope.sync_serial_profiles,
+            scope.sync_telnet_profiles,
+            scope.sync_mosh_profiles,
+            scope.sync_remote_desktop_profiles,
+            scope.sync_app_settings,
+            scope.sync_plugin_settings,
+        ]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+        audit.summary(&format!("provider={:?},automatic={automatic},direction=upload,scope_kinds={selected_kinds},sensitive_credentials={}", settings.backend_type, scope.sync_sensitive_credentials));
+    }
+    audit.finish(
+        if result.is_ok() {
+            oxideterm_audit::AuditOutcome::Succeeded
+        } else if revision_sequence_consumed.is_some() {
+            oxideterm_audit::AuditOutcome::Unknown
+        } else {
+            oxideterm_audit::AuditOutcome::Failed
+        },
+        oxideterm_audit::AuditEvidence::Protocol,
+        None,
+        None,
+    );
     let _ = tx.send(CloudSyncDelivery::UploadFinished {
         action: CloudSyncUploadActionResult {
             result,
@@ -471,6 +604,16 @@ pub async fn deliver_cloud_sync_pull_preview(
     hints: BTreeMap<String, bool>,
     previous_remote_sections: Option<StructuredSectionRevisions>,
 ) {
+    let mut audit = oxideterm_audit::AuditOperation::begin(
+        oxideterm_audit::AuditCategory::Configuration,
+        "cloud_sync_download",
+        None,
+        None,
+    );
+    audit.summary(&format!(
+        "provider={:?},direction=download",
+        settings.backend_type
+    ));
     let mut provider = CloudSyncKeychainSecretProvider::new(hints);
     let progress_tx = tx.clone();
     let mut progress = move |progress| {
@@ -503,6 +646,16 @@ pub async fn deliver_cloud_sync_pull_preview(
         Err(error) => Err(error),
     }
     .map_err(|error| error.to_string());
+    audit.finish(
+        if result.is_ok() {
+            oxideterm_audit::AuditOutcome::Succeeded
+        } else {
+            oxideterm_audit::AuditOutcome::Failed
+        },
+        oxideterm_audit::AuditEvidence::Protocol,
+        None,
+        None,
+    );
     send_action_result(
         tx,
         CloudSyncDelivery::PullPreviewFinished,
@@ -581,6 +734,35 @@ pub async fn deliver_cloud_sync_apply_preview(
     selection: CloudSyncPreviewSelection,
     create_rollback_backup: bool,
 ) {
+    let mut legacy_import_audit = match &preview {
+        CloudSyncPendingPreview::Legacy {
+            source: CloudSyncPreviewSource::Backup { .. },
+            ..
+        } => {
+            let mut audit = oxideterm_audit::AuditOperation::begin(
+                oxideterm_audit::AuditCategory::Configuration,
+                "backup_restore",
+                None,
+                Some("cloud_sync_rollback"),
+            );
+            audit.summary("mode=legacy_backup");
+            Some(audit)
+        }
+        CloudSyncPendingPreview::Legacy {
+            source: CloudSyncPreviewSource::LocalFile,
+            ..
+        } => {
+            let mut audit = oxideterm_audit::AuditOperation::begin(
+                oxideterm_audit::AuditCategory::Configuration,
+                "cloud_sync_local_import",
+                None,
+                Some("oxide_file"),
+            );
+            audit.summary("mode=legacy_local_file,direction=import");
+            Some(audit)
+        }
+        _ => None,
+    };
     let apply_total_units =
         cloud_sync_apply_total_units(&preview, &selection, create_rollback_backup);
     let mut provider = CloudSyncKeychainSecretProvider::new(hints);
@@ -596,6 +778,14 @@ pub async fn deliver_cloud_sync_apply_preview(
         &selection,
         create_rollback_backup,
     ) else {
+        if let Some(audit) = legacy_import_audit.take() {
+            audit.finish(
+                oxideterm_audit::AuditOutcome::Failed,
+                oxideterm_audit::AuditEvidence::Protocol,
+                None,
+                None,
+            );
+        }
         return;
     };
     if create_rollback_backup {
@@ -617,6 +807,14 @@ pub async fn deliver_cloud_sync_apply_preview(
             }
             Ok(None) => {}
             Err(error) => {
+                if let Some(audit) = legacy_import_audit.take() {
+                    audit.finish(
+                        oxideterm_audit::AuditOutcome::Failed,
+                        oxideterm_audit::AuditEvidence::Protocol,
+                        None,
+                        None,
+                    );
+                }
                 send_action_result(
                     tx,
                     CloudSyncDelivery::ApplyPreviewFinished,
@@ -690,8 +888,21 @@ pub async fn deliver_cloud_sync_apply_preview(
         connection_store,
         settings_store,
         outcome,
+        legacy_import_audit: legacy_import_audit
+            .take()
+            .map(|audit| PendingLegacyImportAudit(Some(audit))),
     })
     .map_err(|error| error.to_string());
+    if result.is_err() {
+        if let Some(audit) = legacy_import_audit.take() {
+            audit.finish(
+                oxideterm_audit::AuditOutcome::Failed,
+                oxideterm_audit::AuditEvidence::Protocol,
+                None,
+                None,
+            );
+        }
+    }
     send_action_result(
         tx,
         CloudSyncDelivery::ApplyPreviewFinished,
@@ -967,6 +1178,7 @@ mod tests {
             remote_metadata: Default::default(),
             manifest,
             connections_snapshot: Some(SavedConnectionsSyncSnapshot {
+                totp_credentials: Vec::new(),
                 local_terminal_profiles: Vec::new(),
                 local_terminal_tombstones: Vec::new(),
                 revision: "empty-connections".to_string(),
@@ -1059,9 +1271,6 @@ fn preview_cloud_sync_rollback_backup(
     progress: Option<&mut dyn CloudSyncProgressSink>,
 ) -> anyhow::Result<LegacyPreview> {
     let bytes = BASE64.decode(backup.bytes_base64.as_bytes())?;
-    let metadata = OxideFile::from_bytes(&bytes)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .metadata;
     let mut noop = |_| {};
     let progress = progress.unwrap_or(&mut noop);
     let preview = preview_oxide_import_with_progress(
@@ -1084,6 +1293,7 @@ fn preview_cloud_sync_rollback_backup(
         },
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let metadata = preview.metadata.clone();
     Ok(LegacyPreview {
         remote_metadata: oxideterm_cloud_sync::backend::RemoteMetadata::default(),
         bytes,
@@ -1173,9 +1383,6 @@ fn create_cloud_sync_rollback_backup(
             MAX_ROLLBACK_BACKUP_BYTES
         );
     }
-    let metadata = OxideFile::from_bytes(&bytes)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .metadata;
     let preview = preview_oxide_import_with_progress(
         connection_store,
         &bytes,
@@ -1184,6 +1391,7 @@ fn create_cloud_sync_rollback_backup(
         |_stage, _current, _total| {},
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let metadata = preview.metadata.clone();
     Ok(Some(CloudSyncRollbackBackup {
         id: uuid::Uuid::new_v4().to_string(),
         created_at: Utc::now().to_rfc3339(),

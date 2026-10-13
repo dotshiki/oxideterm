@@ -49,10 +49,23 @@ fn readonly_value_trigger_spec() -> SelectTriggerChromeSpec {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum SelectAnchorId {
+    PluginMarketplaceSort,
+    NativePluginControl(u64),
     ActiveSessionSort,
+    AuditCategory,
+    AuditSeverity,
+    AuditSource,
+    AuditOutcome,
+    AuditTime,
+    AuditSearchField,
     SettingsLanguage,
     SettingsUpdateChannel,
     SettingsAppearanceTheme,
+    SettingsAppearanceTerminalTheme,
+    SettingsAppearanceThemeLight,
+    SettingsAppearanceThemeDark,
+    SettingsAppearanceTerminalThemeLight,
+    SettingsAppearanceTerminalThemeDark,
     SettingsAppearanceDensity,
     SettingsAppearanceUiFontSizeSlider,
     SettingsAppearanceBorderRadiusSlider,
@@ -64,7 +77,18 @@ pub enum SelectAnchorId {
     SettingsAppearanceFrostedGlass,
     SettingsAppearanceBackgroundOpacitySlider,
     SettingsAppearanceBackgroundBlurSlider,
+    SettingsBackgroundReadability,
+    SettingsBackgroundEffectStrength,
+    SettingsBackgroundEffectSheen,
     SettingsAppearanceBackgroundFit,
+    SettingsBackgroundEffectSpeed,
+    SettingsBackgroundEffectSize,
+    SettingsBackgroundEffectBrightness,
+    SettingsBackgroundEffectRoughness,
+    SettingsBackgroundEffectDirection,
+    SettingsBackgroundParticleCount,
+    SettingsBackgroundCameraAmount,
+    SettingsBackgroundCameraSpeed,
     SettingsCustomThemeDuplicate,
     SettingsUpdateProxyMode,
     SettingsUpdateProxyProtocol,
@@ -126,6 +150,8 @@ pub enum SelectAnchorId {
     NewConnectionGroup,
     NewConnectionKeyAuthSource,
     NewConnectionManagedKey,
+    NewConnectionTotp,
+    NewConnectionJumpTotp,
     NewConnectionStandaloneSftpSecondaryKeyAuthSource,
     NewConnectionStandaloneSftpSecondaryManagedKey,
     NewConnectionJumpSavedConnection,
@@ -185,6 +211,11 @@ impl SelectAnchorId {
                 | Self::SettingsUpdateProxyMode
                 | Self::SettingsUpdateProxyProtocol
                 | Self::SettingsAppearanceTheme
+                | Self::SettingsAppearanceTerminalTheme
+                | Self::SettingsAppearanceThemeLight
+                | Self::SettingsAppearanceThemeDark
+                | Self::SettingsAppearanceTerminalThemeLight
+                | Self::SettingsAppearanceTerminalThemeDark
                 | Self::SettingsAppearanceDensity
                 | Self::SettingsAppearanceAnimation
                 | Self::SettingsAppearanceRenderProfile
@@ -248,6 +279,8 @@ impl SelectAnchorId {
             Self::NewConnectionGroup
                 | Self::NewConnectionKeyAuthSource
                 | Self::NewConnectionManagedKey
+                | Self::NewConnectionTotp
+                | Self::NewConnectionJumpTotp
                 | Self::NewConnectionStandaloneSftpSecondaryKeyAuthSource
                 | Self::NewConnectionStandaloneSftpSecondaryManagedKey
                 | Self::NewConnectionJumpSavedConnection

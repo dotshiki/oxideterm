@@ -161,23 +161,6 @@ fn nearest_virtual_scroll_strategy(
     }
 }
 
-pub(crate) fn tauri_virtual_list_is_near_bottom(
-    handle: &UniformListScrollHandle,
-    threshold: Pixels,
-) -> bool {
-    // Browser scroll containers keep an event log "sticky" while the user is
-    // within a small bottom threshold. GPUI's uniform list owns the same base
-    // scroll handle internally, so expose the threshold test once for migrated
-    // lists instead of reimplementing per sidebar or log view.
-    let base_handle = handle.0.borrow().base_handle.clone();
-    let max_offset = base_handle.max_offset();
-    if max_offset.y <= px(0.0) {
-        return true;
-    }
-    let remaining_to_bottom = max_offset.y + base_handle.offset().y;
-    remaining_to_bottom <= threshold
-}
-
 pub(crate) fn uniform_list_edge_autoscroll(
     handle: &UniformListScrollHandle,
     position: Point<Pixels>,
@@ -310,7 +293,8 @@ pub(super) fn sync_tauri_variable_list_state_by_signatures(
     let shared_len = old_len.min(new_len);
     for (index, signature) in signatures.iter().take(shared_len).enumerate() {
         if cache.signatures.get(index) != Some(signature) {
-            state.splice(index..index + 1, 1);
+            // A changed card still owns the user's offset within that same row.
+            state.remeasure_items(index..index + 1);
         }
     }
     if old_len < new_len {
@@ -402,6 +386,33 @@ mod tests {
         );
         let top = state.logical_scroll_top();
         assert_eq!((top.item_ix, top.offset_in_item), (1, px(240.0)));
+    }
+
+    #[test]
+    fn variable_settings_card_updates_preserve_scroll_offset() {
+        let state = ListState::new(0, ListAlignment::Top, px(0.0));
+        let mut cache = VirtualListSignatureCache::default();
+        let spec = TauriVirtualListSpec::new(px(400.0), 2);
+        sync_tauri_variable_list_state_by_signatures(
+            &state,
+            &mut cache,
+            "appearance",
+            &[1, 2, 3],
+            spec,
+        );
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 1,
+            offset_in_item: px(720.0),
+        });
+        sync_tauri_variable_list_state_by_signatures(
+            &state,
+            &mut cache,
+            "appearance",
+            &[1, 9, 3],
+            spec,
+        );
+        let top = state.logical_scroll_top();
+        assert_eq!((top.item_ix, top.offset_in_item), (1, px(720.0)));
     }
 
     #[test]

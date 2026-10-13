@@ -51,6 +51,12 @@ fn terminal_split_supported(
     }
 }
 
+fn terminal_auto_closes_on_exit(kind: oxideterm_terminal::TerminalSessionKind) -> bool {
+    // A remote channel or device can end independently of the user's task. Retain
+    // its pane and scrollback until explicitly closed, even if the node stays connected.
+    kind == oxideterm_terminal::TerminalSessionKind::LocalPty
+}
+
 fn serial_profile_line_ending(
     line_ending: oxideterm_terminal::SerialLineEnding,
 ) -> oxideterm_connections::SerialLineEnding {
@@ -110,6 +116,31 @@ impl TerminalInputBroadcastRoute {
             terminal.retain_live_broadcast_targets(&live_panes);
             terminal.filter_broadcast_targets(self.source_pane_id, candidates)
         });
+        if targets.is_empty() {
+            return;
+        }
+        let explicit_send = matches!(kind, TerminalBroadcastInputKind::Paste)
+            || bytes.contains(&b'\r')
+            || bytes.contains(&b'\n');
+        let mut batch = explicit_send.then(|| {
+            let mut context = oxideterm_audit::AuditContext::current_request()
+                .or_else(oxideterm_audit::AuditContext::current);
+            if let Some(context) = &mut context {
+                context.source = oxideterm_audit::AuditSource::Broadcast;
+            }
+            oxideterm_audit::AuditOperation::in_context(
+                context.as_ref(),
+                oxideterm_audit::AuditCategory::Automation,
+                "broadcast_send_batch",
+                None,
+            )
+        });
+        let parent_id = batch
+            .as_ref()
+            .and_then(oxideterm_audit::AuditOperation::id)
+            .map(str::to_string);
+        let target_count = targets.len();
+        let mut sent_count = 0usize;
         for pane_id in targets {
             let session_id = tab_host
                 .read(cx)
@@ -128,11 +159,31 @@ impl TerminalInputBroadcastRoute {
             let Some(pane) = tab_host.read(cx).panes().get(&pane_id).cloned() else {
                 continue;
             };
-            let _ = pane.update(cx, |pane, cx| {
+            if pane.update(cx, |pane, cx| {
                 // Borrowed input is delivered synchronously and never retained
                 // outside the target pane's existing zeroizing write path.
-                pane.send_broadcast_input(kind, bytes, cx);
-            });
+                pane.send_broadcast_input_with_parent(kind, bytes, parent_id.as_deref(), cx)
+            }) {
+                sent_count += 1;
+            }
+        }
+        if let Some(mut batch) = batch.take() {
+            batch.summary(&format!(
+                "targets={target_count}; sent={sent_count}; input_bytes={}",
+                bytes.len()
+            ));
+            batch.finish(
+                if sent_count == target_count {
+                    oxideterm_audit::AuditOutcome::Sent
+                } else if sent_count > 0 {
+                    oxideterm_audit::AuditOutcome::Partial
+                } else {
+                    oxideterm_audit::AuditOutcome::Failed
+                },
+                oxideterm_audit::AuditEvidence::Dispatch,
+                None,
+                None,
+            );
         }
     }
 }
@@ -170,6 +221,7 @@ impl WorkspaceApp {
         self.ai_runtime_context.update(cx, |runtime, _cx| {
             runtime.register_terminal_session(session_id, terminal_label);
         });
+        self.refresh_native_plugin_terminal_hooks(cx);
     }
 
     pub(super) fn handle_terminal_pane_delivery(
@@ -181,6 +233,9 @@ impl WorkspaceApp {
         cx: &mut Context<Self>,
     ) {
         match event {
+            TerminalPaneEvent::InputActivity => {
+                oxideterm_gpui_background::note_input_activity(window_handle.window_id(), cx);
+            }
             TerminalPaneEvent::Exited { .. } => {
                 self.queue_auto_close_terminal_session(session_id, cx);
             }
@@ -385,15 +440,24 @@ impl WorkspaceApp {
         session_id: TerminalSessionId,
         cx: &mut Context<Self>,
     ) {
-        // Serial sessions report port failures through the same terminal event;
-        // keep local transport panes visible so users can inspect the error
-        // text and reconnect without recreating the whole tab.
-        if self.serial_terminal_configs.contains_key(&session_id) {
+        if !self.terminal_session_auto_closes_on_exit(session_id, cx) {
             return;
         }
         if self.pending_auto_close_terminal_sessions.insert(session_id) {
             cx.notify();
         }
+    }
+
+    fn terminal_session_auto_closes_on_exit(
+        &self,
+        session_id: TerminalSessionId,
+        cx: &App,
+    ) -> bool {
+        self.tab_host
+            .read(cx)
+            .terminal_location(session_id)
+            .and_then(|location| self.terminal_kind_for_pane(location.pane_id, cx))
+            .is_some_and(terminal_auto_closes_on_exit)
     }
 
     pub(super) fn schedule_pending_auto_close_terminal_sessions(
@@ -423,7 +487,7 @@ impl WorkspaceApp {
     ) {
         let session_ids: Vec<_> = self.pending_auto_close_terminal_sessions.drain().collect();
         for session_id in session_ids {
-            if self.serial_terminal_configs.contains_key(&session_id) {
+            if !self.terminal_session_auto_closes_on_exit(session_id, cx) {
                 continue;
             }
             self.close_terminal_session(session_id, window, cx);
@@ -985,6 +1049,10 @@ impl WorkspaceApp {
         let active_pane_id = tab_id
             .and_then(|tab_id| self.tab_by_id(tab_id, cx))
             .and_then(|tab| tab.active_pane_id);
+        let split = tab_id
+            .and_then(|id| self.tab_by_id(id, cx))
+            .and_then(|tab| tab.root_pane.as_ref())
+            .is_some_and(|root| root.pane_count() > 1);
         let content = match node {
             PaneNode::Page {
                 pane_id,
@@ -995,11 +1063,14 @@ impl WorkspaceApp {
                 };
                 let (pane_id, page_id) = (*pane_id, *page_id);
                 let container = tab_id.unwrap_or(page_id);
-                let content = match page.kind {
-                    TabKind::Sftp => self.render_sftp_surface_for_tab(page_id, window, cx),
-                    TabKind::Ide => self.render_ide_surface_for_tab(page_id, cx),
-                    TabKind::Forwards => self.render_forwards_surface_for_tab(page_id, window, cx),
-                    _ => div().into_any_element(),
+                let content = if page.kind == TabKind::Knowledge {
+                    self.render_knowledge_workspace_surface(
+                        KnowledgeWorkspaceLayout::SplitPane,
+                        window,
+                        cx,
+                    )
+                } else {
+                    self.render_tab_content_for_id(page_id, &page.kind, None, window, cx)
                 };
                 div()
                     .id(("workspace-page", pane_id.0))
@@ -1008,6 +1079,10 @@ impl WorkspaceApp {
                     .flex_col()
                     .overflow_hidden()
                     .capture_any_mouse_down(cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        let previous = this.tab_host.read(cx).focused_page_id(container);
+                        if previous != page_id {
+                            this.release_remote_desktop_inputs_for_tab(previous, cx);
+                        }
                         if this
                             .tab_host
                             .update(cx, |host, _| host.set_active_pane(Some(container), pane_id))
@@ -1019,12 +1094,14 @@ impl WorkspaceApp {
                         }
                         cx.notify();
                     }))
-                    .child(self.render_workspace_page_header(
-                        page_id,
-                        &page.title,
-                        Some(pane_id) == active_pane_id,
-                        cx,
-                    ))
+                    .when(split, |frame| {
+                        frame.child(self.render_workspace_page_header(
+                            page_id,
+                            &page.title,
+                            Some(pane_id) == active_pane_id,
+                            cx,
+                        ))
+                    })
                     .child(div().flex_1().min_h_0().relative().child(content))
                     .into_any_element()
             }
@@ -1034,10 +1111,6 @@ impl WorkspaceApp {
                     return div().size_full().into_any_element();
                 };
                 let sync_header = self.render_terminal_sync_member_header(*pane_id, cx);
-                let split = tab_id
-                    .and_then(|id| self.tab_by_id(id, cx))
-                    .and_then(|tab| tab.root_pane.as_ref())
-                    .is_some_and(|root| root.pane_count() > 1);
                 let terminal_top = if sync_header.is_some() {
                     terminal_command_bar::TERMINAL_SYNC_HEADER_HEIGHT
                 } else {
@@ -1074,6 +1147,7 @@ impl WorkspaceApp {
                                 // Release logical input ownership before focusing the native pane.
                                 this.blur_text_inputs(cx);
                                 if let Some(tab_id) = tab_id {
+                                    this.release_remote_desktop_inputs_for_tab(tab_id, cx);
                                     this.tab_host.update(cx, |tab_host, _| {
                                         tab_host.set_active_pane(Some(tab_id), pane_id);
                                     });
@@ -1190,7 +1264,10 @@ impl WorkspaceApp {
                         let line_color = if active_drag {
                             rgba((self.tokens.ui.accent << 8) | SPLIT_HANDLE_ACTIVE_LINE_ALPHA)
                         } else {
-                            rgba((self.tokens.ui.divider << 8) | SPLIT_HANDLE_LINE_ALPHA)
+                            self.workspace_divider_color(
+                                self.tokens.ui.divider,
+                                SPLIT_HANDLE_LINE_ALPHA,
+                            )
                         };
                         let line_width = if active_drag {
                             SPLIT_HANDLE_ACTIVE_LINE_WIDTH
@@ -1317,8 +1394,22 @@ impl WorkspaceApp {
 }
 
 #[cfg(test)]
-mod split_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn remote_terminal_exit_does_not_request_auto_close() {
+        use oxideterm_terminal::TerminalSessionKind::*;
+        for (kind, auto_close) in [
+            (LocalPty, true),
+            (SshPty, false),
+            (Telnet, false),
+            (Mosh, false),
+            (Serial, false),
+        ] {
+            assert_eq!(terminal_auto_closes_on_exit(kind), auto_close, "{kind:?}");
+        }
+    }
 
     #[test]
     fn terminal_split_support_matches_transport_ownership() {

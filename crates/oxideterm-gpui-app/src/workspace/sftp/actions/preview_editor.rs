@@ -15,6 +15,18 @@ impl WorkspaceApp {
             };
             self.set_sftp_path(pane, join_sftp_path(&base, &file.name), cx);
         } else if pane == SftpPane::Remote {
+            // The backend may recognize an executable by its header even without an extension.
+            let plugin_preview = {
+                let plugins = self.plugin_entity.clone();
+                let runtime = self.forwarding_runtime.clone();
+                let tokens = self.tokens;
+                let i18n = self.i18n.clone();
+                Some(cx.new(|cx| {
+                    super::super::super::plugin_preview::PluginFilePreview::new(
+                        plugins, runtime, tokens, i18n, cx,
+                    )
+                }))
+            };
             let generation = self.sftp_view().update(cx, |sftp, cx| {
                 sftp.active_pane = pane;
                 sftp.clear_context_menu_immediately();
@@ -25,6 +37,7 @@ impl WorkspaceApp {
                 sftp.preview_path = Some(file.path.clone());
                 sftp.preview_content = None;
                 sftp.preview_asset_owner = None;
+                sftp.preview_plugin = plugin_preview;
                 sftp.preview_markdown_scroll = MarkdownVirtualListScrollHandle::new();
                 sftp.preview_document_scroll = ScrollHandle::new();
                 sftp.font_preview_scroll = ScrollHandle::new();
@@ -117,6 +130,7 @@ impl WorkspaceApp {
         let editor_language = sftp_editor_language(language.as_deref(), name);
         let syntax_language =
             sftp_editor_language_id(language.as_deref(), preview_path.as_deref(), name, &data);
+        let syntax_path = preview_path.as_deref().unwrap_or(name).to_string();
         let tokens = self.tokens;
         let runtime_settings = self.ide_runtime_settings();
         let context_menu_labels = EditorContextMenuLabels {
@@ -145,7 +159,7 @@ impl WorkspaceApp {
                     runtime_settings.background_active,
                     cx,
                 );
-                editor.set_language(syntax_language, cx);
+                editor.set_language_from_path(syntax_path, syntax_language, cx);
                 editor.set_on_save(Box::new(move |text, _window, cx| {
                     let _ = sftp_entity.update(cx, |sftp, cx| {
                         sftp.save_preview_editor_content(text, cx);
@@ -398,7 +412,29 @@ impl WorkspaceApp {
         path: &str,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = open_path_in_external_app(path) {
+        let audit = oxideterm_audit::AuditContext::current().map(|mut context| {
+            context.source = oxideterm_audit::AuditSource::User;
+            context.target = Some(oxideterm_audit::redact(path));
+            context.operation(
+                oxideterm_audit::AuditCategory::File,
+                "file_external_open",
+                Some("local_application_launch"),
+            )
+        });
+        let result = open_path_in_external_app(path);
+        if let Some(audit) = audit {
+            audit.finish(
+                if result.is_ok() {
+                    oxideterm_audit::AuditOutcome::Sent
+                } else {
+                    oxideterm_audit::AuditOutcome::Failed
+                },
+                oxideterm_audit::AuditEvidence::Dispatch,
+                None,
+                None,
+            );
+        }
+        if let Err(error) = result {
             let error = format!(
                 "{}: {}",
                 self.i18n.t("sftp.toast.open_external_failed"),
@@ -411,7 +447,7 @@ impl WorkspaceApp {
         }
     }
 
-    fn spawn_remote_sftp_preview(&self, path: String, generation: u64, cx: &App) {
+    fn spawn_remote_sftp_preview(&self, path: String, generation: u64, cx: &mut Context<Self>) {
         let Some(remote_id) = self.visible_sftp_remote_id(cx) else {
             return;
         };
@@ -420,13 +456,31 @@ impl WorkspaceApp {
         };
         let tx = self.sftp_view().read(cx).worker_sender();
         let runtime = self.forwarding_runtime.clone();
-        runtime.spawn(async move {
-            let result = load_remote_sftp_preview(backend, &path).await;
+        let audit_request = oxideterm_audit::AuditContext::current_request().or_else(|| {
+            oxideterm_audit::AuditContext::current().map(|mut context| {
+                context.source = oxideterm_audit::AuditSource::User;
+                context
+            })
+        });
+        let task = runtime.spawn(async move {
+            let task = load_remote_sftp_preview(backend, &path);
+            let result = if let Some(context) = audit_request {
+                context.scope(task).await
+            } else {
+                task.await
+            };
             let _ = tx.send(SftpWorkerResult::PreviewLoaded {
+                asset_owner: result
+                    .as_ref()
+                    .ok()
+                    .and_then(PreviewAssetOwner::from_asset_content_owned_temp),
                 generation,
                 path,
                 result,
             });
+        });
+        self.sftp_view().update(cx, |sftp, _| {
+            sftp.preview_load_task = Some(task.abort_handle())
         });
     }
 
@@ -469,8 +523,19 @@ impl WorkspaceApp {
         let tx = self.sftp_view().read(cx).worker_sender();
         let error_prefix = self.i18n.t("sftp.toast.load_more_failed");
         let runtime = self.forwarding_runtime.clone();
+        let audit_request = oxideterm_audit::AuditContext::current_request().or_else(|| {
+            oxideterm_audit::AuditContext::current().map(|mut context| {
+                context.source = oxideterm_audit::AuditSource::User;
+                context
+            })
+        });
         runtime.spawn(async move {
-            let result = load_remote_sftp_preview_hex(backend, &path, offset).await;
+            let task = load_remote_sftp_preview_hex(backend, &path, offset);
+            let result = if let Some(context) = audit_request {
+                context.scope(task).await
+            } else {
+                task.await
+            };
             let _ = tx.send(SftpWorkerResult::PreviewHexLoaded {
                 generation,
                 path,
@@ -498,15 +563,25 @@ impl WorkspaceApp {
         };
         let network_error_message = self.i18n.t("sftp.preview.network_error");
         let runtime = self.forwarding_runtime.clone();
+        let audit_request = oxideterm_audit::AuditContext::current_request().or_else(|| {
+            oxideterm_audit::AuditContext::current().map(|mut context| {
+                context.source = oxideterm_audit::AuditSource::User;
+                context
+            })
+        });
         runtime.spawn(async move {
-            let result = save_remote_sftp_preview(
+            let task = save_remote_sftp_preview(
                 backend,
                 &path,
                 content.as_ref(),
                 encoding.as_ref(),
                 line_ending,
-            )
-            .await;
+            );
+            let result = if let Some(context) = audit_request {
+                context.scope(task).await
+            } else {
+                task.await
+            };
             let _ = tx.send(SftpWorkerResult::PreviewSaved {
                 generation,
                 path,

@@ -1,27 +1,22 @@
 // Copyright (C) 2026 AnalyseDeCircuit
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::collections::BTreeMap;
-use std::fmt;
-use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, Instant};
-
-use fernomade_crypto::SessionKey;
-use fernomade_runtime::{
-    ConnectionState, MonotonicTime, RuntimeError, SessionAction, SessionRuntime, ShutdownOutcome,
-    TerminalInputEvent,
+use crate::{
+    MoshIpFamily,
+    wire::{self, Event, Request},
 };
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-
-use crate::MoshIpFamily;
-
-const COMMAND_CHANNEL_CAPACITY: usize = 256;
-const EVENT_CHANNEL_CAPACITY: usize = 512;
-const MAX_DATAGRAM_BYTES: usize = u16::MAX as usize;
-const MAX_TIMER_SLEEP: Duration = Duration::from_secs(1);
-const SUSPEND_GAP: Duration = Duration::from_secs(5);
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Condvar, Mutex},
+    time::Duration,
+};
+use tokio::{
+    process::Command,
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
+use zeroize::Zeroize;
 
 pub struct MoshSessionConfig {
     pub remote_host: String,
@@ -29,157 +24,193 @@ pub struct MoshSessionConfig {
     pub ip_family: MoshIpFamily,
     pub columns: u16,
     pub rows: u16,
-    pub key: SessionKey,
-}
-
-impl fmt::Debug for MoshSessionConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MoshSessionConfig")
-            .field("remote_host", &self.remote_host)
-            .field("remote_port", &self.remote_port)
-            .field("ip_family", &self.ip_family)
-            .field("columns", &self.columns)
-            .field("rows", &self.rows)
-            .field("key", &"[REDACTED]")
-            .finish()
-    }
-}
-
-enum MoshSessionCommand {
-    Input { prediction_id: u64, bytes: Vec<u8> },
-    Resize { columns: u16, rows: u16 },
-    Shutdown,
-    Cancel,
-}
-
-impl fmt::Debug for MoshSessionCommand {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Input {
-                prediction_id,
-                bytes,
-            } => formatter
-                .debug_struct("Input")
-                .field("prediction_id", prediction_id)
-                .field("bytes", &bytes.len())
-                .finish(),
-            Self::Resize { columns, rows } => formatter
-                .debug_struct("Resize")
-                .field("columns", columns)
-                .field("rows", rows)
-                .finish(),
-            Self::Shutdown => formatter.write_str("Shutdown"),
-            Self::Cancel => formatter.write_str("Cancel"),
-        }
-    }
+    pub key: crate::MoshSessionKey,
+    pub executable: PathBuf,
+    pub lease: MoshSessionLease,
 }
 
 pub enum MoshSessionEvent {
     Output(Vec<u8>),
     RemoteResize { columns: u16, rows: u16 },
-    ConnectionStateChanged(ConnectionState),
+    ConnectionStateChanged(crate::MoshConnectionState),
     RoundTripEstimate(u16),
     PredictionAcknowledged(u64),
     RemoteStateAdvanced(u64),
-    Closed(ShutdownOutcome),
+    Closed(crate::ShutdownOutcome),
     Failed(String),
 }
 
-impl fmt::Debug for MoshSessionEvent {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Output(bytes) => formatter
-                .debug_struct("Output")
-                .field("bytes", &bytes.len())
-                .finish(),
-            Self::RemoteResize { columns, rows } => formatter
-                .debug_struct("RemoteResize")
-                .field("columns", columns)
-                .field("rows", rows)
-                .finish(),
-            Self::ConnectionStateChanged(state) => formatter
-                .debug_tuple("ConnectionStateChanged")
-                .field(state)
-                .finish(),
-            Self::RoundTripEstimate(milliseconds) => formatter
-                .debug_tuple("RoundTripEstimate")
-                .field(milliseconds)
-                .finish(),
-            Self::PredictionAcknowledged(state_id) => formatter
-                .debug_tuple("PredictionAcknowledged")
-                .field(state_id)
-                .finish(),
-            Self::RemoteStateAdvanced(state_id) => formatter
-                .debug_tuple("RemoteStateAdvanced")
-                .field(state_id)
-                .finish(),
-            Self::Closed(outcome) => formatter.debug_tuple("Closed").field(outcome).finish(),
-            Self::Failed(message) => formatter.debug_tuple("Failed").field(message).finish(),
+#[derive(Default)]
+struct Sessions {
+    blocked: bool,
+    next_id: u64,
+    active: HashMap<u64, watch::Sender<bool>>,
+}
+
+struct QueuedEvent(MoshSessionEvent);
+impl QueuedEvent {
+    fn into_event(mut self) -> MoshSessionEvent {
+        std::mem::replace(&mut self.0, MoshSessionEvent::RemoteStateAdvanced(0))
+    }
+}
+impl Drop for QueuedEvent {
+    fn drop(&mut self) {
+        if let MoshSessionEvent::Output(bytes) = &mut self.0 {
+            bytes.zeroize();
         }
     }
 }
 
-pub struct MoshSessionClient {
-    command_tx: mpsc::Sender<MoshSessionCommand>,
-    event_rx: mpsc::Receiver<MoshSessionEvent>,
+/// The workspace can stop and reap every engine before replacing its package.
+#[derive(Default)]
+pub struct MoshPluginSessions {
+    state: Mutex<Sessions>,
+    completed: Condvar,
 }
 
+impl MoshPluginSessions {
+    pub fn set_available(&self, available: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.blocked = !available;
+        if !available {
+            for cancel in state.active.values() {
+                let _ = cancel.send(true);
+            }
+        }
+    }
+
+    pub fn stop(self: &Arc<Self>) -> std::thread::JoinHandle<()> {
+        self.set_available(false);
+        let sessions = self.clone();
+        std::thread::spawn(move || {
+            let mut state = sessions.state.lock().unwrap();
+            while !state.active.is_empty() {
+                state = sessions.completed.wait(state).unwrap();
+            }
+        })
+    }
+
+    pub fn acquire(self: &Arc<Self>) -> Result<MoshSessionLease, MoshSessionStartError> {
+        let mut state = self.state.lock().unwrap();
+        if state.blocked {
+            return Err(MoshSessionStartError::Unavailable);
+        }
+        state.next_id += 1;
+        let id = state.next_id;
+        let (cancel, receiver) = watch::channel(false);
+        state.active.insert(id, cancel);
+        Ok(MoshSessionLease {
+            registration: Registration {
+                id,
+                sessions: self.clone(),
+            },
+            cancellation: receiver,
+        })
+    }
+}
+
+/// Acquired before SSH bootstrap so retired startup work cannot relaunch an engine.
+pub struct MoshSessionLease {
+    registration: Registration,
+    cancellation: watch::Receiver<bool>,
+}
+
+impl MoshSessionLease {
+    pub fn cancellation(&self) -> MoshSessionCancellation {
+        MoshSessionCancellation(
+            self.registration.sessions.state.lock().unwrap().active[&self.registration.id].clone(),
+        )
+    }
+
+    pub async fn cancelled(&mut self) {
+        if !*self.cancellation.borrow() {
+            let _ = self.cancellation.changed().await;
+        }
+    }
+}
+
+pub struct MoshSessionCancellation(watch::Sender<bool>);
+impl MoshSessionCancellation {
+    pub fn cancel(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+struct Registration {
+    id: u64,
+    sessions: Arc<MoshPluginSessions>,
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.sessions.state.lock().unwrap().active.remove(&self.id);
+        self.sessions.completed.notify_all();
+    }
+}
+
+pub struct MoshSessionClient {
+    command_tx: mpsc::Sender<Request>,
+    event_rx: mpsc::Receiver<QueuedEvent>,
+}
 impl MoshSessionClient {
     pub async fn send_input_for_prediction(
         &self,
         prediction_id: u64,
         bytes: Vec<u8>,
     ) -> Result<(), MoshSessionCommandError> {
-        self.command_tx
-            .send(MoshSessionCommand::Input {
-                prediction_id,
-                bytes,
-            })
-            .await
-            .map_err(|_| MoshSessionCommandError::Closed)
+        let bytes = zeroize::Zeroizing::new(bytes);
+        for chunk in bytes.chunks(wire::MAX_FRAME_BYTES - 8) {
+            self.command_tx
+                .send(Request::Input {
+                    prediction_id,
+                    bytes: zeroize::Zeroizing::new(chunk.to_vec()),
+                })
+                .await
+                .map_err(|_| MoshSessionCommandError::Closed)?;
+        }
+        Ok(())
     }
-
     pub async fn resize(&self, columns: u16, rows: u16) -> Result<(), MoshSessionCommandError> {
         self.command_tx
-            .send(MoshSessionCommand::Resize { columns, rows })
+            .send(Request::Resize { columns, rows })
             .await
             .map_err(|_| MoshSessionCommandError::Closed)
     }
-
     pub async fn next_event(&mut self) -> Option<MoshSessionEvent> {
-        self.event_rx.recv().await
+        self.event_rx.recv().await.map(QueuedEvent::into_event)
     }
-
     pub fn try_next_event(&mut self) -> Option<MoshSessionEvent> {
-        self.event_rx.try_recv().ok()
+        self.event_rx.try_recv().ok().map(QueuedEvent::into_event)
     }
 }
 
 pub struct MoshSessionOwner {
-    command_tx: mpsc::Sender<MoshSessionCommand>,
+    command_tx: mpsc::Sender<Request>,
+    cancel: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
 }
-
 impl MoshSessionOwner {
     pub async fn shutdown(mut self) {
-        let _ = self.command_tx.send(MoshSessionCommand::Shutdown).await;
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+        if let Some(mut task) = self.task.take() {
+            // Include a congested input queue in the graceful-shutdown deadline.
+            let graceful = async {
+                let _ = self.command_tx.send(Request::Shutdown).await;
+                let _ = (&mut task).await;
+            };
+            if tokio::time::timeout(Duration::from_secs(12), graceful)
+                .await
+                .is_err()
+            {
+                self.cancel();
+                let _ = task.await;
+            }
         }
     }
-
     pub fn cancel(&mut self) {
-        let _ = self.command_tx.try_send(MoshSessionCommand::Cancel);
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        let _ = self.cancel.send(true);
     }
 }
-
 impl Drop for MoshSessionOwner {
     fn drop(&mut self) {
-        // Abrupt owner loss must drop protocol key material immediately.
         self.cancel();
     }
 }
@@ -188,12 +219,13 @@ impl Drop for MoshSessionOwner {
 pub enum MoshSessionStartError {
     #[error("Mosh UDP endpoint is invalid")]
     InvalidEndpoint,
-    #[error("Mosh UDP endpoint could not be resolved")]
-    EndpointResolutionFailed,
-    #[error("Mosh UDP socket could not be opened")]
-    SocketOpenFailed,
+    #[error("Mosh plugin is unavailable")]
+    Unavailable,
+    #[error("Mosh plugin could not be started")]
+    Launch,
+    #[error("Mosh plugin protocol is unsupported or failed")]
+    Protocol,
 }
-
 #[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
 pub enum MoshSessionCommandError {
     #[error("Mosh session is closed")]
@@ -206,311 +238,236 @@ pub async fn start_mosh_session(
     if config.remote_port == 0 || config.columns == 0 || config.rows == 0 {
         return Err(MoshSessionStartError::InvalidEndpoint);
     }
-    let remote_address =
-        resolve_remote_address(&config.remote_host, config.remote_port, config.ip_family).await?;
-    let bind_address = match remote_address.ip() {
-        IpAddr::V4(_) => "0.0.0.0:0",
-        IpAddr::V6(_) => "[::]:0",
+    let MoshSessionLease {
+        registration,
+        cancellation: mut registry_cancel,
+    } = config.lease;
+    if *registry_cancel.borrow() {
+        return Err(MoshSessionStartError::Unavailable);
+    }
+    let mut command = Command::new(&config.executable);
+    command
+        .arg("--stdio")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command.spawn().map_err(|_| MoshSessionStartError::Launch)?;
+    let mut stdin = child.stdin.take().ok_or(MoshSessionStartError::Launch)?;
+    let mut stdout = child.stdout.take().ok_or(MoshSessionStartError::Launch)?;
+    let start = Request::Start {
+        version: wire::PROTOCOL_VERSION,
+        host: config.remote_host,
+        port: config.remote_port,
+        family: config.ip_family,
+        columns: config.columns,
+        rows: config.rows,
+        key: config.key.into_encoded(),
     };
-    let socket = UdpSocket::bind(bind_address)
-        .await
-        .map_err(|_| MoshSessionStartError::SocketOpenFailed)?;
-    socket
-        .connect(remote_address)
-        .await
-        .map_err(|_| MoshSessionStartError::SocketOpenFailed)?;
-
-    let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let owner_command_tx = command_tx.clone();
-    let task = tokio::spawn(run_session(
-        socket,
-        config.key,
-        config.columns,
-        config.rows,
-        command_rx,
-        event_tx,
-    ));
+    let handshake = async {
+        wire::write_frame(&mut stdin, &start).await?;
+        match wire::read_frame::<_, Event>(&mut stdout).await? {
+            Event::Ready {
+                version: wire::PROTOCOL_VERSION,
+            } => Ok(()),
+            _ => Err(std::io::Error::other("Mosh plugin handshake failed")),
+        }
+    };
+    let result = tokio::select! {
+        _ = registry_cancel.changed() => Err(MoshSessionStartError::Unavailable),
+        result = tokio::time::timeout(Duration::from_secs(10), handshake) => result.map_err(|_| MoshSessionStartError::Protocol).and_then(|result| result.map_err(|_| MoshSessionStartError::Protocol)),
+    };
+    drop(start);
+    if let Err(error) = result {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error);
+    }
+    let (command_tx, mut commands) = mpsc::channel::<Request>(64);
+    // 16 frames capped at 64 KiB bound the queued terminal output to 1 MiB.
+    let (event_tx, event_rx) = mpsc::channel(16);
+    let (cancel, mut cancelled) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let _registration = registration;
+        let result = tokio::select! {
+            _ = cancelled.changed() => Ok(()),
+            _ = registry_cancel.changed() => Ok(()),
+            result = relay(&mut stdout, &mut stdin, &mut commands, &event_tx) => result,
+        };
+        // Reap before notifying package management that its executable can be replaced.
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        if result.is_err() {
+            let _ = event_tx.try_send(QueuedEvent(MoshSessionEvent::Failed(
+                "Mosh plugin transport failed".into(),
+            )));
+        }
+    });
     Ok((
         MoshSessionClient {
-            command_tx,
+            command_tx: command_tx.clone(),
             event_rx,
         },
         MoshSessionOwner {
-            command_tx: owner_command_tx,
+            command_tx,
+            cancel,
             task: Some(task),
         },
     ))
 }
 
-async fn resolve_remote_address(
-    host: &str,
-    port: u16,
-    family: MoshIpFamily,
-) -> Result<SocketAddr, MoshSessionStartError> {
-    let addresses = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| MoshSessionStartError::EndpointResolutionFailed)?;
-    addresses
-        .into_iter()
-        .find(|address| match family {
-            MoshIpFamily::Auto => true,
-            MoshIpFamily::Ipv4 => address.is_ipv4(),
-            MoshIpFamily::Ipv6 => address.is_ipv6(),
-        })
-        .ok_or(MoshSessionStartError::EndpointResolutionFailed)
-}
-
-async fn run_session(
-    socket: UdpSocket,
-    key: SessionKey,
-    columns: u16,
-    rows: u16,
-    mut command_rx: mpsc::Receiver<MoshSessionCommand>,
-    event_tx: mpsc::Sender<MoshSessionEvent>,
-) {
-    let started_at = Instant::now();
-    let mut previous_loop = started_at;
-    let mut runtime = SessionRuntime::new(key, monotonic_time(started_at));
-    runtime.queue_resize(columns, rows);
-    let mut prediction_ids = PredictionIdMap::default();
-    let mut receive_buffer = vec![0_u8; MAX_DATAGRAM_BYTES];
-
-    loop {
-        let now = Instant::now();
-        if now.duration_since(previous_loop) > SUSPEND_GAP {
-            runtime.resume(monotonic_time(started_at));
+async fn relay(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    commands: &mut mpsc::Receiver<Request>,
+    event_tx: &mpsc::Sender<QueuedEvent>,
+) -> std::io::Result<()> {
+    let requests = async {
+        while let Some(request) = commands.recv().await {
+            wire::write_frame(writer, &request).await?;
         }
-        previous_loop = now;
-        let actions = match runtime.poll(monotonic_time(started_at)) {
-            Ok(actions) => actions,
-            Err(error) => {
-                let _ = event_tx
-                    .send(MoshSessionEvent::Failed(error.to_string()))
-                    .await;
-                let _ = runtime.cancel();
-                return;
-            }
-        };
-        if !apply_actions(&socket, &event_tx, &mut prediction_ids, actions).await {
-            let _ = runtime.cancel();
-            return;
-        }
-        if runtime.shutdown_outcome().is_some() {
-            return;
-        }
-
-        let poll_wait = runtime
-            .milliseconds_until_next_poll(monotonic_time(started_at))
-            .min(MAX_TIMER_SLEEP.as_millis() as u64);
-        tokio::select! {
-            command = command_rx.recv() => {
-                match command {
-                    Some(MoshSessionCommand::Input { prediction_id, bytes }) => {
-                        if let Err(error) = queue_prediction_input(
-                            &mut runtime,
-                            &mut prediction_ids,
-                            prediction_id,
-                            bytes,
-                        ) {
-                            let _ = event_tx.send(MoshSessionEvent::Failed(error.to_string())).await;
-                            let _ = runtime.cancel();
-                            return;
-                        }
-                    }
-                    Some(MoshSessionCommand::Resize { columns, rows }) => {
-                        if columns > 0 && rows > 0 {
-                            let _ = runtime.queue_terminal_event(TerminalInputEvent::Resize { columns, rows });
-                        }
-                    }
-                    Some(MoshSessionCommand::Shutdown) => {
-                        match runtime.request_shutdown(monotonic_time(started_at)) {
-                            Ok(actions) => {
-                                if !apply_actions(
-                                    &socket,
-                                    &event_tx,
-                                    &mut prediction_ids,
-                                    actions,
-                                ).await {
-                                    let _ = runtime.cancel();
-                                    return;
-                                }
-                            }
-                            Err(error) => {
-                                let _ = event_tx.send(MoshSessionEvent::Failed(error.to_string())).await;
-                                let _ = runtime.cancel();
-                                return;
-                            }
-                        }
-                    }
-                    Some(MoshSessionCommand::Cancel) | None => {
-                        let _ = runtime.cancel();
-                        return;
-                    }
+        Ok::<(), std::io::Error>(())
+    };
+    let events = async {
+        loop {
+            let event = wire::read_frame::<_, Event>(reader).await?;
+            let event = match event {
+                Event::Ready { .. } | Event::Failed => {
+                    return Err(std::io::Error::other("Mosh engine failed"));
                 }
-            }
-            received = socket.recv(&mut receive_buffer) => {
-                match received {
-                    Ok(length) => {
-                        let actions = runtime.receive_datagram_lossy(
-                            &receive_buffer[..length],
-                            monotonic_time(started_at),
-                        );
-                        if !apply_actions(
-                            &socket,
-                            &event_tx,
-                            &mut prediction_ids,
-                            actions,
-                        ).await {
-                            let _ = runtime.cancel();
-                            return;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = event_tx.send(MoshSessionEvent::Failed(
-                            "Mosh UDP receive failed".to_string(),
-                        )).await;
-                        let _ = runtime.cancel();
-                        return;
-                    }
+                Event::Output(bytes) => MoshSessionEvent::Output(bytes.to_vec()),
+                Event::RemoteResize { columns, rows } => {
+                    MoshSessionEvent::RemoteResize { columns, rows }
                 }
-            }
-            () = tokio::time::sleep(Duration::from_millis(poll_wait)) => {}
-        }
-    }
-}
-
-async fn apply_actions(
-    socket: &UdpSocket,
-    event_tx: &mpsc::Sender<MoshSessionEvent>,
-    prediction_ids: &mut PredictionIdMap,
-    actions: Vec<SessionAction>,
-) -> bool {
-    for action in actions {
-        let event = match action {
-            SessionAction::SendDatagram(datagram) => {
-                if socket.send(&datagram).await.is_err() {
+                Event::ConnectionStateChanged(state) => {
+                    MoshSessionEvent::ConnectionStateChanged(state)
+                }
+                Event::RoundTripEstimate(value) => MoshSessionEvent::RoundTripEstimate(value),
+                Event::PredictionAcknowledged(value) => {
+                    MoshSessionEvent::PredictionAcknowledged(value)
+                }
+                Event::RemoteStateAdvanced(value) => MoshSessionEvent::RemoteStateAdvanced(value),
+                Event::Closed(outcome) => {
                     let _ = event_tx
-                        .send(MoshSessionEvent::Failed("Mosh UDP send failed".to_string()))
+                        .send(QueuedEvent(MoshSessionEvent::Closed(outcome)))
                         .await;
-                    return false;
+                    return Ok(());
                 }
-                continue;
+            };
+            if event_tx.send(QueuedEvent(event)).await.is_err() {
+                return Ok(());
             }
-            SessionAction::WriteTerminal(bytes) => MoshSessionEvent::Output(bytes),
-            SessionAction::ResizeTerminal { columns, rows } => {
-                MoshSessionEvent::RemoteResize { columns, rows }
-            }
-            SessionAction::AcknowledgePrediction(protocol_frame_id) => {
-                let Some(prediction_id) = prediction_ids.acknowledge(protocol_frame_id) else {
-                    continue;
-                };
-                MoshSessionEvent::PredictionAcknowledged(prediction_id)
-            }
-            SessionAction::RemoteStateAdvanced(state_id) => {
-                MoshSessionEvent::RemoteStateAdvanced(state_id)
-            }
-            SessionAction::ConnectionStateChanged(state) => {
-                MoshSessionEvent::ConnectionStateChanged(state)
-            }
-            SessionAction::RoundTripEstimate(milliseconds) => {
-                MoshSessionEvent::RoundTripEstimate(milliseconds)
-            }
-            SessionAction::ShutdownComplete(outcome) => MoshSessionEvent::Closed(outcome),
-            SessionAction::CapabilitiesChanged(_)
-            | SessionAction::RemoteSessionControl { .. }
-            | SessionAction::SessionLifecycleChanged(_)
-            | SessionAction::UdpBindingChanged(_)
-            | SessionAction::Diagnostic(_) => continue,
-        };
-        if event_tx.send(event).await.is_err() {
-            return false;
         }
+    };
+    // Rendering backpressure is independent from terminal input and shutdown.
+    tokio::select! {
+        result = requests => result,
+        result = events => result,
     }
-    true
-}
-
-#[derive(Default)]
-struct PredictionIdMap {
-    by_protocol_frame: BTreeMap<u64, u64>,
-}
-
-impl PredictionIdMap {
-    fn record(&mut self, protocol_frame_id: u64, prediction_id: u64) {
-        self.by_protocol_frame
-            .entry(protocol_frame_id)
-            .and_modify(|current| *current = (*current).max(prediction_id))
-            .or_insert(prediction_id);
-    }
-
-    fn acknowledge(&mut self, protocol_frame_id: u64) -> Option<u64> {
-        let prediction_id = self
-            .by_protocol_frame
-            .range(..=protocol_frame_id)
-            .next_back()
-            .map(|(_, prediction_id)| *prediction_id);
-        self.by_protocol_frame
-            .retain(|frame_id, _| *frame_id > protocol_frame_id);
-        prediction_id
-    }
-}
-
-fn queue_prediction_input(
-    runtime: &mut SessionRuntime,
-    prediction_ids: &mut PredictionIdMap,
-    prediction_id: u64,
-    bytes: Vec<u8>,
-) -> Result<(), RuntimeError> {
-    // The runtime alone owns SSP numbering; bridge its frame back to the terminal-local prediction.
-    let protocol_frame_id = runtime.prediction_frame_id();
-    runtime.queue_terminal_event(TerminalInputEvent::Bytes(bytes))?;
-    prediction_ids.record(protocol_frame_id, prediction_id);
-    Ok(())
-}
-
-fn monotonic_time(started_at: Instant) -> MonotonicTime {
-    let elapsed = Instant::now().duration_since(started_at).as_millis();
-    MonotonicTime::from_milliseconds(u64::try_from(elapsed).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
-    const SYNTHETIC_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEA==";
+    #[tokio::test]
+    async fn retired_startup_cannot_relaunch_after_the_provider_becomes_available() {
+        let sessions = Arc::new(MoshPluginSessions::default());
+        let mut lease = sessions.acquire().unwrap();
+        let retirement = sessions.stop();
+        assert!(matches!(
+            sessions.acquire(),
+            Err(MoshSessionStartError::Unavailable)
+        ));
+        sessions.set_available(true);
+        tokio::time::timeout(Duration::from_secs(1), lease.cancelled())
+            .await
+            .unwrap();
+        let result = start_mosh_session(MoshSessionConfig {
+            remote_host: "127.0.0.1".into(),
+            remote_port: 60001,
+            ip_family: MoshIpFamily::Ipv4,
+            columns: 80,
+            rows: 24,
+            key: crate::MoshSessionKey::decode("AQIDBAUGBwgJCgsMDQ4PEA").unwrap(),
+            executable: PathBuf::new(),
+            lease,
+        })
+        .await;
+        assert!(matches!(result, Err(MoshSessionStartError::Unavailable)));
+        retirement.join().unwrap();
 
-    #[test]
-    fn terminal_prediction_ids_do_not_depend_on_protocol_state_numbers() {
-        let key = SessionKey::decode(SYNTHETIC_KEY).expect("synthetic key must decode");
-        let mut runtime = SessionRuntime::new(key, MonotonicTime::from_milliseconds(0));
-        runtime.queue_resize(80, 24);
-        runtime
-            .poll(MonotonicTime::from_milliseconds(0))
-            .expect("initial protocol state must open");
-        let protocol_frame_id = runtime.prediction_frame_id();
-        assert_ne!(protocol_frame_id, 0);
-
-        let mut prediction_ids = PredictionIdMap::default();
-        queue_prediction_input(
-            &mut runtime,
-            &mut prediction_ids,
-            0,
-            b"first input".to_vec(),
-        )
-        .expect("terminal-local prediction zero must be accepted");
-
-        assert_eq!(prediction_ids.acknowledge(protocol_frame_id), Some(0));
+        let mut closed_pane = sessions.acquire().unwrap();
+        closed_pane.cancellation().cancel();
+        tokio::time::timeout(Duration::from_secs(1), closed_pane.cancelled())
+            .await
+            .unwrap();
+        let healthy = sessions.acquire().unwrap();
+        assert!(!*healthy.cancellation.borrow());
     }
 
-    #[test]
-    fn prediction_acknowledgements_coalesce_by_protocol_frame() {
-        let mut prediction_ids = PredictionIdMap::default();
-        prediction_ids.record(4, 0);
-        prediction_ids.record(4, 1);
-        prediction_ids.record(7, 2);
-
-        assert_eq!(prediction_ids.acknowledge(4), Some(1));
-        assert_eq!(prediction_ids.acknowledge(6), None);
-        assert_eq!(prediction_ids.acknowledge(7), Some(2));
+    #[tokio::test]
+    async fn unread_terminal_output_does_not_block_pipe_input_or_retirement() {
+        let (host, engine) = tokio::io::duplex(1);
+        let (mut stdout, mut stdin) = tokio::io::split(host);
+        let (mut input, mut display) = tokio::io::split(engine);
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (events, mut event_rx) = mpsc::channel(1);
+        let task =
+            tokio::spawn(
+                async move { relay(&mut stdout, &mut stdin, &mut command_rx, &events).await },
+            );
+        wire::write_frame(
+            &mut display,
+            &Event::Output(zeroize::Zeroizing::new(b"first".to_vec())),
+        )
+        .await
+        .unwrap();
+        wire::write_frame(
+            &mut display,
+            &Event::Output(zeroize::Zeroizing::new(b"blocked".to_vec())),
+        )
+        .await
+        .unwrap();
+        // A third frame header fits only after the second frame was consumed;
+        // its delivery is blocked by the unread, capacity-one terminal mailbox.
+        display.write_u8(2).await.unwrap();
+        commands
+            .send(Request::Input {
+                prediction_id: 42,
+                bytes: zeroize::Zeroizing::new(b"input-under-pressure".to_vec()),
+            })
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(
+            Duration::from_secs(3),
+            wire::read_frame::<_, Request>(&mut input),
+        )
+        .await
+        .expect("unread output blocked the stdin pipe")
+        .unwrap();
+        match received {
+            Request::Input {
+                prediction_id,
+                bytes,
+            } => {
+                assert_eq!(prediction_id, 42);
+                assert_eq!(bytes.as_slice(), b"input-under-pressure");
+            }
+            _ => panic!("expected input frame"),
+        }
+        drop(commands);
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("unread output blocked retirement")
+            .unwrap()
+            .unwrap();
+        match event_rx.recv().await.unwrap().into_event() {
+            MoshSessionEvent::Output(bytes) => assert_eq!(bytes, b"first"),
+            _ => panic!("expected first output"),
+        }
     }
 }

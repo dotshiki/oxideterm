@@ -551,6 +551,7 @@ pub(super) enum SftpWorkerResult {
         result: Result<Vec<BackgroundTransferSnapshot>, String>,
     },
     PreviewLoaded {
+        asset_owner: Option<PreviewAssetOwner>,
         generation: u64,
         path: String,
         result: Result<PreviewContent, String>,
@@ -1045,6 +1046,7 @@ pub(super) struct SftpWorkspaceEntity {
     remote_load_inflight: bool,
     remote_load_retry_count: u8,
     remote_load_retry_task: Option<Task<()>>,
+    remote_browse_request: Option<(SftpRemoteId, String, oxideterm_audit::AuditContext)>,
     pub(in crate::workspace) current_surface_id: Option<SftpSurfaceId>,
     pub(in crate::workspace) current_remote_id: Option<SftpRemoteId>,
     pair_primary_remote_id: Option<SftpRemoteId>,
@@ -1069,7 +1071,9 @@ pub(super) struct SftpWorkspaceEntity {
     // immutable snapshots instead of cloning the payload on every frame.
     preview_content: Option<Arc<PreviewContent>>,
     preview_asset_owner: Option<PreviewAssetOwner>,
+    preview_plugin: Option<Entity<super::plugin_preview::PluginFilePreview>>,
     preview_generation: u64,
+    preview_load_task: Option<tokio::task::AbortHandle>,
     preview_audio: RodioAudioPreviewBackend,
     preview_audio_tick_active: bool,
     preview_audio_tick_task: Option<Task<()>>,
@@ -1167,6 +1171,7 @@ impl Default for SftpWorkspaceEntity {
             remote_load_inflight: false,
             remote_load_retry_count: 0,
             remote_load_retry_task: None,
+            remote_browse_request: None,
             current_surface_id: None,
             current_remote_id: None,
             pair_primary_remote_id: None,
@@ -1189,7 +1194,9 @@ impl Default for SftpWorkspaceEntity {
             preview_path: None,
             preview_content: None,
             preview_asset_owner: None,
+            preview_plugin: None,
             preview_generation: 0,
+            preview_load_task: None,
             preview_audio: RodioAudioPreviewBackend::new(),
             preview_audio_tick_active: false,
             preview_audio_tick_task: None,
@@ -1284,7 +1291,10 @@ impl SftpWorkspaceEntity {
     fn schedule_worker_delivery(&self, cx: &mut Context<Self>) {
         let worker_wake = self.worker_tx.wake();
         let release_wake = worker_wake.clone();
-        cx.on_release(move |_, _| {
+        cx.on_release(move |this, _| {
+            if let Some(task) = this.preview_load_task.take() {
+                task.abort();
+            }
             // Releasing the page owner stops UI delivery without cancelling
             // node-owned transfers or their backend tasks.
             release_wake.stop();
@@ -1389,6 +1399,9 @@ impl SftpWorkspaceEntity {
         if self.folder_picker_task.is_some() {
             return;
         }
+        let audit_context = crate::workspace::file_manager::local_file_audit_context(
+            oxideterm_audit::AuditSource::User,
+        );
         self.folder_picker_task = Some(cx.spawn(async move |entity, cx| {
             let selected_path = selection.await;
             let _ = entity.update(cx, |sftp, cx| {
@@ -1397,7 +1410,14 @@ impl SftpWorkspaceEntity {
                     if let Some(remote_id) = sftp.current_remote_id.clone() {
                         sftp.local_path_by_remote.insert(remote_id, path.clone());
                     }
-                    sftp.apply_local_path(path);
+                    let audit = oxideterm_audit::AuditOperation::in_context(
+                        audit_context.as_ref(),
+                        oxideterm_audit::AuditCategory::File,
+                        "file_browse",
+                        Some(&path),
+                    );
+                    let result = sftp.apply_local_path(path);
+                    audit.result(&result);
                     cx.notify();
                 }
             });
@@ -1447,6 +1467,7 @@ impl SftpWorkspaceEntity {
         self.conflict_state = None;
         self.dialog_value.clear();
         self.preview_asset_owner = None;
+        self.preview_plugin = None;
         self.preview_hex_loading_more = false;
         self.preview_markdown_source_mode = false;
         self.preview_markdown_scroll = MarkdownVirtualListScrollHandle::new();
@@ -1478,6 +1499,10 @@ impl SftpWorkspaceEntity {
     }
 
     pub(in crate::workspace::sftp) fn stop_preview_media(&mut self) {
+        if let Some(task) = self.preview_load_task.take() {
+            task.abort();
+        }
+        self.preview_plugin = None;
         let _ = self.preview_audio.command(AudioPreviewCommand::Stop);
         self.preview_audio_tick_active = false;
         self.preview_audio_tick_task = None;
@@ -1642,24 +1667,8 @@ mod entity_delivery_tests {
         }
     }
 
-    #[test]
-    fn file_row_selection_is_owned_by_sftp_entity() {
-        let mut sftp = SftpWorkspaceEntity::default();
-        sftp.local_files = vec![file_entry("alpha"), file_entry("beta")];
-
-        sftp.select_file(
-            SftpPane::Local,
-            "alpha".to_string(),
-            gpui::Modifiers::default(),
-        );
-
-        assert_eq!(sftp.local_selected, HashSet::from(["alpha".to_string()]));
-        assert_eq!(sftp.local_last_selected.as_deref(), Some("alpha"));
-        assert_eq!(sftp.active_pane, SftpPane::Local);
-    }
-
     #[gpui::test]
-    fn file_activation_emits_typed_workspace_intent(cx: &mut TestAppContext) {
+    fn local_selection_survives_opening_a_remote_file_with_its_identity(cx: &mut TestAppContext) {
         let entity = cx.new(SftpWorkspaceEntity::new);
         let observed = Arc::new(AtomicBool::new(false));
         let observed_event = observed.clone();
@@ -1678,7 +1687,16 @@ mod entity_delivery_tests {
         });
 
         entity.update(cx, |sftp, cx| {
+            sftp.local_files = vec![file_entry("alpha"), file_entry("beta")];
+            sftp.select_file(
+                SftpPane::Local,
+                "alpha".to_string(),
+                gpui::Modifiers::default(),
+            );
+            assert_eq!(sftp.active_pane, SftpPane::Local);
             sftp.activate_file(SftpPane::Remote, file_entry("remote.txt"), cx);
+            assert_eq!(sftp.local_selected, HashSet::from(["alpha".to_string()]));
+            assert_eq!(sftp.local_last_selected.as_deref(), Some("alpha"));
         });
 
         assert!(observed.load(Ordering::Acquire));
@@ -1804,6 +1822,8 @@ mod entity_delivery_tests {
                 );
                 assert_eq!(state.remote_selected, HashSet::from([name.to_string()]));
                 assert!(!state.remote_load_pending);
+                assert!(!state.remote_load_inflight);
+                assert!(!state.remote_loading);
             });
         }
     }
@@ -1942,12 +1962,12 @@ use helpers::{
     format_sftp_media_time, format_transfer_speed, home_path,
     is_sftp_incomplete_store_compat_error, join_local_path, join_sftp_path, list_local_files,
     load_remote_sftp_completion_listing, load_remote_sftp_listing, load_remote_sftp_preview,
-    load_remote_sftp_preview_hex, local_drives, new_sftp_transfer_id,
+    load_remote_sftp_preview_hex, local_drives, local_files_or_error, new_sftp_transfer_id,
     normalize_external_dropped_path, normalize_remote_path, parent_path, preview_content_text,
-    refreshed_local_files, remote_directory_prefixes, save_remote_sftp_preview, sftp_bg,
-    sftp_border, sftp_card_surface, sftp_conflict_resolution_from_settings, sftp_diff_visual_lines,
-    sftp_editor_language, sftp_editor_language_id, sftp_file_name, sftp_hover_bg, sftp_panel_bg,
-    sftp_path_segments, sftp_preview_editor_is_network_error, sftp_preview_is_markdown,
+    remote_directory_prefixes, save_remote_sftp_preview, sftp_bg, sftp_border, sftp_card_surface,
+    sftp_conflict_resolution_from_settings, sftp_diff_visual_lines, sftp_editor_language,
+    sftp_editor_language_id, sftp_file_name, sftp_hover_bg, sftp_panel_bg, sftp_path_segments,
+    sftp_preview_editor_is_network_error, sftp_preview_is_markdown,
     sftp_source_not_newer_than_target, sftp_transfer_conflicts,
     sftp_transfer_state_from_background, sorted_sftp_files, unique_sftp_conflict_name,
 };
